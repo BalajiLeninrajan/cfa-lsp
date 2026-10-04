@@ -1,0 +1,14 @@
+#pragma once
+
+struct ofstream {
+	void * file;
+};
+
+// Standard output stream.
+extern ofstream & sout;
+
+ofstream & ?|?( ofstream & os, int i );
+ofstream & ?|?( ofstream & os, double d );
+void open( ofstream & os, const char * name, const char * mode );
+void open( ofstream & os, const char * name );
+extern int __cfa_flags;

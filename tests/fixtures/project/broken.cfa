@@ -1,0 +1,11 @@
+// Two type errors; the rest of the file still resolves.
+#include <fstream.hfa>
+#include "geometry.hfa"
+
+int main() {
+	Rect r = { { 0, 0 }, { 1, 1 } };
+	double d = area( r );
+	double bad = area( "rect" );
+	sout | d | nosuch;
+	sout | bad;
+}

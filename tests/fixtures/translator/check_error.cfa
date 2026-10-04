@@ -1,0 +1,10 @@
+// Errors from checking passes before Resolve, and a warning.
+int noreturn_value() {
+return;
+}
+
+int main() {
+int x = 1;
+x = x;
+return noreturn_value() + x;
+}

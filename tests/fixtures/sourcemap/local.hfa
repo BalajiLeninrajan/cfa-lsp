@@ -1,0 +1,11 @@
+#pragma once
+
+// A local header for the SourceMap include test.
+#define SCALE( x ) ( (x) * 3 )
+
+struct Pt {
+	int	x,   y;
+};
+
+int	scale_pt(  struct Pt p );
+static inline int pt_sum( struct Pt p ) { return SCALE( p.x ) + p.y; }

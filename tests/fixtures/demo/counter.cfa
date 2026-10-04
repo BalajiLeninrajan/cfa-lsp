@@ -1,0 +1,28 @@
+#include <fstream.hfa>
+#include "counter.hfa"
+
+struct Point { int x, y; };
+
+forall(T &) {
+  T & twice(T & v) { return v; }
+}
+
+void main(Counter & c) with(c) {
+  for () {
+    count += 1;
+    if (count > LIMIT) throw ExceptionInst(TooLong);
+    suspend;
+  }
+}
+
+void next(Counter & c, char ch) {
+  c.ch = ch;
+  resume(c);
+}
+
+int main() {
+  Counter counter;
+  Point p = { 1, 2 };
+  for (i; 3) next(counter, 'a');
+  sout | counter.count | p.x;
+}

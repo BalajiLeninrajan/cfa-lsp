@@ -1,0 +1,26 @@
+// Termination and resumption exceptions.
+exception Oops { int code; };
+vtable( Oops ) oops_vt;
+
+void risky( int n ) {
+if ( n > 2 ) throw (Oops){ &oops_vt, n };
+}
+
+void gentle( int n ) {
+throwResume (Oops){ &oops_vt, n };
+}
+
+int main() {
+int code = 0;
+try {
+risky( 3 );
+} catch ( Oops * e ) {
+code = e->code;
+}
+try {
+gentle( 1 );
+} catchResume ( Oops * e ) {
+code += e->code;
+}
+return code;
+}

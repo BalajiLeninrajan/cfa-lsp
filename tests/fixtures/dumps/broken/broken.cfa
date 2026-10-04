@@ -1,0 +1,7 @@
+#include "../shapes/shapes.hfa"
+
+int main() {
+	Box b;
+	int a = area( b, 1 );
+	return a;
+}

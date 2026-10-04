@@ -1,0 +1,42 @@
+{
+  "format": 1,
+  "complete": true,
+  "diagnostics": [],
+  "decls": [
+    { "id": 1, "name": "twice", "kind": "function", "file": "@FILE@", "line": 3, "col": 0, "endLine": 6, "endCol": 1,
+      "nameRange": { "line": 3, "col": 4, "endLine": 3, "endCol": 9 },
+      "type": "int (int)", "signature": "int twice( int x )", "parent": null, "typeDecl": null,
+      "params": [ "x" ], "body": { "line": 3, "col": 19, "endLine": 6, "endCol": 1 }, "generated": false, "local": false },
+    { "id": 2, "name": "x", "kind": "parameter", "file": "@FILE@", "line": 3, "col": 11, "endLine": 3, "endCol": 16,
+      "nameRange": { "line": 3, "col": 15, "endLine": 3, "endCol": 16 },
+      "type": "int", "signature": "int x", "parent": 1, "typeDecl": null, "body": null, "generated": false, "local": true },
+    { "id": 3, "name": "unused", "kind": "variable", "file": "@FILE@", "line": 4, "col": 1, "endLine": 4, "endCol": 11,
+      "nameRange": { "line": 4, "col": 5, "endLine": 4, "endCol": 11 },
+      "type": "int", "signature": "int unused", "parent": 1, "typeDecl": null, "body": null, "generated": false, "local": true },
+    { "id": 4, "name": "main", "kind": "function", "file": "@FILE@", "line": 8, "col": 0, "endLine": 11, "endCol": 1,
+      "nameRange": { "line": 8, "col": 4, "endLine": 8, "endCol": 8 },
+      "type": "int ()", "signature": "int main()", "parent": null, "typeDecl": null,
+      "params": [], "body": { "line": 8, "col": 11, "endLine": 11, "endCol": 1 }, "generated": false, "local": false },
+    { "id": 5, "name": "y", "kind": "variable", "file": "@FILE@", "line": 9, "col": 1, "endLine": 9, "endCol": 20,
+      "nameRange": { "line": 9, "col": 5, "endLine": 9, "endCol": 6 },
+      "type": "int", "signature": "int y", "parent": 4, "typeDecl": null, "body": null, "generated": false, "local": true },
+    { "id": 6, "name": "twice", "kind": "function", "file": "@DIR@/hello.hfa", "line": 2, "col": 0, "endLine": 2, "endCol": 18,
+      "nameRange": { "line": 2, "col": 4, "endLine": 2, "endCol": 9 },
+      "type": "int (int)", "signature": "int twice( int x )", "parent": null, "typeDecl": null,
+      "params": [ "x" ], "body": null, "generated": false, "local": false }
+  ],
+  "refs": [
+    { "file": "@FILE@", "line": 5, "col": 8, "endLine": 5, "endCol": 9, "decl": 2, "role": "read" },
+    { "file": "@FILE@", "line": 9, "col": 9, "endLine": 9, "endCol": 14, "decl": 1, "role": "call" },
+    { "file": "@FILE@", "line": 10, "col": 8, "endLine": 10, "endCol": 9, "decl": 5, "role": "read" }
+  ],
+  "exprs": [
+    { "file": "@FILE@", "line": 5, "col": 8, "endLine": 5, "endCol": 9, "type": "int", "typeDecl": null },
+    { "file": "@FILE@", "line": 9, "col": 9, "endLine": 9, "endCol": 20, "type": "int", "typeDecl": null },
+    { "file": "@FILE@", "line": 10, "col": 8, "endLine": 10, "endCol": 9, "type": "int", "typeDecl": null }
+  ],
+  "scopes": [
+    { "file": "@FILE@", "line": 3, "col": 19, "endLine": 6, "endCol": 1, "parent": null, "decls": [ 2, 3 ] },
+    { "file": "@FILE@", "line": 8, "col": 11, "endLine": 11, "endCol": 1, "parent": null, "decls": [ 5 ] }
+  ]
+}

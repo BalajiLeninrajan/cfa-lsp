@@ -1,0 +1,17 @@
+#pragma once
+
+#include <coroutine.hfa>
+#include <Exception.hfa>
+
+// Counts characters until it sees a newline.
+coroutine Counter {
+  char ch;     // character passed in by next
+  int count;   // characters seen so far
+};
+
+enum { LIMIT = 80 }; // longest line
+
+ExceptionDecl(TooLong); // line went past LIMIT
+
+void main(Counter & c);
+void next(Counter & c, char ch); // pass one character

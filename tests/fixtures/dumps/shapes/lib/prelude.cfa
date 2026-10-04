@@ -1,0 +1,4 @@
+// A small stand-in for the CFA prelude.
+forall( T * ) trait sized {};
+signed int ?+?( signed int, signed int );
+double ?*?( double, double );

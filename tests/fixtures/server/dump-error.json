@@ -1,0 +1,14 @@
+{
+  "format": 1,
+  "complete": false,
+  "diagnostics": [
+    { "file": "@DIR@/hello.hfa", "line": 2, "col": 4, "endLine": 2, "endCol": 9, "severity": "error",
+      "message": "fake error in header" },
+    { "file": "@FILE@", "line": 9, "col": 9, "endLine": 9, "endCol": 14, "severity": "error",
+      "message": "fake error in main" }
+  ],
+  "decls": [],
+  "refs": [],
+  "exprs": [],
+  "scopes": []
+}

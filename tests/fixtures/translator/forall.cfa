@@ -1,0 +1,15 @@
+// Polymorphic functions with trait assertions.
+forall( T ) trait addable {
+	T ?+?( T, T );
+};
+
+forall( T | addable( T ) ) T twice( T x ) { return x + x; }
+
+forall( T & ) T & self( T & r ) { return r; }
+
+int main() {
+int i = twice( 3 );
+double d = twice( 1.5 );
+int & r = self( i );
+return r + (int)d;
+}

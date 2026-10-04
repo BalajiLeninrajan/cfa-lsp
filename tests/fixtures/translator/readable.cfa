@@ -1,0 +1,12 @@
+// A failed declaration stays in scope, system typedefs are refs, and type text is readable.
+#include <stdio.h>
+forall( T ) T pick( T a, T b ) { return a; }
+forall( U & ) U & same( U & u ) { return u; }
+enum { ONE = 1 };
+int main() {
+FILE * f = 0;
+size_t n = ONE;
+long big = pick( 1, 2 );
+int bad = nosuch( 1 );
+return bad + (int)n + (int)big + (f == 0);
+}

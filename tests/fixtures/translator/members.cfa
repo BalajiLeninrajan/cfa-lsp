@@ -1,0 +1,19 @@
+// Struct members, references, pointers and with clauses.
+struct Point { int x; int y; };
+
+void shift( Point & p, int dx ) with( p ) {
+x += dx;
+y += dx;
+}
+
+int sum( Point * pp ) { return pp->x + pp->y; }
+
+int main() {
+Point pt = { 1, 2 };
+Point & r = pt;
+r.x = 3;
+shift( r, 1 );
+int & ri = pt.y;
+ri = 4;
+return sum( &pt ) + r.y;
+}

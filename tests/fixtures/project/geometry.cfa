@@ -1,0 +1,67 @@
+#include <fstream.hfa>
+#include "geometry.hfa"
+
+vtable( TooBig ) tooBig_vt;
+
+double area( Rect r ) {
+	return (r.hi.x - r.lo.x)   *   (r.hi.y - r.lo.y);
+}
+
+double area( Circle c ) with( c ) {
+	return 3.14159 * SQ( radius );
+}
+
+int unit() { return 1; }
+double unit() { return 1.0; }
+
+forall( T | { int ?<?( T, T ); } )
+T biggest( T a, T b ) {
+	return a < b ? b : a;
+}
+
+forall( S | Shape( S ) )
+double total( S * shapes, int n ) {
+	double sum = 0;
+	for ( i; n ) sum += area( shapes[i] );
+	return sum;
+}
+
+void main( Fib & f ) with( f ) {
+	int a = 0, b = 1;
+	for () {
+		fn = a;
+		suspend;
+		int t = a + b;
+		a = b;  b = t;
+	}
+}
+
+int next( Fib & f ) {
+	resume( f );
+	return f.fn;
+}
+
+/* Throws when the amount is too large. */
+void check( double amount ) {
+	if ( amount > 100 ) throw (TooBig){ &tooBig_vt, amount };
+}
+
+int main() {
+	Rect box = { { ORIGIN, 0 }, { 3, 4 } };
+	Circle   wheel = {{1,1},2};
+	Rect * pbox = &box;
+	double a1 = area( box ), a2 = area( wheel );
+	int u = unit();
+	double du = unit();
+	sout | biggest( 3, 7 ) | biggest( 2.5, 1.5 );
+	sout | pbox->hi.x | wheel.centre.y;
+	sout | total( &box, 1 );
+	Fib fib;
+	for ( 5 ) sout | next( fib );
+	try {
+		check( a1 + a2 );
+	} catch ( TooBig * e ) {
+		sout | "too big:" | e->amount;
+	}
+	sout | u | du;
+}

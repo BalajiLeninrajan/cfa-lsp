@@ -1,0 +1,24 @@
+#include <coroutine.hfa>
+[ int, int ] swap( int a, int b ) { return [ b, a ]; }
+struct P { int x, y; };
+P make( int v ) { P p = { v, v }; return p; }
+int use( P p ) { return p.x; }
+exception Boom { int code; };
+vtable( Boom ) Boom_vt;
+void blow( int c ) { throw (Boom){ &Boom_vt, c }; }
+generator Gen { int n; };
+void main( Gen & g ) with( g ) { for () { n += 1; suspend; } }
+int main() {
+int u = 1, v = 2;
+[ u, v ] = swap( u, v );
+P a = (P){ u, v };
+int r = use( (P){ u + 1, v } );
+with ( make( u ) ) { r += x; }
+int q = (int)sizeof( r );
+typedef double Real;
+Real z = 1.5;
+{ typedef char Small; Small c = 'a'; r += c; }
+int w = a.
+x;
+return r + q + w + (int)z;
+}

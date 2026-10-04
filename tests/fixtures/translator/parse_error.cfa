@@ -1,0 +1,7 @@
+// A syntax error.
+int ok( int x ) { return x; }
+
+int main() {
+int y = ;
+return ok( y );
+}

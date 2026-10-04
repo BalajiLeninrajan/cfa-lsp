@@ -1,0 +1,51 @@
+#pragma once
+
+#include <fstream.hfa>
+#include <coroutine.hfa>
+
+#define SQ( x ) ((x) * (x))
+#define ORIGIN 0
+
+// A point on the plane.
+struct Point {
+	double x, y;
+};
+
+/* An axis-aligned rectangle given by two corners. */
+struct Rect {
+	Point lo, hi;
+};
+
+struct Circle {
+	Point centre;
+	double radius;						// always positive
+};
+
+// Area of a rectangle.
+double area( Rect r );
+// Area of a circle.
+double area( Circle c );
+
+// The same name, overloaded on the return type.
+int unit();
+double unit();
+
+forall( T | { int ?<?( T, T ); } )
+T biggest( T a, T b );
+
+forall( S )
+trait Shape {
+	double area( S );
+};
+
+forall( S | Shape( S ) )
+double total( S * shapes, int n );
+
+exception TooBig { double amount; };
+
+// Generates Fibonacci numbers.
+coroutine Fib {
+	int fn;
+};
+void main( Fib & f );
+int next( Fib & f );

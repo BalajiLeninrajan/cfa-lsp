@@ -1,0 +1,4 @@
+// An error from a pass before Resolve: the trait does not exist.
+struct S { int a; };
+forall( T | nosuch( T ) ) void f( T x ) {}
+int g( S s ) { return s.a; }

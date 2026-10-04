@@ -1,0 +1,24 @@
+#pragma once
+
+// A point on the integer grid.
+struct Point {
+	int x;	// horizontal offset
+	int y;	// vertical offset
+};
+
+/* An axis-aligned box. */
+struct Box {
+	Point lo, hi;
+};
+
+/**
+ * Area of a box.
+ */
+int area( Box & b );
+double area( double r );
+
+forall( T ) trait Shape {
+	int area( T & );
+};
+
+enum Colour { Red, Green, Blue };

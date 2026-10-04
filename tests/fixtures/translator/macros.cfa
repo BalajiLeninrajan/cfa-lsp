@@ -1,0 +1,14 @@
+// Macros and irregular spacing: only lines are checked here.
+#define SQUARE( v ) ((v) * (v))
+#define LIMIT 10
+
+int square_it( int v ) { return SQUARE( v ); }
+
+// bool comes from stdbool.h, and cpp splits this line around its expansion.
+bool positive( int v ) { return v > 0; }
+
+int main() {
+    int    spaced   =   square_it(   LIMIT   );
+	int tabbed	=	SQUARE( spaced );
+    return spaced + tabbed + positive( spaced );
+}

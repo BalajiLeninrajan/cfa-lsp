@@ -1,0 +1,4 @@
+[submodule "cforall"]
+	path = cforall
+	url = https://github.com/cforall/cforall.git
+	shallow = true

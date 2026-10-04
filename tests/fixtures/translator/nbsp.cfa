@@ -1,0 +1,5 @@
+// A non-breaking space (bytes c2 a0) in code.
+int main() {
+int x = 1;
+return x;
+}

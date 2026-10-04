@@ -1,0 +1,12 @@
+// One type error in an otherwise good file.
+struct S { int a; };
+
+int good( int x ) { return x + 1; }
+
+int bad() {
+S s;
+int y = good( 2 );
+return s.nope + y;
+}
+
+int main() { return good( 1 ) + bad(); }

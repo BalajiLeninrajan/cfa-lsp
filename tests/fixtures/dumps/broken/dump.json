@@ -1,0 +1,26 @@
+{
+  "format": 1,
+  "complete": false,
+  "diagnostics": [
+    {"file": "/fixture/broken/broken.cfa", "line": 5, "col": 9, "endLine": 5, "endCol": 21, "severity": "error", "message": "No alternatives for expression area( b, 1 )", "detail": "Alternatives are:\n  int area( Box & b )\n  double area( double r )"},
+    {"file": "/fixture/broken/broken.cfa", "line": 6, "col": 1, "endLine": 6, "endCol": 10, "severity": "warning", "message": "statement has no effect"},
+    {"file": "/fixture/shapes/shapes.hfa", "line": 17, "col": 4, "endLine": 17, "endCol": 8, "severity": "note", "message": "candidate declared here"},
+    {"file": "", "line": 0, "col": 0, "severity": "error", "message": "translation stopped after errors"}
+  ],
+  "decls": [
+    {"id": 1, "name": "Point", "kind": "struct", "file": "/fixture/shapes/shapes.hfa", "line": 4, "col": 0, "endLine": 7, "endCol": 2, "nameRange": {"line": 4, "col": 7, "endLine": 4, "endCol": 12}, "type": "struct Point", "signature": "struct Point", "parent": null, "typeDecl": null, "body": {"line": 4, "col": 13, "endLine": 7, "endCol": 1}, "generated": false, "local": false},
+    {"id": 2, "name": "x", "kind": "field", "file": "/fixture/shapes/shapes.hfa", "line": 5, "col": 1, "endLine": 5, "endCol": 6, "nameRange": {"line": 5, "col": 5, "endLine": 5, "endCol": 6}, "type": "int", "signature": "int x", "parent": 1, "typeDecl": null, "body": null, "generated": false, "local": false},
+    {"id": 3, "name": "y", "kind": "field", "file": "/fixture/shapes/shapes.hfa", "line": 6, "col": 1, "endLine": 6, "endCol": 6, "nameRange": {"line": 6, "col": 5, "endLine": 6, "endCol": 6}, "type": "int", "signature": "int y", "parent": 1, "typeDecl": null, "body": null, "generated": false, "local": false},
+    {"id": 4, "name": "Box", "kind": "struct", "file": "/fixture/shapes/shapes.hfa", "line": 10, "col": 0, "endLine": 12, "endCol": 2, "nameRange": {"line": 10, "col": 7, "endLine": 10, "endCol": 10}, "type": "struct Box", "signature": "struct Box", "parent": null, "typeDecl": null, "body": {"line": 10, "col": 11, "endLine": 12, "endCol": 1}, "generated": false, "local": false},
+    {"id": 5, "name": "lo", "kind": "field", "file": "/fixture/shapes/shapes.hfa", "line": 11, "col": 1, "endLine": 11, "endCol": 9, "nameRange": {"line": 11, "col": 7, "endLine": 11, "endCol": 9}, "type": "Point", "signature": "Point lo", "parent": 4, "typeDecl": 1, "body": null, "generated": false, "local": false},
+    {"id": 6, "name": "hi", "kind": "field", "file": "/fixture/shapes/shapes.hfa", "line": 11, "col": 1, "endLine": 11, "endCol": 13, "nameRange": {"line": 11, "col": 11, "endLine": 11, "endCol": 13}, "type": "Point", "signature": "Point hi", "parent": 4, "typeDecl": 1, "body": null, "generated": false, "local": false},
+    {"id": 7, "name": "area", "kind": "function", "file": "/fixture/shapes/shapes.hfa", "line": 17, "col": 0, "endLine": 17, "endCol": 19, "nameRange": {"line": 17, "col": 4, "endLine": 17, "endCol": 8}, "type": "int (Box &)", "signature": "int area( Box & b )", "parent": null, "typeDecl": null, "params": ["b"], "body": null, "generated": false, "local": false},
+    {"id": 9, "name": "area", "kind": "function", "file": "/fixture/shapes/shapes.hfa", "line": 18, "col": 0, "endLine": 18, "endCol": 23, "nameRange": {"line": 18, "col": 7, "endLine": 18, "endCol": 11}, "type": "double (double)", "signature": "double area( double r )", "parent": null, "typeDecl": null, "params": ["r"], "body": null, "generated": false, "local": false},
+    {"id": 100, "name": "main", "kind": "function", "file": "/fixture/broken/broken.cfa", "line": 3, "col": 0, "endLine": 7, "endCol": 1, "nameRange": {"line": 3, "col": 4, "endLine": 3, "endCol": 8}, "type": "int ()", "signature": "int main()", "parent": null, "typeDecl": null, "params": [], "body": {"line": 3, "col": 11, "endLine": 7, "endCol": 1}, "generated": false, "local": false},
+    {"id": 101, "name": "b", "kind": "variable", "file": "/fixture/broken/broken.cfa", "line": 4, "col": 1, "endLine": 4, "endCol": 6, "nameRange": {"line": 4, "col": 5, "endLine": 4, "endCol": 6}, "type": "Box", "signature": "Box b", "parent": 100, "typeDecl": 4, "body": null, "generated": false, "local": true},
+    {"id": 102, "name": "a", "kind": "variable", "file": "/fixture/broken/broken.cfa", "line": 5, "col": 1, "endLine": 5, "endCol": 21, "nameRange": {"line": 5, "col": 5, "endLine": 5, "endCol": 6}, "type": "int", "signature": "int a", "parent": 100, "typeDecl": null, "body": null, "generated": false, "local": true}
+  ],
+  "refs": [],
+  "exprs": [],
+  "scopes": []
+}

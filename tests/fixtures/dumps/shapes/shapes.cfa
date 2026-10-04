@@ -1,0 +1,39 @@
+#include <fstream.hfa>
+#include "shapes.hfa"
+
+int area( Box & b ) with( b ) {
+	return (hi.x - lo.x) * (hi.y - lo.y);
+}
+
+// Area of a circle with radius r.
+double area( double r ) {
+	return 3.14159 * r * r;
+}
+
+coroutine Walker {
+	Box box;	// box being walked
+	int steps;
+};
+
+void main( Walker & w ) {
+	for ( i; 4 ) {
+		w.steps += 1;
+		suspend;
+	}
+}
+
+forall( T | Shape( T ) )
+int twice( T & s ) {
+	return area( s ) * 2;
+}
+
+int main() {
+	Box b = { { 0, 0 }, { 3, 4 } };
+	Walker w;
+	const int n = area( b );
+	{
+		int inner = n + 1;
+		sout | inner | b.hi.x | w.box.lo.y;
+	}
+	sout | area( 2.0 ) | n;
+}

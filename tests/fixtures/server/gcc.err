@@ -1,0 +1,4 @@
+@CFILE@: In function '_X4mainFi___1':
+@CFILE@:4:5: warning: unused variable '_X6unusedi_2' [-Wunused-variable]
+@CFILE@:4:5: warning: unused variable '_X6unusedi_2' [-Wunused-variable]
+/usr/include/stdio.h:10:1: warning: something in a system header

@@ -1,0 +1,17 @@
+// Overloading on parameter types, on return type, and of variables.
+int f( int x ) { return x; }
+double f( double x ) { return x; }
+int g() { return 1; }
+double g() { return 2.5; }
+int v = 1;
+double v = 2.5;
+
+int main() {
+int a = f( 1 );
+double b = f( 2.5 );
+int c = g();
+double d = g();
+double e = v;
+int k = v;
+return a + c + k + (int)(b + d + e);
+}

@@ -1,0 +1,20 @@
+typedef struct { int q; } Anon;
+struct Outer { struct Inner { int i; } in; struct { int a; } anon; };
+forall( T ) struct Box { T val; };
+forall( T & ) struct Ref { T * p; };
+struct Vec { int x, y; };
+Vec ?+?( Vec a, Vec b ) { return a; }
+int ?`len( Vec v ) { return v.x; }
+void put( int a, int b = 4, const char * m = "r" ) {}
+int main() {
+Anon an;
+struct Outer o;
+Box( int ) bx;
+Vec v = { 1, 2 }, w = { 3, 4 };
+Vec s = v + w;
+int n = v`len;
+put( 1 );
+an.q = n;
+o.in.i = bx.val;
+return s.x + o.anon.a;
+}

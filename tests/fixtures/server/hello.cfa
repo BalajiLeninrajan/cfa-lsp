@@ -1,0 +1,11 @@
+#include "hello.hfa"
+
+int twice( int x ) {
+	int unused;
+	return x * 2;
+}
+
+int main() {
+	int y = twice( 21 );
+	return y;
+}

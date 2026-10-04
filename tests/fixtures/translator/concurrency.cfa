@@ -1,0 +1,29 @@
+// Coroutines, monitors and threads.
+#include <coroutine.hfa>
+#include <monitor.hfa>
+#include <thread.hfa>
+
+coroutine Gen { int value; };
+
+void main( Gen & g ) {
+for ( i; 10 ) { g.value = i; suspend; }
+}
+
+int next( Gen & g ) { resume( g ); return g.value; }
+
+monitor Account { int balance; };
+
+void deposit( Account & mutex a, int amount ) { a.balance += amount; }
+
+thread Worker { int id; };
+
+void main( Worker & w ) { w.id += 1; }
+
+int main() {
+Gen gen;
+int n = next( gen );
+Account acc;
+deposit( acc, n );
+{ Worker w; }
+return acc.balance;
+}

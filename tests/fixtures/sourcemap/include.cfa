@@ -1,0 +1,11 @@
+#include <fstream.hfa>
+#include "local.hfa"
+
+int  scale_pt( struct Pt p ) {
+	return   SCALE( p.x )  +  pt_sum( p );
+}
+
+int main() {
+	struct Pt p = { 1, 2 };
+	sout | scale_pt( p ) | nl;
+}

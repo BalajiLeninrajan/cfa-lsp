@@ -1,0 +1,13 @@
+// Generic types.
+forall( T ) struct Box { T item; };
+
+forall( T ) T get( Box( T ) & b ) { return b.item; }
+
+typedef Box( int ) IntBox;
+
+int main() {
+Box( int ) b = { 3 };
+IntBox c = { 4 };
+int v = get( b );
+return v + b.item + c.item;
+}

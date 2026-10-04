@@ -1,0 +1,5 @@
+struct A { int v; };
+void ?{}( A & a ) { a.v = 0; }
+struct B { A a; int w; };
+void ?{}( B & b ) { int z = b.a.v; (b.a){}; b.w = z; }
+int main() { B b; return b.w; }

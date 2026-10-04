@@ -1,0 +1,217 @@
+# cfa-lsp
+
+A language server for [Cforall](https://cforall.uwaterloo.ca) (CFA). It gets
+its answers from the CFA translator itself: a fork of `cfa-cpp` (in the
+`cforall/` submodule) parses and resolves the file the way the compiler does,
+then writes a JSON description of what it found. Hover on an overloaded call
+shows the overload the resolver picked, including overloads on the return
+type, and definition jumps to that declaration.
+
+Features:
+
+- diagnostics from cpp, the translator (syntax, resolver and checking errors,
+  translator warnings) and, optionally, gcc on the generated C
+- hover with the declaration, doc comment, location and overload count, and
+  for macros the `#define`
+- go to definition and declaration, including into libcfa and the prelude,
+  for macros, and on `#include` lines
+- find references
+- document symbols
+- completion of locals, `with` fields, globals and keywords, and of members
+  after `.` and `->`
+- signature help
+- semantic tokens
+
+It runs on Linux and needs an installed CFA 1.0.0 (`cfa` on `PATH`). The
+translator fork is pinned to the same version (commit `fade1b55`).
+
+## Install
+
+```sh
+git submodule update --init
+make -j8
+make install PREFIX=~/.local
+```
+
+The first `make` configures and builds the translator in `build/cforall`,
+which takes about 13 minutes at `-j8`. Later builds only recompile what
+changed. You need g++ with C++20 support and the usual autotools build
+dependencies of Cforall. bison and flex are only needed if you edit
+`cforall/src/Parser/parser.yy` or `lex.ll`.
+
+`make install` puts the server in `$PREFIX/bin/cfa-lsp` and the translator in
+`$PREFIX/libexec/cfa-lsp/cfa-cpp`, both stripped. `make uninstall` removes
+them. The server finds the translator next to itself, so nothing else needs
+configuring if `cfa` is on `PATH`.
+
+## Editor setup
+
+The server speaks LSP over stdin and stdout. In Neovim 0.11:
+
+```lua
+vim.filetype.add( { extension = { cfa = 'cfa', hfa = 'cfa' } } )
+vim.lsp.config( 'cfa_lsp', {
+  cmd = { 'cfa-lsp' },
+  filetypes = { 'cfa' },
+  root_markers = { 'cfa_flags.txt', '.git' },
+} )
+vim.lsp.enable( 'cfa_lsp' )
+```
+
+Any client that can start a stdio server for `.cfa` and `.hfa` files works
+the same way.
+
+## Configuration
+
+### Compiler flags
+
+The server looks for a `cfa_flags.txt` in the file's directory and then in
+each parent directory, and uses the nearest one. Put one flag per line, or
+several separated by spaces (`-I ../include` works). Lines starting with `#`
+are comments. Relative paths resolve against the directory of the
+`cfa_flags.txt`. Without one, the flags are `-Wall -Wextra`.
+
+```
+-I include
+-DDEBUG
+-Wall
+```
+
+The flags are split between the stages the way the `cfa` driver splits them:
+`-D`, `-U`, `-I` and friends go to the preprocessor, `-Wall`, `-Werror`, `-w`
+and CFA's own warning names (`-Wself-assign`, ...) to the translator, and the
+rest of the warnings and `-f`, `-O`, `-std` options to gcc. `-iquote DIR` is
+passed as `-I DIR`, because the `cfa` driver mistakes the directory for an
+input file.
+
+### initializationOptions
+
+All optional.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `cfa` | `cfa` on `PATH` | The CFA driver. |
+| `translator` | next to the server, then `CFA_LSP_TRANSLATOR` | The forked `cfa-cpp`. Without it the server falls back to `cfa -c` and reports only compiler errors. |
+| `preludeDir` | derived from `cfa` | Directory with `prelude.cfa` (e.g. `<prefix>/lib/cfa/x64-debug`). |
+| `flags` | from `cfa_flags.txt` | Flags as an array, or a string in `cfa_flags.txt` format. Overrides the file. |
+| `backend` | `true` | Run gcc `-fsyntax-only` on the generated C for gcc's warnings. |
+| `cc` | `gcc` | The C compiler for the backend check. |
+| `debounceMs` | `500` | Wait after the last edit before checking. |
+| `timeoutMs` | `120000` | Limit for each child process. |
+
+The server reads these once, at startup.
+
+### Logging
+
+Set `CFA_LSP_LOG` to `error`, `warn`, `info` or `debug` to log to stderr. At
+`info` it logs how long each stage of a check took.
+
+## How it works
+
+On open, and after edits once `debounceMs` has passed, a worker thread checks
+the buffer:
+
+1. It writes the buffer to a temporary file that starts with
+   `# 1 "/real/path.cfa"`, so every location in the output names the real
+   file, and runs `cfa -E` on it with the user's flags plus `-I` for the real
+   file's directory.
+2. It runs the forked translator: `cfa-cpp --lsp out.json --lsp-focus
+   /real/path.cfa [--lsp-c-out out.c] ... in.i`. The translator runs its
+   passes as usual, records errors instead of stopping at the first one, and
+   after the resolver has run writes the declarations, resolved references,
+   expression types and scopes to `out.json`. `docs/dump-format.md` describes
+   the format.
+3. The server loads the JSON (`src/analysis`) and publishes diagnostics.
+4. If the translator reported no errors, it runs gcc `-fsyntax-only` on the
+   generated C and adds gcc's warnings, mapped back to source lines through
+   the line markers.
+
+Requests are answered right away from the last good result. When a check
+fails to parse the file, the previous result stays in use, so completion
+after `x.` keeps working while a line is half typed. Edits made since that
+result are tracked, and positions are mapped through them in both
+directions.
+
+### Columns
+
+`cfa -E` collapses whitespace between tokens and expands macros, so the
+translator's columns are offsets into the preprocessed line, not the line in
+your file. Line numbers are right, thanks to the line markers. The server
+tokenizes both lines and aligns the tokens to map each column back. Tokens
+produced by a macro map to the whole macro invocation, and a macro argument
+maps to where it is written. The alignment is a heuristic, and it can pick
+the wrong spot in a few cases:
+
+- a system-header macro such as `assert` or `isdigit` makes cpp split the line
+  into pieces that share one line number;
+- a header included twice uses the mapping of its first inclusion;
+- a `#line` directive in your source breaks the line correspondence.
+
+## Limits
+
+- A check takes as long as compiling the file: about 3 seconds for a small
+  program that includes `fstream.hfa`, 5 seconds with `string.hfa`. Almost
+  all of it is the translator, and half of that is the resolver.
+- Each file is checked on its own. Open headers are checked as if they were
+  the main file. Saving a header re-checks the open files; nothing else
+  tracks dependencies between files.
+- Uses inside macro bodies have no references, and code the translator
+  generates (for example the bodies of `corun`) is not walked.
+- Array dimensions in declarations, postfix calls (`` x`f ``) and labels are
+  not references.
+- Completion does not know about type-only contexts, `inline` member
+  embedding or qualified enumerators (`Colour.Red`). libcfa names containing
+  `$` are hidden unless the prefix has a `$`.
+- Type and signature text comes from the translator's pretty printer, so it
+  can differ from what you wrote (`Fib &f`, assertions left out).
+- If the translator crashes on an internal assertion there are no results for
+  that check; the error is reported on the file.
+- `workspace/didChangeConfiguration` is not handled. Restart the server to
+  change options.
+
+## Development
+
+```
+src/server/      LSP transport, documents, the check pipeline (C++20)
+src/analysis/    dump loading, SourceMap (column mapping), queries
+cforall/         the CFA source, with the LSP dump in cforall/src/LSP
+docs/            the translator's JSON format
+tests/           doctest tests, one binary; fixtures in tests/fixtures
+translator.mk    builds the translator
+```
+
+Build and test:
+
+```sh
+make -j8                  # server and translator
+make -j8 test             # every test
+make test ARGS='-ts=integration'
+make BUILD=build/mine test   # a separate object directory
+```
+
+`make test` builds the server and the test binary, then runs everything.
+Tests that need `cfa` or the translator skip themselves when those are
+missing. The suites are:
+
+- `tests/analysis`: SourceMap against real `cfa -E` output, the tokenizer,
+  and the queries on hand-written dumps;
+- `tests/server`: transport, position mapping, flags, compiler output parsing
+  and LSP sessions against a fake toolchain (`tests/server/fake`);
+- `tests/translator`: the forked translator on small programs, checking the
+  dump;
+- `tests/integration`: the built server, the translator and `cfa` on the
+  project in `tests/fixtures/project`, driven over pipes the way an editor
+  would.
+
+To see what the server answers on any program, the probe test opens a file
+and prints hover and definition for every identifier. `CFA_LSP_PROBE_FULL=1`
+prints whole hovers:
+
+```sh
+make test ARGS='-tc=probe -s' CFA_LSP_PROBE=path/to/prog.cfa
+```
+
+The translator changes live in the submodule on branch `balaji/lsp`. Most of
+them are in `cforall/src/LSP/Lsp.cpp`; the rest record source locations in the
+parser and keep going after errors. Change `docs/dump-format.md` first when
+the JSON changes, then both sides.

@@ -1,0 +1,6 @@
+// A Latin-1 string literal (byte e9) in an expression with a type error.
+void take( int x ) {}
+int main() {
+take( "café" );
+return 0;
+}
