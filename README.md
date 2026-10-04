@@ -23,7 +23,7 @@ Features:
 - semantic tokens
 
 It runs on Linux and needs an installed CFA 1.0.0 (`cfa` on `PATH`). The
-translator fork is pinned to the same version (commit `fade1b55`).
+translator fork is based on the same version (upstream commit `fade1b55`).
 
 ## Install
 
@@ -211,7 +211,8 @@ prints whole hovers:
 make test ARGS='-tc=probe -s' CFA_LSP_PROBE=path/to/prog.cfa
 ```
 
-The translator changes live in the submodule on branch `balaji/lsp`. Most of
+The translator changes live in the submodule, on branch `balaji/lsp` of
+[BalajiLeninrajan/cforall](https://github.com/BalajiLeninrajan/cforall). Most of
 them are in `cforall/src/LSP/Lsp.cpp`; the rest record source locations in the
 parser and keep going after errors. Change `docs/dump-format.md` first when
 the JSON changes, then both sides.
