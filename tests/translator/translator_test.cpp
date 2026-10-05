@@ -606,6 +606,59 @@ TEST_CASE( "translator: syntax error" ) {
 	CHECK( (*d)["col"] == r->col( 5, ";" ) );
 	CHECK( (*d)["endCol"] == r->col( 5, ";" ) + 1 );
 	CHECK( (*d)["message"].get<std::string>().find( "syntax error" ) != std::string::npos );
+	// The parser skips the broken statement and the rest is translated, but only the syntax error is reported:
+	// `y` is undeclared now, and that is not worth an error.
+	CHECK( r->dump["diagnostics"].size() == 1 );
+	CHECK( declAt( *r, "ok", 2 ) );
+	CHECK( declAt( *r, "main", 4 ) );
+	expectRef( *r, 2, "x", 2, "read", 1 );
+}
+
+TEST_CASE( "translator: the parser recovers from syntax errors in statements and declarations" ) {
+	const Run * r = run( "recovery.cfa" );
+	if ( ! r ) return;
+	checkInvariants( *r );
+	CHECK( r->dump["complete"] == false );
+	std::set<int> lines;
+	for ( const json & d : r->dump["diagnostics"] ) {
+		CHECK( d["severity"] == "error" );
+		lines.insert( d["line"].get<int>() );
+	}
+	// A broken declarator, a broken initializer at file scope and in a block, `r.` with the next line, and
+	// adjacent identifiers. Nothing from the passes after parsing.
+	CHECK( lines == std::set<int>{ 4, 5, 8, 10, 11 } );
+	const json * adjacent = diagnosticOn( *r, 11, "error" );
+	REQUIRE( adjacent );
+	CHECK( (*adjacent)["message"].get<std::string>().find( "adjacent identifiers" ) != std::string::npos );
+
+	// What parsed is declared and resolved, before and after the errors.
+	CHECK( declAt( *r, "Rect", 2 ) );
+	CHECK( declAt( *r, "area", 3 ) );
+	CHECK( declAt( *r, "main", 6 ) );
+	CHECK( declAt( *r, "r", 7 ) );
+	CHECK( declAt( *r, "a", 10 ) );
+	CHECK( declAt( *r, "after", 14 ) );
+	CHECK_FALSE( declAt( *r, "broken", 4 ) );
+	CHECK_FALSE( declAt( *r, "g", 5 ) );
+	CHECK_FALSE( declAt( *r, "y", 8 ) );
+	expectRef( *r, 7, "Rect", 2, "type" );
+	expectRef( *r, 10, "area", 3, "call" );
+	expectRef( *r, 10, "r", 7, "read" );
+	expectRef( *r, 12, "a", 10, "read" );
+	expectRef( *r, 14, "area", 3, "call" );
+	expectRef( *r, 14, "r", 14, "read", 1 );
+}
+
+TEST_CASE( "translator: a syntax error at the end of the file keeps the definitions before it" ) {
+	const Run * r = run( "unclosed.cfa" );
+	if ( ! r ) return;
+	checkInvariants( *r );
+	CHECK( r->dump["complete"] == false );
+	bool error = false;
+	for ( const json & d : r->dump["diagnostics"] ) error = error || d["severity"] == "error";
+	CHECK( error );
+	CHECK( declAt( *r, "first", 2 ) );
+	expectRef( *r, 2, "x", 2, "read", 1 );
 }
 
 TEST_CASE( "translator: a type error keeps the rest of the dump" ) {

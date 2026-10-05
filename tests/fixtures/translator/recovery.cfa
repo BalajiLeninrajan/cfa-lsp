@@ -1,0 +1,14 @@
+// Syntax errors the parser recovers from; the rest is still translated.
+struct Rect { int w, h; };
+int area( Rect r ) { return r.w * r.h; }
+int broken( int x = ) { return x; }
+int g = ;
+int main() {
+Rect r = { 1, 2 };
+int y = ;
+r.
+int a = area( r );
+Strng s;
+return a;
+}
+int after( Rect r ) { return area( r ); }

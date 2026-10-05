@@ -488,6 +488,35 @@ TEST_CASE( "answers for text typed since the last check" ) {
 	CHECK( c.shutdown() == 0 );
 }
 
+TEST_CASE( "a check of a file with a syntax error still covers the code that parses" ) {
+	if ( ! ready() ) return;
+	LspClient c( envOr( "CFA_LSP_TEST_LOG" ) );
+	c.initialize( { { "debounceMs", 50 }, { "backend", false } } );
+	std::string text = readAll( projectDir() + "/geometry.cfa" );
+	std::string uri = uriOf( projectDir() + "/scratch_recovery.cfa" );
+	c.open( uri, text );
+	REQUIRE( c.diagnostics( uri, 1 ) );
+	// A half-typed statement, and code after it that no earlier check has seen.
+	std::string ins = "\tint half = ;\n\tdouble fresh = a1 * 2;\n\tsout | fresh;\n";
+	json p = posOf( text, "\tsout | u | du;" );
+	text.insert( text.find( "\tsout | u | du;" ), ins );
+	c.change( uri, 2, p, p, ins );
+	auto d = c.diagnostics( uri, 2 );
+	REQUIRE( d );
+	// Only the syntax error: nothing about the code the parser skipped.
+	REQUIRE( ( *d )["diagnostics"].size() == 1 );
+	CHECK( ( *d )["diagnostics"][0]["range"]["start"]["line"] == posOf( text, "int half" )["line"] );
+	CHECK( contains( ( *d )["diagnostics"][0]["message"].get<std::string>(), "syntax error" ) );
+	// The new code was translated: hover comes from the translator, not the text.
+	std::string h = hoverText( c.result( "textDocument/hover", at( uri, posOf( text, "fresh;" ) ) ) );
+	CHECK( contains( h, "double fresh" ) );
+	CHECK_FALSE( contains( h, "from the text" ) );
+	json def = c.result( "textDocument/definition", at( uri, posOf( text, "a1 * 2" ) ) );
+	REQUIRE( def.size() == 1 );
+	CHECK( def[0]["range"]["start"] == posOf( text, "a1 = area" ) );
+	CHECK( c.shutdown() == 0 );
+}
+
 TEST_CASE( "a header edited but not saved: locations in it follow the buffer" ) {
 	if ( ! ready() ) return;
 	LspClient c( envOr( "CFA_LSP_TEST_LOG" ) );
