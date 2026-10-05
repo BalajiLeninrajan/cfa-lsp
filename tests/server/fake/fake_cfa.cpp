@@ -11,7 +11,10 @@
 //                        the --lsp-c-out file, with @FILE@ replaced by the
 //                        --lsp-focus path and @DIR@ by its directory. If the input
 //                        contains FAKE_SLOW it first forks a grandchild, writes
-//                        both pids to $FAKE_CFA_PIDS and sleeps.
+//                        both pids to $FAKE_CFA_PIDS and sleeps. FAKE_CRASH
+//                        makes it print an assertion failure and abort without
+//                        writing OUT, FAKE_EMPTY_DUMP makes it write an empty OUT
+//                        and exit with status 0.
 //   -fsyntax-only ... C  backend: print $FAKE_CFA_DIR/gcc.err to stderr with
 //                        @CFILE@ replaced by C.
 //
@@ -21,6 +24,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <vector>
 
@@ -124,6 +128,16 @@ int main( int argc, char * argv[] ) {
 				std::rename( ( env( "FAKE_CFA_PIDS" ) + ".tmp" ).c_str(), env( "FAKE_CFA_PIDS" ).c_str() );
 			}
 			sleep( 60 );
+		}
+		if ( readFile( in ).find( "FAKE_CRASH" ) != std::string::npos ) {
+			std::fprintf( stderr, "*CFA assertion error* \"fake\" from program \"cfa-cpp\"\n" );
+			rlimit none = { 0, 0 };				// no core file
+			setrlimit( RLIMIT_CORE, &none );
+			std::abort();
+		}
+		if ( readFile( in ).find( "FAKE_EMPTY_DUMP" ) != std::string::npos ) {
+			std::ofstream( after( "--lsp" ) ).close();
+			return 0;
 		}
 		std::string focusDir = focus.substr( 0, focus.rfind( '/' ) );
 		std::string dumpName = readFile( in ).find( "FAKE_HEADER_ERROR" ) != std::string::npos ? "/dump-error.json" : "/dump.json";

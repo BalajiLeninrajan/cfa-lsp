@@ -494,3 +494,55 @@ TEST_CASE( "after didClose, the last publish for the file is empty" ) {
 	s.notify( "exit", nullptr );
 	CHECK( s.finish() == 0 );
 }
+
+TEST_CASE( "a translator crash is an error on line 1, and the previous analysis stays" ) {
+	if ( fakeCfa().empty() ) {
+		MESSAGE( "CFA_LSP_FAKE_CFA not set; skipping (run through make test)" );
+		return;
+	}
+	FakeEnv env;
+	std::string path = fs::canonical( fixtures() + "/server/hello.cfa" ).string();
+	std::string uri = pathToUri( path );
+	std::string text = readAll( path );
+	Session s;
+	s.initialize( fakeOptions( { { "backend", false } } ) );
+	s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 }, { "text", text } } } } );
+	REQUIRE( s.diagnosticsFor( uri, []( const json & ds ) { return ds.empty(); } ) );
+
+	int version = 1;
+	for ( const char * marker : { "FAKE_CRASH", "FAKE_EMPTY_DUMP" } ) {
+		INFO( marker );
+		version += 1;
+		s.notify( "textDocument/didChange", { { "textDocument", { { "uri", uri }, { "version", version } } },
+											  { "contentChanges", { { { "text", text + "// " + marker + "\n" } } } } } );
+		auto d = s.diagnosticsFor( uri, []( const json & ds ) { return ! ds.empty(); } );
+		REQUIRE( d );
+		CHECK( ( *d )["version"] == version );
+		json ds = ( *d )["diagnostics"];
+		REQUIRE( ds.size() == 1 );
+		std::string message = ds[0]["message"];
+		CHECK( message.rfind( "internal translator error: cfa-cpp ", 0 ) == 0 );
+		if ( std::string( marker ) == "FAKE_CRASH" ) {
+			CHECK( message.find( "killed by signal" ) != std::string::npos );
+			CHECK( message.find( "*CFA assertion error*" ) != std::string::npos );	// from its stderr
+		} else {
+			CHECK( message.find( "wrote no output" ) != std::string::npos );
+		}
+		CHECK( ds[0]["severity"] == 1 );
+		CHECK( ds[0]["range"]["start"]["line"] == 0 );
+		if ( realAnalysis() ) {
+			// the call to twice
+			json hv = s.request( "textDocument/hover", { { "textDocument", { { "uri", uri } } }, { "position", pos( 8, 10 ) } } )["result"];
+			CHECK( ! hv.is_null() );
+		}
+		// Back to the good text, so the next marker's publish is a change.
+		version += 1;
+		s.notify( "textDocument/didChange", { { "textDocument", { { "uri", uri }, { "version", version } } },
+											  { "contentChanges", { { { "text", text } } } } } );
+		REQUIRE( s.diagnosticsFor( uri, []( const json & ds ) { return ds.empty(); } ) );
+	}
+	s.request( "shutdown" );
+	s.notify( "exit", nullptr );
+	CHECK( s.finish() == 0 );
+	CHECK( env.tempDirsLeft() == 0 );
+}
