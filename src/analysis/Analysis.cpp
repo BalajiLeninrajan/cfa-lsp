@@ -2226,9 +2226,45 @@ UnitIndex Analysis::unitIndex() const {
 		return i;
 	};
 
+	m.loadMacros();
 	for ( int fi = 0; fi < int( m.files.size() ); fi += 1 ) {
 		const File & f = m.files[fi];
 		if ( !f.focus || f.path.empty() || f.path[0] != '/' ) continue;
+		// Spellings the dump doesn't account for, the same ones rename() checks.
+		if ( auto source = m.read ? m.read( f.path ) : std::nullopt ) {
+			std::set<Loc> known;
+			for ( int r : f.refs ) known.insert( m.refs[r].range.start );
+			for ( int n : f.names ) known.insert( m.decls[n].nameRange.start );
+			for ( const Token & tok : lex( *source ) ) {
+				if ( tok.kind != TokKind::Identifier || tok.line != tok.endLine || known.count( Loc{ tok.line, tok.col } ) ||
+					 !text::isIdentifier( tok.text ) || isKeyword( tok.text ) ) {
+					continue;
+				}
+				out.loose.push_back( { tok.text, { f.path, { { tok.line, tok.col }, { tok.line, tok.endCol } } }, false } );
+			}
+		}
+		for ( const auto & [name, list] : m.macros ) {
+			for ( const Impl::Macro & mac : list ) {
+				if ( mac.file != fi ) continue;
+				std::string_view body( mac.text );
+				size_t k = body.find( "define" );
+				if ( k != std::string_view::npos ) k = body.find( name, k + 6 );
+				if ( k == std::string_view::npos ) continue;
+				body.remove_prefix( k + name.size() );
+				std::set<std::string> params;
+				if ( mac.function ) {
+					size_t close = body.find( ')' );
+					if ( close == std::string_view::npos ) continue;
+					for ( const Token & t : lex( body.substr( 0, close ) ) ) params.insert( t.text );
+					body.remove_prefix( close + 1 );
+				}
+				std::set<std::string> named;
+				for ( const Token & t : lex( body ) ) {
+					if ( t.kind != TokKind::Identifier || params.count( t.text ) || isKeyword( t.text ) || !named.insert( t.text ).second ) continue;
+					out.loose.push_back( { t.text, { f.path, mac.name }, true } );
+				}
+			}
+		}
 		for ( int r : f.refs ) {
 			const Ref & ref = m.refs[r];
 			if ( !wanted( ref.decl ) ) continue;
@@ -2662,7 +2698,7 @@ std::vector<InlayHint> Analysis::inlayHints( const std::string & file, Range ran
 	return out;
 }
 
-std::optional<RenamePlan> Analysis::rename( const std::string & file, Loc pos ) const {
+std::optional<RenamePlan> Analysis::rename( const std::string & file, Loc pos, bool acrossFiles ) const {
 	const Impl & m = *impl;
 	int fi = m.findFile( file );
 	if ( fi < 0 ) return std::nullopt;
@@ -2682,16 +2718,18 @@ std::optional<RenamePlan> Analysis::rename( const std::string & file, Loc pos ) 
 	for ( int d : m.entityMembers[m.entity[t.decl]] ) {
 		if ( m.decls[d].generated || m.decls[d].file == fi ) continue;
 		std::string w = m.where( d, file );
+		if ( acrossFiles && !isLibrary( m.origin( d ) ) ) continue;
 		return refuse( quoted + " is declared in " + ( w.empty() ? std::string( "another file" ) : "`" + w + "`" ) +
-					   "; renaming across files is not supported yet" );
+					   ( acrossFiles ? "" : "; renaming it across files needs the workspace index" ) );
 	}
-	if ( isHeaderPath( file ) && !x.local ) {
+	if ( isHeaderPath( file ) && !x.local && !acrossFiles ) {
 		return refuse( quoted + " is declared in a header, and the files that include it are not known; "
 					   "only local names can be renamed in a header" );
 	}
 	auto ft = m.text( fi );
 	for ( const Location & l : m.entityReferences( t.decl, true ) ) {
-		if ( l.file != file ) return refuse( quoted + " is used in another file; renaming across files is not supported yet" );
+		if ( l.file != file && acrossFiles ) continue;
+		if ( l.file != file ) return refuse( quoted + " is used in another file; renaming it across files needs the workspace index" );
 		if ( ft && ft->slice( l.range ) != x.name ) return refuse( "an occurrence of " + quoted + " does not spell its name; rename it by hand" );
 		plan.sites.push_back( l.range );
 	}

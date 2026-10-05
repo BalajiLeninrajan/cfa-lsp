@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -30,7 +31,9 @@ namespace cfalsp {
 // one worker thread runs checks and publishes diagnostics. An edit does not
 // cancel the check in flight unless it has run more than twice as long as the
 // document's last check: it finishes and publishes, mapped through the edits
-// made since, and the next check starts after it.
+// made since, and the next check starts after it. When it has nothing else
+// to do, the worker checks every .cfa file under the workspace root from disk
+// (the background index) for cross-file queries.
 class Server {
   public:
 	Server( int inFd, int outFd, std::string exeDir );
@@ -54,8 +57,11 @@ class Server {
 	using json = nlohmann::json;
 	using Clock = std::chrono::steady_clock;
 
+	using SeqMap = std::map<std::string, uint64_t>;	// path -> document seq
+
 	struct DiagSet {
 		uint64_t seq = 0;					// document seq the positions refer to (main file only)
+		SeqMap reads;						// other documents the check read from their buffers
 		std::vector<Diag> diags;
 	};
 
@@ -69,6 +75,9 @@ class Server {
 
 		std::shared_ptr<const Analysis> analysis;
 		uint64_t analysisSeq = 0;
+		SeqMap analysisReads;				// other documents its check read from their buffers
+		std::shared_ptr<const UnitIndex> table;	// from `analysis`, for cross-file queries
+		std::vector<std::string> includes;	// project files the last check read
 		// The seq at which the buffer had the contents on disk (when opened or
 		// saved), which is what other documents' checks read; unset if unknown.
 		std::optional<uint64_t> diskSeq;
@@ -90,13 +99,66 @@ class Server {
 		uint64_t seq = 0;
 		std::shared_ptr<CancelToken> token;
 		Clock::time_point started;
+		SeqMap reads;
+		bool index = false;					// a background index check, from disk
 	};
+
+	// How the positions in one check's results relate to the texts the client
+	// has now: `main` was read from its buffer at `mainSeq`, the files in
+	// `reads` from their buffers at those seqs, every other file from disk.
+	struct Snapshot {
+		std::string main;
+		uint64_t mainSeq = 0;
+		SeqMap reads;
+	};
+
+	// One check's tables for cross-file queries.
+	struct Source {
+		std::shared_ptr<const UnitIndex> table;
+		Snapshot snap;
+		bool index = false;					// from the background index
+	};
+
+	// A declaration as cross-file queries match it: file and name start, in
+	// the text the client has now.
+	using Key = std::pair<std::string, Loc>;
+
+	struct Match {
+		size_t source;
+		int entity;
+	};
+
+	// The entity under the cursor, if the document's table knows it (it
+	// leaves out locals).
+	struct Target {
+		std::string name;
+		std::set<Key> keys;
+		bool library = false;
+		bool function = false;
+	};
+
+	struct Mapped {
+		const Text * text;
+		Location loc;
+	};
+
+	struct IndexEntry {
+		std::shared_ptr<const UnitIndex> table;	// null until checked, or if the check failed
+		// Modification times of the files the check read, taken before it ran.
+		std::map<std::string, std::filesystem::file_time_type> stamps;
+		bool stale = true;
+		uint64_t gen = 0;					// bumped whenever it goes stale
+	};
+
+	// Where a cross-file rename edits: file -> (text the ranges are in, ranges).
+	using RenameSites = std::map<std::string, std::pair<const Text *, std::vector<Range>>>;
 
 	struct Options {
 		int debounceMs = 500;
 		bool backend = true;
 		int timeoutMs = 120000;
 		bool stopAfterResolve = false;
+		bool index = true;
 		std::optional<std::vector<std::string>> flags;
 	};
 
@@ -136,6 +198,7 @@ class Server {
 	void didClose( const json & params );
 	void didSave( const json & params );
 	void schedule( const std::string & path, int delayMs );	// caller holds mtx
+	void scheduleDependents( const std::string & header );	// caller holds mtx
 	void trimLog( Document & doc );		// caller holds mtx
 
 	// queries (caller holds mtx)
@@ -153,6 +216,9 @@ class Server {
 	json rename( const json & params );
 	json switchSourceHeader( const json & params );
 	json workspaceSymbol( const json & params );
+	json prepareCallHierarchy( const json & params );
+	json incomingCalls( const json & params );
+	json outgoingCalls( const json & params );
 	// The cursor in `params` in d's snapshot; nullopt if it is in text typed since.
 	std::optional<Loc> cursorInSnapshot( const Document & d, const json & params ) const;
 	// The rename at the cursor with its ranges in the current buffer; nullopt
@@ -160,11 +226,38 @@ class Server {
 	std::optional<RenamePlan> renameAt( const Document & d, const json & params );
 	json codeAction( const json & params );
 	json formatting( const json & params, bool range );
+	// The same across files, through the index: plan.sites is empty and the
+	// edits are in `sites`. nullopt when the index can't do it (no index, or
+	// the name is local), and renameAt applies.
+	std::optional<RenamePlan> renameAcross( const Document & d, const json & params, RenameSites & sites );
+
+	// cross-file queries (caller holds mtx)
+	std::vector<Source> sources();
+	bool hidden( const Source & s, const std::string & file ) const;
+	std::optional<Target> targetAt( const Document & d, Loc pos );
+	std::set<Key> keysOf( const Source & s, int entity );
+	std::vector<Match> matchEntities( const std::vector<Source> & srcs, const std::string & name, std::set<Key> & keys );
+	std::optional<json> callItem( const std::vector<Source> & srcs, const std::vector<Match> & matches,
+								  const std::set<Key> & keys );
+	// For grouping calls: the same id for an entity in every source, and its item.
+	std::pair<std::string, std::optional<json>> resolveEntity( const std::vector<Source> & srcs, size_t source, int entity );
+	std::pair<std::string, std::set<Key>> itemKeys( const json & item );
+	json calls( const json & params, bool incoming );
 
 	// conversions (caller holds mtx)
 	json lspPos( const Text & text, Loc l ) const;
 	json lspRange( const Text & text, Range r ) const;
-	std::optional<json> lspLocation( const Document & from, const Location & loc, bool exact );
+	Snapshot snapOf( const Document & d ) const;
+	// The edits that take positions `snap` has in `file` to the text the
+	// client sees, which is stored in `text`.
+	EditList editsFor( const Snapshot & snap, const std::string & file, const Text *& text );
+	// A location from a check, in the client's text; nullopt if `exact` and
+	// an edit touched it.
+	std::optional<Mapped> toClient( const Snapshot & snap, const Location & loc, bool exact );
+	std::optional<json> lspLocation( const Snapshot & snap, const Location & loc, bool exact );
+	std::optional<json> lspLocation( const Document & from, const Location & loc, bool exact ) {
+		return lspLocation( snapOf( from ), loc, exact );
+	}
 	const Text & textOf( const std::string & path );	// open document or disk (cached per request)
 	// A range in `path` as read from disk, in the text the client sees: the
 	// open buffer if the edits since its disk contents are known, else the
@@ -179,14 +272,19 @@ class Server {
 	const HeaderIndex & headerIndex();
 
 	// diagnostics
-	void storeDiags( const std::string & source, uint64_t seq, const std::vector<Diag> & diags,
+	void storeDiags( const std::string & source, uint64_t seq, const SeqMap & reads, const std::vector<Diag> & diags,
 					 std::vector<json> & out );	// caller holds mtx
 	json publishFor( const std::string & target );	// caller holds mtx
-	json diagJson( const Diag & d, const std::string & target, const std::string & source, uint64_t seq );
+	json diagJson( const Diag & d, const std::string & target, const std::string & source, const DiagSet & set );
 
 	// checking
 	void workerLoop();
-	CheckRequest makeRequest( const Document & doc ) const;
+	CheckRequest makeRequest( const std::string & path, const std::string & text ) const;
+
+	// background index (worker thread, holding `lk` except while it works)
+	bool indexing() const;
+	void scanWorkspace( std::unique_lock<std::mutex> & lk );
+	bool runIndexJob( std::unique_lock<std::mutex> & lk );	// false if nothing is stale
 	void rebaseBackend( Document & doc, uint64_t seq );	// caller holds mtx
 
 	MessageReader reader;
@@ -197,6 +295,7 @@ class Server {
 	Encoding enc = Encoding::Utf16;
 	bool hierarchicalSymbols = false;
 	bool prepareRenameSupport = false;
+	bool watchFiles = false;				// the client takes dynamic registration of file watchers
 	bool inlayHintRefresh = false;			// the client takes workspace/inlayHint/refresh
 	std::string rootPath;
 	bool configurationPull = false;			// client answers workspace/configuration
@@ -231,6 +330,9 @@ class Server {
 	std::map<std::string, Text> diskCache;	// cleared per request
 	int refreshRequests = 0;				// ids of the requests we send
 	std::optional<HeaderIndex> headers;		// see headerIndex()
+	std::map<std::string, IndexEntry> index;	// every .cfa under the root, by path
+	std::vector<std::string> projectHeaders;	// .hfa files under the root, focus files for index checks
+	bool indexRescan = false;				// walk the root again and look for changed files
 };
 
 } // namespace cfalsp

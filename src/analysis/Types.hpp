@@ -132,9 +132,19 @@ struct UnitIndex {
 		int kind = 13;						// LSP SymbolKind
 		Location loc;
 	};
+	// A spelling of a name in a focus file that the dump has no use or
+	// declaration for: in an array dimension, a designator, dead #if code or
+	// code that failed to resolve, or in a macro body (`loc` is then the
+	// macro's name). A rename would leave it behind.
+	struct Loose {
+		std::string name;
+		Location loc;
+		bool macro = false;
+	};
 	std::vector<Entity> entities;
 	std::vector<Ref> refs;
 	std::vector<Sym> symbols;
+	std::vector<Loose> loose;
 };
 
 } // namespace cfalsp

@@ -1,0 +1,10 @@
+#include <fstream.hfa>
+#include "shapes.hfa"
+
+double area( Rect r ) {
+	return r.w * r.h;
+}
+
+void describe( Rect r ) {
+	sout | area( r );
+}

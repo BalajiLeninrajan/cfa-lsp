@@ -388,6 +388,9 @@ TEST_CASE( "unit index: entities, uses and symbols for other files" ) {
 	}
 	CHECK( sawTwice );
 	CHECK( sawField );
+
+	// Every spelling of area is a use or a declaration in the dump.
+	for ( const auto & l : u.loose ) CHECK( l.name != "area" );
 }
 
 TEST_CASE( "document symbols" ) {

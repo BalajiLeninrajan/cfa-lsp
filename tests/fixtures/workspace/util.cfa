@@ -1,0 +1,5 @@
+#include "shapes.hfa"
+
+double twiceArea( Rect r ) {
+	return 2 * area( r );
+}

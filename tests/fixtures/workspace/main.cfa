@@ -1,0 +1,9 @@
+#include "shapes.hfa"
+
+double twiceArea( Rect r );
+
+int main() {
+	Rect r = { 2, 3 };
+	describe( r );
+	return area( r ) > twiceArea( r );
+}
