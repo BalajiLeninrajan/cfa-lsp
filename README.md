@@ -220,7 +220,10 @@ the wrong spot in a few cases:
 - A check takes as long as compiling the file: about 3 seconds for a small
   program that includes `fstream.hfa`, 5 seconds with `string.hfa`. Almost
   all of it is the translator, and half of that is the resolver.
-  `stopAfterResolve` cuts 40 to 45% of it.
+  `stopAfterResolve` cuts 40 to 45% of it. Most of the rest is re-parsing and
+  re-resolving the prelude and the libcfa headers on every check;
+  `docs/persistent-translator.md` describes how a long-running translator
+  could avoid that.
 - Each file is checked on its own. Open headers are checked as if they were
   the main file. Saving a header re-checks the open files; nothing else
   tracks dependencies between files.
@@ -248,7 +251,7 @@ the wrong spot in a few cases:
 src/server/          LSP transport, documents, the check pipeline (C++20)
 src/analysis/        dump loading, SourceMap (column mapping), queries
 cforall/             the CFA source, with the LSP dump in cforall/src/LSP
-docs/                the translator's JSON format
+docs/                the translator's JSON format, design notes
 tests/               doctest tests, one binary; fixtures in tests/fixtures
 translator.mk        builds the translator
 compile-commands.mk  translator entries for compile_commands.json
