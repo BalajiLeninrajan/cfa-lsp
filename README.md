@@ -253,8 +253,9 @@ For other macros, such an identifier maps to the argument.
   `$` are hidden unless the prefix has a `$`.
 - Type and signature text comes from the translator's pretty printer, so it
   can differ from what you wrote (`Fib &f`, assertions left out).
-- If the translator crashes on an internal assertion there are no results for
-  that check; the error is reported on the file.
+- If the translator fails an internal assertion or crashes, the check reports
+  `internal translator error` on line 1, and unless the crash came after
+  resolution the previous results stay in use.
 
 ## Development
 
@@ -293,7 +294,9 @@ missing. The suites are:
 - `tests/server`: transport, position mapping, flags, compiler output parsing
   and LSP sessions against a fake toolchain (`tests/server/fake`);
 - `tests/translator`: the forked translator on small programs, checking the
-  dump;
+  dump, plus a fuzz test that runs it on truncated and mutated fixtures. Set
+  `CFA_LSP_FUZZ=all` to run every variant instead of a sample (about 10
+  minutes on CI);
 - `tests/integration`: the built server, the translator and `cfa` on the
   project in `tests/fixtures/project`, driven over pipes the way an editor
   would.

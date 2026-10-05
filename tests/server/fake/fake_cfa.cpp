@@ -17,7 +17,9 @@
 //                        it first forks a grandchild, writes both pids to
 //                        $FAKE_CFA_PIDS and sleeps. If it contains FAKE_DELAY
 //                        it creates $FAKE_CFA_STARTED and sleeps for 1.5 s
-//                        first.
+//                        first. FAKE_CRASH makes it print an assertion failure
+//                        and abort without writing OUT, FAKE_EMPTY_DUMP makes
+//                        it write an empty OUT and exit with status 0.
 //   -fsyntax-only ... C  backend: print $FAKE_CFA_DIR/gcc.err to stderr with
 //                        @CFILE@ replaced by C, and an error on line 6 if C
 //                        contains FAKE_GCC_ERROR.
@@ -28,6 +30,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <vector>
 
@@ -131,6 +134,16 @@ int main( int argc, char * argv[] ) {
 				std::rename( ( env( "FAKE_CFA_PIDS" ) + ".tmp" ).c_str(), env( "FAKE_CFA_PIDS" ).c_str() );
 			}
 			sleep( 60 );
+		}
+		if ( readFile( in ).find( "FAKE_CRASH" ) != std::string::npos ) {
+			std::fprintf( stderr, "*CFA assertion error* \"fake\" from program \"cfa-cpp\"\n" );
+			rlimit none = { 0, 0 };				// no core file
+			setrlimit( RLIMIT_CORE, &none );
+			std::abort();
+		}
+		if ( readFile( in ).find( "FAKE_EMPTY_DUMP" ) != std::string::npos ) {
+			std::ofstream( after( "--lsp" ) ).close();
+			return 0;
 		}
 		if ( readFile( in ).find( "FAKE_DELAY" ) != std::string::npos ) {
 			if ( ! env( "FAKE_CFA_STARTED" ).empty() ) std::ofstream( env( "FAKE_CFA_STARTED" ) ) << getpid() << '\n';

@@ -8,8 +8,12 @@
 #include <doctest/doctest.h>
 #include <nlohmann/json.hpp>
 
+#include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -17,6 +21,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -270,6 +275,88 @@ void checkInvariants( const Run & r ) {
 		for ( const json & id : s["decls"] ) CHECK( id.get<int>() < (int)decls.size() );
 		if ( ! s["parent"].is_null() ) CHECK( s["parent"].get<int>() < (int)r.dump["scopes"].size() );
 	}
+}
+
+// One translator run on `text` as if it were the file `path`, the way the server runs it: the text goes to a temp
+// file whose first line is a line marker naming `path`. Uses no doctest macros, so threads can call it.
+struct Translation {
+	bool preprocessed = false;							// false: cfa -E failed and the translator did not run
+	int status = -1;									// exit status, or -1 when killed by a signal
+	int signal = 0;
+	std::string dump, err;
+};
+
+// `vars` (VAR=value ...) go in the translator's environment.
+Translation translateText( const std::string & path, const std::string & text, const std::string & vars = "" ) {
+	const Tools & t = tools();
+	Translation out;
+	std::string dirTemplate = ( fs::temp_directory_path() / "cfa-lsp-translator-XXXXXX" ).string();
+	std::vector<char> buf( dirTemplate.begin(), dirTemplate.end() );
+	buf.push_back( '\0' );
+	if ( ! mkdtemp( buf.data() ) ) {
+		out.err = "mkdtemp failed";
+		return out;
+	}
+	fs::path work( buf.data() );
+	std::ofstream( work / "in.cfa", std::ios::binary ) << "# 1 \"" << path << "\"\n" << text;
+	std::string pre = quote( t.cfa ) + " -E -I " + quote( fs::path( path ).parent_path().string() ) + " "
+		+ quote( ( work / "in.cfa" ).string() ) + " > " + quote( ( work / "in.i" ).string() ) + " 2> "
+		+ quote( ( work / "cpp.err" ).string() );
+	out.preprocessed = std::system( pre.c_str() ) == 0;
+	if ( out.preprocessed ) {
+		std::string cmd = vars + ( vars.empty() ? "" : " " ) + quote( t.translator ) + " --prelude-dir=" + quote( t.prelude )
+			+ " --lsp " + quote( ( work / "out.json" ).string() ) + " --lsp-focus " + quote( path )
+			+ " -Wall -Wextra"							// the server's default flags
+			+ " " + quote( ( work / "in.i" ).string() ) + " > " + quote( ( work / "translator.err" ).string() ) + " 2>&1";
+		int rc = std::system( cmd.c_str() );
+		if ( WIFEXITED( rc ) && WEXITSTATUS( rc ) < 128 ) {
+			out.status = WEXITSTATUS( rc );
+		} else {										// the shell reports a killed child as 128 + signal
+			out.signal = WIFSIGNALED( rc ) ? WTERMSIG( rc ) : WEXITSTATUS( rc ) - 128;
+		}
+		out.dump = readFile( work / "out.json" );
+		out.err = readFile( work / "translator.err" );
+	} else {
+		out.err = readFile( work / "cpp.err" );
+	}
+	std::error_code ec;
+	fs::remove_all( work, ec );
+	return out;
+}
+
+// The diagnostics whose message starts with `prefix`.
+std::vector<json> diagnosticsStarting( const json & dump, const std::string & prefix ) {
+	std::vector<json> out;
+	if ( ! dump.is_object() || ! dump.contains( "diagnostics" ) || ! dump["diagnostics"].is_array() ) return out;
+	for ( const json & d : dump["diagnostics"] ) {
+		if ( d.is_object() && d.contains( "message" ) && d["message"].is_string()
+				&& d["message"].get<std::string>().rfind( prefix, 0 ) == 0 ) out.push_back( d );
+	}
+	return out;
+}
+
+// What is wrong with a dump, or "" if it has the shape docs/dump-format.md gives.
+std::string dumpProblem( const std::string & text ) {
+	json dump = json::parse( text, nullptr, false );
+	if ( dump.is_discarded() ) return text.empty() ? "empty dump" : "dump is not valid JSON";
+	if ( ! dump.is_object() || ! dump.contains( "format" ) || dump["format"] != 1 ) return "no format 1";
+	if ( ! dump.contains( "complete" ) || ! dump["complete"].is_boolean() ) return "no complete flag";
+	for ( const char * key : { "diagnostics", "decls", "refs", "exprs", "scopes" } ) {
+		if ( ! dump.contains( key ) || ! dump[key].is_array() ) return std::string( "no " ) + key + " array";
+	}
+	auto internal = diagnosticsStarting( dump, "internal translator error" );
+	if ( ! internal.empty() ) return internal.front()["message"].get<std::string>();
+	return "";
+}
+
+// The first few lines of a translator's output, for failure messages.
+std::string head( const std::string & text, size_t lines = 6 ) {
+	size_t pos = 0;
+	for ( size_t i = 0; i < lines && pos != std::string::npos; i += 1 ) {
+		pos = text.find( '\n', pos );
+		if ( pos != std::string::npos ) pos += 1;
+	}
+	return text.substr( 0, pos );
 }
 
 } // namespace
@@ -822,6 +909,165 @@ TEST_CASE( "translator: bytes that are not UTF-8 in messages don't break the dum
 	const Run * latin1 = run( "latin1.cfa" );
 	REQUIRE( latin1 );
 	CHECK( diagnosticOn( *latin1, 4, "error" ) );
+}
+
+TEST_CASE( "translator: a failed assertion still writes the dump" ) {
+	if ( ! run( "overload.cfa" ) ) return;				// skips without the translator
+	std::string path = fs::absolute( fs::path( tools().fixtures ) / "translator" / "overload.cfa" ).lexically_normal().string();
+	Translation t = translateText( path, readFile( path ), "CFA_LSP_TEST_CRASH=assert" );
+	INFO( t.err );
+	REQUIRE( t.preprocessed );
+	CHECK( t.signal == 0 );
+	REQUIRE( t.status == 0 );
+	json dump = json::parse( t.dump );
+	auto internal = diagnosticsStarting( dump, "internal translator error: assertion" );
+	REQUIRE( internal.size() == 1 );
+	CHECK( internal[0]["message"].get<std::string>().find( "CFA_LSP_TEST_CRASH" ) != std::string::npos );
+	CHECK( internal[0]["severity"] == "error" );
+	CHECK( internal[0]["file"] == path );
+	CHECK( internal[0]["line"] == 1 );
+	CHECK( internal[0]["col"] == 0 );
+	// The assertion fails after the snapshot of a resolved unit, so that is kept.
+	CHECK( dump["complete"] == true );
+	CHECK_FALSE( dump["decls"].empty() );
+	CHECK_FALSE( dump["refs"].empty() );
+}
+
+TEST_CASE( "translator: a fatal signal still writes the dump" ) {
+	if ( ! run( "overload.cfa" ) ) return;
+	std::string path = fs::absolute( fs::path( tools().fixtures ) / "translator" / "overload.cfa" ).lexically_normal().string();
+	Translation t = translateText( path, readFile( path ), "CFA_LSP_TEST_CRASH=segv" );
+	INFO( t.err );
+	REQUIRE( t.preprocessed );
+	CHECK( t.signal == 0 );
+	REQUIRE( t.status == 0 );
+	json dump = json::parse( t.dump );
+	auto internal = diagnosticsStarting( dump, "internal translator error: segmentation fault" );
+	REQUIRE( internal.size() == 1 );
+	CHECK( internal[0]["line"] == 1 );
+	// The crash comes before any pass, so there is nothing but the diagnostic.
+	CHECK( dump["complete"] == false );
+	CHECK( dump["decls"].empty() );
+}
+
+// The first identifier on a line that is not a keyword, as [start, end), or start == npos.
+static std::pair<size_t, size_t> firstName( const std::string & line ) {
+	static const std::set<std::string> keywords = { "auto", "bool", "break", "case", "catch", "char", "const",
+		"continue", "coroutine", "default", "define", "do", "double", "else", "enum", "exception", "extern", "float",
+		"for", "forall", "if", "include", "inline", "int", "long", "monitor", "mutex", "resume", "return", "short",
+		"signed", "sizeof", "static", "struct", "suspend", "switch", "thread", "throw", "trait", "try", "typedef",
+		"typeof", "union", "unsigned", "vtable", "void", "while", "with" };
+	auto idStart = []( char c ) { return isalpha( (unsigned char)c ) || c == '_'; };
+	auto idChar = []( char c ) { return isalnum( (unsigned char)c ) || c == '_'; };
+	size_t lineComment = line.find( "//" );
+	for ( size_t i = 0; i < line.size() && i < lineComment; ) {
+		if ( line[i] == '"' || line[i] == '\'' ) return { std::string::npos, 0 };	// leave literals alone
+		if ( ! idStart( line[i] ) || ( i > 0 && idChar( line[i - 1] ) ) ) {
+			i += 1;
+			continue;
+		}
+		size_t end = i;
+		while ( end < line.size() && idChar( line[end] ) ) end += 1;
+		if ( ! keywords.count( line.substr( i, end - i ) ) ) return { i, end };
+		i = end;
+	}
+	return { std::string::npos, 0 };
+}
+
+// A half-typed file reaches the passes before Resolve with ASTs the normal compiler never sees, because it stops at
+// the first error. Each fixture cut after each of its lines, and a sample of mutations (a line left out, doubled,
+// swapped with the next, or with its first name replaced by an undeclared one), must give a well-formed dump with no
+// internal errors. The project and demo fixtures include fstream.hfa, which makes each run several times slower, so
+// they are cut after every third line only. CFA_LSP_FUZZ=all cuts after every line and applies every mutation to
+// every line, which takes about five times as long.
+TEST_CASE( "translator: truncated and mutated fixtures always give a dump" ) {
+	if ( ! run( "overload.cfa" ) ) return;
+	struct Job {
+		std::string path, text, what;
+		Translation result;
+	};
+	const bool all = env( "CFA_LSP_FUZZ" ) == "all";
+	const int sample = 6;								// otherwise one mutation every this many lines
+	int counter = 0;
+	std::vector<Job> jobs;
+	for ( const std::string dir : { "translator", "project", "demo" } ) {
+		const int stride = all || dir == "translator" ? 1 : 3;
+		std::vector<std::string> files;
+		for ( const auto & e : fs::directory_iterator( fs::path( tools().fixtures ) / dir ) ) {
+			if ( e.path().extension() == ".cfa" ) files.push_back( fs::absolute( e.path() ).lexically_normal().string() );
+		}
+		std::sort( files.begin(), files.end() );
+		for ( const std::string & path : files ) {
+			std::stringstream in( readFile( path ) );
+			std::vector<std::string> lines;
+			for ( std::string l; std::getline( in, l ); ) lines.push_back( l );
+			std::string name = fs::path( path ).filename().string();
+			// The file with lines [from, to) replaced by `with`.
+			auto edit = [&]( int from, int to, const std::string & with ) {
+				std::string text;
+				for ( int i = 0; i < from; i += 1 ) text += lines[i] + "\n";
+				text += with;
+				for ( int i = to; i < (int)lines.size(); i += 1 ) text += lines[i] + "\n";
+				return text;
+			};
+			for ( int k = 0; k < (int)lines.size(); k += 1 ) {
+				std::string at = std::to_string( k + 1 );
+				// The whole file is covered by the other tests.
+				if ( k % stride == 0 ) {
+					jobs.push_back( { path, edit( k, (int)lines.size(), "" ), name + " cut after line " + std::to_string( k ), {} } );
+				}
+				for ( int kind = 0; kind < 4; kind += 1 ) {
+					if ( ! all && ( counter % sample != 0 || counter / sample % 4 != kind ) ) continue;
+					auto [from, to] = firstName( lines[k] );
+					if ( kind == 0 ) {
+						jobs.push_back( { path, edit( k, k + 1, "" ), name + " without line " + at, {} } );
+					} else if ( kind == 1 ) {
+						jobs.push_back( { path, edit( k, k + 1, lines[k] + "\n" + lines[k] + "\n" ), name + " line " + at + " twice", {} } );
+					} else if ( kind == 2 && k + 1 < (int)lines.size() ) {
+						jobs.push_back( { path, edit( k, k + 2, lines[k + 1] + "\n" + lines[k] + "\n" ),
+							name + " lines " + at + " and " + std::to_string( k + 2 ) + " swapped", {} } );
+					} else if ( kind == 3 && from != std::string::npos ) {
+						std::string renamed = lines[k].substr( 0, from ) + "zz_undeclared" + lines[k].substr( to );
+						jobs.push_back( { path, edit( k, k + 1, renamed + "\n" ), name + " line " + at + " as: " + renamed, {} } );
+					}
+				}
+				counter += 1;
+			}
+		}
+	}
+
+	auto start = std::chrono::steady_clock::now();
+	std::atomic<size_t> next{ 0 };
+	std::vector<std::thread> workers;
+	unsigned threads = std::max( 2u, std::thread::hardware_concurrency() );
+	for ( unsigned i = 0; i < threads; i += 1 ) {
+		workers.emplace_back( [&] {
+			for ( size_t j = next++; j < jobs.size(); j = next++ ) jobs[j].result = translateText( jobs[j].path, jobs[j].text );
+		} );
+	}
+	for ( std::thread & w : workers ) w.join();
+	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - start ).count();
+
+	int skipped = 0, failed = 0;
+	for ( const Job & job : jobs ) {
+		const Translation & t = job.result;
+		if ( ! t.preprocessed ) {
+			skipped += 1;
+			continue;
+		}
+		std::string problem;
+		if ( t.signal ) problem = "killed by signal " + std::to_string( t.signal );
+		else if ( t.status != 0 ) problem = "exit status " + std::to_string( t.status );
+		else problem = dumpProblem( t.dump );
+		if ( problem.empty() ) continue;
+		failed += 1;
+		if ( failed <= 80 ) {
+			FAIL_CHECK( job.what << ": " << problem << "\n" << head( t.err ) );
+		}
+	}
+	MESSAGE( jobs.size() << " variants (" << skipped << " not preprocessed, " << failed << " failed) on "
+		<< threads << " threads in " << ms << " ms" );
+	CHECK( failed == 0 );
 }
 
 TEST_CASE( "translator: array parameters and dimensions" ) {

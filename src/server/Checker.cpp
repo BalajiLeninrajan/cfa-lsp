@@ -549,13 +549,17 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 	}
 	lap( "translator" );
 	auto dumpText = readFile( json );
-	if ( ! r.ok() || ! dumpText ) {
+	if ( ! r.ok() || ! dumpText || dumpText->empty() ) {
 		fr.status = FrontResult::TranslatorFailed;
 		fr.diags = cppDiags;
 		// cfa-cpp prints some errors (bad options) on stdout.
 		std::string err = readFile( t.stdoutPath ).value_or( "" ) + readFile( t.stderrPath ).value_or( "" );
-		fr.diags.push_back( fileLevel( req.path, "cfa-lsp: the translator " + r.describe() +
-										( err.empty() ? "" : ":\n" + excerpt( err ) ) ) );
+		// The translator writes the dump whenever it can, even after an assertion failure, so getting none is a
+		// crash. Our own limits are reported as such.
+		std::string what = r.status == RunResult::TimedOut || r.status == RunResult::SpawnFailed
+			? "cfa-lsp: the translator " + r.describe()
+			: "internal translator error: cfa-cpp " + ( r.ok() ? std::string( "wrote no output" ) : r.describe() );
+		fr.diags.push_back( fileLevel( req.path, what + ( err.empty() ? "" : ":\n" + excerpt( err ) ) ) );
 		return fr;
 	}
 
