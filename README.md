@@ -15,7 +15,7 @@ Features:
   for macros the `#define`
 - go to definition and declaration, including into libcfa and the prelude,
   for macros, and on `#include` lines
-- find references
+- find references, across the workspace
 - document symbols
 - completion of locals, `with` fields, globals and keywords, and of members
   after `.` and `->`
@@ -24,9 +24,9 @@ Features:
 - document highlight
 - inlay hints: parameter names at call sites, and the type a call of a
   `forall` function returns when it differs from the declared return type
-- rename within one file
-- workspace symbols from the open documents and the project headers they
-  include
+- rename, across the workspace
+- workspace symbols
+- call hierarchy (incoming and outgoing calls)
 - clangd's `textDocument/switchSourceHeader`, between `x.cfa` and `x.hfa`
 - quick fixes for an undeclared identifier: a visible name a typo away from
   it, and the `#include` of the libcfa header that declares it (also for a
@@ -126,6 +126,7 @@ All optional.
 | `cc` | `gcc` | The C compiler for the backend check. |
 | `stopAfterResolve` | `false` | Stop the translator after `Resolve`. Checks take 40 to 45% less time, but you lose the warnings and errors of the later passes and gcc's warnings (see below). |
 | `debounceMs` | `500` | Wait after the last edit before checking. |
+| `index` | `true` | Check every `.cfa` file under the workspace root in the background, for workspace-wide references, rename, symbols and call hierarchy. |
 | `timeoutMs` | `120000` | Limit for each child process. |
 
 The same options can be changed while the server runs, through
@@ -182,6 +183,12 @@ the buffer:
    passes that only check the program), gcc's errors are left out: they are
    about code the translator already rejected.
 
+When an open header has unsaved edits, checks of the files that include it
+read the buffer: the server writes it to an overlay directory and puts that
+directory on the include path right before the directory it shadows (the
+file's own, then each `-iquote` and `-I` directory). Editing such a header
+re-checks the open files that include it.
+
 Requests are answered right away from the last good result, in the order
 they arrive. A request cancelled with `$/cancelRequest` before its turn comes
 gets the `RequestCancelled` error instead of an answer. After a syntax error
@@ -213,6 +220,31 @@ diagnostics would never update. The exception is a check that has already
 run more than twice as long as the file's last one, which is likely stuck on
 something the edit may have fixed; an edit cancels that one. Closing the file
 also cancels its check.
+
+### The background index
+
+When the client gives a workspace root, the server looks for `.cfa` and
+`.hfa` files under it (skipping hidden directories) and checks each `.cfa`
+file from disk, one at a time, whenever no open file is waiting for a check.
+These checks stop after `Resolve`, and every `.hfa` under the root is a focus
+file in them, so uses inside headers are recorded too. A check of an open file
+cancels the index check in flight, which runs again later.
+
+From each check the server keeps a small table: the declarations of each
+function, variable and type, the uses of each, and for calls the function
+they are in. Two tables talk about the same entity when they share a
+declaration (file and position of the name), so a prototype in a header links
+the uses in every file that includes it to the definition in the file that
+has the body. References, definition, rename, workspace symbols and call
+hierarchy use these tables together with those of the open files. For an open
+file, its own check wins over the index.
+
+The index is brought up to date when a file is saved, when the configuration
+changes and when the client reports changed files
+(`workspace/didChangeWatchedFiles`, which the server registers for if the
+client supports it): files whose own text or included headers changed since
+their check are checked again, new files are added and deleted ones dropped.
+The walk stops after 50000 directory entries and 1000 `.cfa` files.
 
 ### Columns
 
@@ -261,18 +293,25 @@ lines inside a block comment move with the line the comment starts on.
   `docs/persistent-translator.md` describes how a long-running translator
   could avoid that.
 - Each file is checked on its own. Open headers are checked as if they were
-  the main file. Saving a header re-checks the open files; nothing else
-  tracks dependencies between files.
+  the main file.
+- The index matches declarations by location. A function declared separately
+  in two `.cfa` files, without a shared header, is two functions to it.
+- The index reads files from disk, so a file changed outside the editor is
+  only picked up on the next save or watched-file notification.
+- An unsaved header is found through the include path. A header on disk that
+  includes it with `#include "..."` from the same directory still reads the
+  copy on disk.
 - Uses inside macro bodies have no references. Inside a `cofor` body, uses of
   the loop variable have none either: they name the copy the translator makes
   in the function it generates for the body.
-- Rename works within one file. It refuses a name declared in another file
-  (a header, libcfa), a global or a field declared in a header (the files that
-  include it aren't known), operators, and names used in a macro of the file.
-  It also refuses when the name is spelled somewhere the dump has no reference
-  for, such as a designator, an array dimension in a typedef, cast or
-  `sizeof`, an `#if 0` block or a function that failed to resolve. It does not
-  check whether the new name clashes with another one in scope.
+- Rename of a name declared in a header or used in other files needs the
+  index, and waits until it has checked every file. Without it, rename works
+  within one file and refuses such names. It always refuses names declared
+  in libcfa or the prelude, operators, names used in a macro body, and names
+  spelled somewhere the dump has no reference for, such as a designator, an
+  array dimension in a typedef, cast or `sizeof`, an `#if 0` block or a
+  function that failed to resolve. It does not check whether the new name
+  clashes with another one in scope.
 - Completion does not know about type-only contexts, `inline` member
   embedding or qualified enumerators (`Colour.Red`). libcfa names containing
   `$` are hidden unless the prefix has a `$`.

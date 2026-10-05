@@ -39,8 +39,11 @@ struct Opened {
 	LspClient c{ envOr( "CFA_LSP_TEST_LOG" ) };
 	std::string uri, text;
 	json init;
-	Opened( const std::string & path, std::string contents, int debounceMs = 50 ) : uri( uriOf( path ) ), text( std::move( contents ) ) {
-		init = c.initialize( { { "debounceMs", debounceMs }, { "backend", false } }, projectDir() );
+	Opened( const std::string & path, std::string contents, int debounceMs = 50, json extra = json::object() )
+		: uri( uriOf( path ) ), text( std::move( contents ) ) {
+		json options = { { "debounceMs", debounceMs }, { "backend", false } };
+		options.update( extra );
+		init = c.initialize( options, projectDir() );
 		c.open( uri, text );
 		REQUIRE( c.diagnostics( uri, 1 ) );
 	}
@@ -183,7 +186,8 @@ TEST_CASE( "inlay hints skip arguments named like the parameter, span lines and 
 
 TEST_CASE( "rename within one file, and refusals" ) {
 	if ( ! ready() ) return;
-	Opened o( projectDir() + "/geometry.cfa", readAll( projectDir() + "/geometry.cfa" ) );
+	// Without the index, as across files IndexTest.cpp covers it.
+	Opened o( projectDir() + "/geometry.cfa", readAll( projectDir() + "/geometry.cfa" ), 50, { { "index", false } } );
 
 	json r = o.c.result( "textDocument/prepareRename", at( o.uri, o.pos( "box, 1", 1 ) ) );
 	REQUIRE( r.is_object() );
@@ -246,7 +250,7 @@ TEST_CASE( "rename refuses names used in macros or where the dump has no ref, an
 		"\tarr[0] = hidden;\n"
 		"\treturn m + n + arr[0];\n"
 		"}\n";
-	Opened o( projectDir() + "/scratch_rename.cfa", text );
+	Opened o( projectDir() + "/scratch_rename.cfa", text, 50, { { "index", false } } );
 	json err = o.c.request( "textDocument/rename", renameParams( o.uri, o.pos( "n = 3" ), "count" ) )["error"];
 	CHECK( err["code"] == -32803 );
 	CHECK( contains( err["message"], "TWICE" ) );
@@ -265,7 +269,7 @@ TEST_CASE( "rename refuses names used in macros or where the dump has no ref, an
 	for ( const auto & e : r["changes"][o.uri] ) dimension = dimension || e["range"]["start"] == o.pos( "SIZE]" );
 	CHECK( dimension );
 
-	// In a header, only local names.
+	// In a header, only local names without the index.
 	std::string header = projectDir() + "/geometry.hfa";
 	std::string htext = readAll( header );
 	o.c.open( uriOf( header ), htext );

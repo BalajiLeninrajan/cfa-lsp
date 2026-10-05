@@ -84,7 +84,10 @@ class Analysis {
 	// local names qualify, since uses in the files that include it are not
 	// known; and every spelling of the name in `file` must be a ref or a
 	// declaration in the dump. nullopt if nothing renameable is at `pos`.
-	std::optional<RenamePlan> rename( const std::string & file, Loc pos ) const;
+	// With `acrossFiles`, declarations and uses in other files are allowed
+	// (unless a declaration is in libcfa, the prelude or a system header) and
+	// left out of `sites`: the server finds those through its index.
+	std::optional<RenamePlan> rename( const std::string & file, Loc pos, bool acrossFiles = false ) const;
 	static bool isKeyword( std::string_view word );
 
 	// The user's files in this dump: focus files and project headers (not

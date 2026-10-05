@@ -39,6 +39,11 @@ struct LspError {
 	std::string message;
 };
 
+// Limits for the walk of the workspace root, so a root like $HOME doesn't
+// turn into hours of background checks.
+const size_t maxScanEntries = 50000;
+const size_t maxIndexedFiles = 1000;
+
 std::optional<std::string> readFile( const std::string & path ) {
 	std::ifstream in( path, std::ios::binary );
 	if ( ! in ) return std::nullopt;
@@ -432,6 +437,9 @@ nlohmann::json Server::request( const std::string & method, const json & params 
 	if ( method == "textDocument/codeAction" ) return codeAction( params );
 	if ( method == "textDocument/formatting" ) return formatting( params, false );
 	if ( method == "textDocument/rangeFormatting" ) return formatting( params, true );
+	if ( method == "textDocument/prepareCallHierarchy" ) return prepareCallHierarchy( params );
+	if ( method == "callHierarchy/incomingCalls" ) return calls( params, true );
+	if ( method == "callHierarchy/outgoingCalls" ) return calls( params, false );
 	throw LspError{ MethodNotFound, "unhandled method " + method };
 }
 
@@ -444,6 +452,14 @@ void Server::notification( const std::string & method, const json & params ) {
 						 { { "registrations", { { { "id", "cfa-lsp-configuration" }, { "method", "workspace/didChangeConfiguration" } } } } } );
 		}
 		if ( configurationPull ) requestConfiguration();
+		if ( watchFiles && indexing() ) {
+			// Changes made outside the editor (git checkout, another editor)
+			// reach the index through these.
+			json watcher = { { "globPattern", "**/*.{cfa,hfa}" } };
+			json reg = { { "id", "cfa-lsp-watch" }, { "method", "workspace/didChangeWatchedFiles" },
+						 { "registerOptions", { { "watchers", json::array( { watcher } ) } } } };
+			sendRequest( "client/registerCapability", { { "registrations", json::array( { reg } ) } } );
+		}
 		return;
 	}
 	if ( phase == Phase::ShuttingDown ) return;
@@ -452,6 +468,11 @@ void Server::notification( const std::string & method, const json & params ) {
 	else if ( method == "textDocument/didClose" ) didClose( params );
 	else if ( method == "textDocument/didSave" ) didSave( params );
 	else if ( method == "workspace/didChangeConfiguration" ) didChangeConfiguration( params );
+	else if ( method == "workspace/didChangeWatchedFiles" ) {
+		std::lock_guard<std::mutex> lock( mtx );
+		indexRescan = true;
+		cv.notify_all();
+	}
 	// $/cancelRequest is handled when reading ahead (see run()); by the time
 	// one gets here, its request has been answered.
 }
@@ -486,6 +507,7 @@ nlohmann::json Server::initialize( const json & params ) {
 	const json & ws = member( caps, "workspace" );
 	configurationPull = member( ws, "configuration" ) == true;
 	configurationRegistration = member( member( ws, "didChangeConfiguration" ), "dynamicRegistration" ) == true;
+	watchFiles = member( member( ws, "didChangeWatchedFiles" ), "dynamicRegistration" ) == true;
 
 	const json & root = member( params, "rootUri" );
 	if ( root.is_string() ) {
@@ -500,6 +522,11 @@ nlohmann::json Server::initialize( const json & params ) {
 	applyOptions( initOptions );
 	phase = Phase::Running;
 	startWorker();
+	{
+		std::lock_guard<std::mutex> lock( mtx );
+		indexRescan = true;
+		cv.notify_all();
+	}
 
 	json tokenTypes = Analysis::tokenTypes();
 	json tokenModifiers = Analysis::tokenModifiers();
@@ -522,6 +549,7 @@ nlohmann::json Server::initialize( const json & params ) {
 		{ "codeActionProvider", { { "codeActionKinds", json::array( { "quickfix" } ) } } },
 		{ "documentFormattingProvider", true },
 		{ "documentRangeFormattingProvider", true },
+		{ "callHierarchyProvider", true },
 	};
 	return { { "capabilities", capabilities }, { "serverInfo", { { "name", "cfa-lsp" }, { "version", "0.1.0" } } } };
 }
@@ -541,6 +569,7 @@ void Server::applyOptions( const json & io ) {
 	o.timeoutMs = std::max( 1, intOr( member( io, "timeoutMs" ), 120000 ) );
 	if ( member( io, "backend" ).is_boolean() ) o.backend = member( io, "backend" ).get<bool>();
 	if ( member( io, "stopAfterResolve" ).is_boolean() ) o.stopAfterResolve = member( io, "stopAfterResolve" ).get<bool>();
+	if ( member( io, "index" ).is_boolean() ) o.index = member( io, "index" ).get<bool>();
 	const json & fl = member( io, "flags" );
 	if ( fl.is_array() ) {
 		std::vector<std::string> v;
@@ -560,6 +589,14 @@ void Server::applyOptions( const json & io ) {
 	checker = chk;
 	headers.reset();						// cfa may have moved
 	effective = io;
+	// Other flags or tools give other results: check everything again.
+	if ( ! opts.index ) index.clear();
+	for ( auto & [path, e] : index ) {
+		e.stale = true;
+		e.gen += 1;
+	}
+	indexRescan = true;
+	cv.notify_all();
 }
 
 void Server::didChangeConfiguration( const json & params ) {
@@ -586,7 +623,7 @@ void Server::applySettings( const json & s ) {
 	// Our settings override initializationOptions key by key; null removes
 	// one. Other keys are someone else's.
 	json eff = initOptions;
-	for ( const char * k : { "cfa", "translator", "preludeDir", "flags", "backend", "stopAfterResolve", "cc", "debounceMs", "timeoutMs" } ) {
+	for ( const char * k : { "cfa", "translator", "preludeDir", "flags", "backend", "stopAfterResolve", "index", "cc", "debounceMs", "timeoutMs" } ) {
 		auto it = settings.find( k );
 		if ( it == settings.end() ) continue;
 		if ( it->is_null() ) eff.erase( k );
@@ -670,7 +707,8 @@ void Server::didChange( const json & params ) {
 	// minutes on, so that one is cancelled. Raising lastCheck to the time it
 	// ran means a check that got slower for good still finishes after a few
 	// edits.
-	if ( inflight && inflight->path == d->path && ! inflight->token->cancelled() && d->lastCheck > Clock::duration::zero() ) {
+	if ( inflight && ! inflight->index && inflight->path == d->path && ! inflight->token->cancelled() &&
+		 d->lastCheck > Clock::duration::zero() ) {
 		Clock::duration ran = Clock::now() - inflight->started;
 		if ( ran > 2 * d->lastCheck ) {
 			inflight->token->cancel();
@@ -678,6 +716,8 @@ void Server::didChange( const json & params ) {
 		}
 	}
 	schedule( d->path, opts.debounceMs );
+	// Checks of the files that include it read the buffer.
+	if ( isHeader( d->path ) ) scheduleDependents( d->path );
 	trimLog( *d );
 }
 
@@ -687,11 +727,14 @@ void Server::didClose( const json & params ) {
 	Document * d = docFor( params );
 	if ( ! d ) return;
 	std::string path = d->path;
+	bool unsaved = ! d->diskSeq || *d->diskSeq != d->seq;
 	pending.erase( path );
-	if ( inflight && inflight->path == path ) inflight->token->cancel();
+	if ( inflight && ! inflight->index && inflight->path == path ) inflight->token->cancel();
 	diskCache.clear();
-	storeDiags( path, 0, {}, out );
+	storeDiags( path, 0, {}, {}, out );
 	docs.erase( path );
+	// Files that include it read it from disk again.
+	if ( unsaved && isHeader( path ) ) scheduleDependents( path );
 	std::lock_guard<std::mutex> pub( publishMtx );
 	lock.unlock();
 	for ( auto & p : out ) notify( "textDocument/publishDiagnostics", std::move( p ) );
@@ -706,20 +749,33 @@ void Server::didSave( const json & params ) {
 	// Skip if the check in flight already covers this text. Otherwise save
 	// always re-checks (after the check in flight): headers on disk may have
 	// changed.
-	bool covered = inflight && inflight->path == d->path && inflight->seq == d->seq;
+	bool covered = inflight && ! inflight->index && inflight->path == d->path && inflight->seq == d->seq;
 	if ( ! covered ) schedule( d->path, 0 );
 	if ( isHeader( d->path ) ) {
 		for ( auto & [p, other] : docs ) {
 			if ( p != d->path ) schedule( p, opts.debounceMs );
 		}
 	}
+	// Files whose text or headers changed on disk are indexed again.
+	indexRescan = true;
+	cv.notify_all();
 }
 
 void Server::schedule( const std::string & path, int delayMs ) {
 	auto due = Clock::now() + std::chrono::milliseconds( delayMs );
 	auto it = pending.find( path );
 	if ( it == pending.end() || delayMs > 0 || due < it->second ) pending[path] = due;
+	// Index checks give way to the user's files.
+	if ( inflight && inflight->index ) inflight->token->cancel();
 	cv.notify_all();
+}
+
+void Server::scheduleDependents( const std::string & header ) {
+	for ( auto & [p, other] : docs ) {
+		if ( p != header && std::find( other.includes.begin(), other.includes.end(), header ) != other.includes.end() ) {
+			schedule( p, opts.debounceMs );
+		}
+	}
 }
 
 void Server::trimLog( Document & doc ) {
@@ -729,8 +785,19 @@ void Server::trimLog( Document & doc ) {
 		auto own = ds->second.find( doc.path );
 		if ( own != ds->second.end() ) keep = std::min( keep, own->second.seq );
 	}
-	if ( inflight && inflight->path == doc.path ) keep = std::min( keep, inflight->seq );
+	if ( inflight && ! inflight->index && inflight->path == doc.path ) keep = std::min( keep, inflight->seq );
 	if ( doc.diskSeq ) keep = std::min( keep, *doc.diskSeq );
+	// Checks of other documents that read this buffer.
+	auto readAt = [&]( const SeqMap & reads ) {
+		if ( auto r = reads.find( doc.path ); r != reads.end() ) keep = std::min( keep, r->second );
+	};
+	for ( const auto & [p, other] : docs ) {
+		if ( other.analysis ) readAt( other.analysisReads );
+	}
+	for ( const auto & [target, bySource] : diagStore ) {
+		for ( const auto & [source, set] : bySource ) readAt( set.reads );
+	}
+	if ( inflight && ! inflight->index ) readAt( inflight->reads );
 	if ( ! doc.backDiags.empty() ) keep = std::min( keep, doc.backSeq );
 	auto it = std::find_if( doc.log.begin(), doc.log.end(), [&]( const auto & e ) { return e.first > keep; } );
 	doc.log.erase( doc.log.begin(), it );
@@ -806,25 +873,45 @@ std::string Server::uriOf( const std::string & path ) const {
 	return d != docs.end() ? d->second.uri : pathToUri( path );
 }
 
-std::optional<nlohmann::json> Server::lspLocation( const Document & from, const Location & loc, bool exact ) {
-	std::string file = fs::path( loc.file ).lexically_normal().string();
-	if ( file == from.path ) {
-		EditList edits = from.editsSince( from.analysisSeq );
-		Range r;
-		if ( exact ) {
-			auto m = toCurrentExact( edits, loc.range );
-			if ( ! m || ( ! edits.empty() && ! wholeName( from.text, *m ) ) ) return std::nullopt;
-			r = *m;
-		} else {
-			r = toCurrentClamped( edits, loc.range );
+Server::Snapshot Server::snapOf( const Document & d ) const { return { d.path, d.analysisSeq, d.analysisReads }; }
+
+EditList Server::editsFor( const Snapshot & snap, const std::string & file, const Text *& text ) {
+	auto d = docs.find( file );
+	if ( d != docs.end() ) {
+		const Document & doc = d->second;
+		std::optional<uint64_t> since = doc.diskSeq;
+		if ( file == snap.main ) since = snap.mainSeq;
+		else if ( auto r = snap.reads.find( file ); r != snap.reads.end() ) since = r->second;
+		if ( since ) {
+			text = &doc.text;
+			return doc.editsSince( *since );
 		}
-		return json{ { "uri", from.uri }, { "range", lspRange( from.text, r ) } };
 	}
+	// Not open, or open with contents that differ from the disk in unknown ways.
+	text = &diskText( file );
+	return {};
+}
+
+std::optional<Server::Mapped> Server::toClient( const Snapshot & snap, const Location & loc, bool exact ) {
+	std::string file = fs::path( loc.file ).lexically_normal().string();
 	if ( file.empty() || file[0] != '/' ) return std::nullopt;
-	// Other files were read from disk by the check.
-	auto m = fromDisk( file, loc.range, exact );
+	const Text * text = nullptr;
+	EditList edits = editsFor( snap, file, text );
+	Range r;
+	if ( exact ) {
+		auto m = toCurrentExact( edits, loc.range );
+		if ( ! m || ( ! edits.empty() && ! wholeName( *text, *m ) ) ) return std::nullopt;
+		r = *m;
+	} else {
+		r = toCurrentClamped( edits, loc.range );
+	}
+	return Mapped{ text, { file, r } };
+}
+
+std::optional<nlohmann::json> Server::lspLocation( const Snapshot & snap, const Location & loc, bool exact ) {
+	auto m = toClient( snap, loc, exact );
 	if ( ! m ) return std::nullopt;
-	return json{ { "uri", uriOf( file ) }, { "range", lspRange( *m->first, m->second ) } };
+	return json{ { "uri", uriOf( m->loc.file ) }, { "range", lspRange( *m->text, m->loc.range ) } };
 }
 
 // ---------------------------------------------------------------- queries
@@ -860,13 +947,23 @@ nlohmann::json Server::definition( const json & params ) {
 	MappedLoc m = toSnapshot( edits, cur );
 	json out = json::array();
 	if ( m.exact && sameIdentifier( *d, cur, edits ) ) {
-		// A prototype whose body is in another open document (a header and its .cfa): go to the body.
+		// A prototype whose body is in another file (a header and its .cfa): go
+		// to the body, from another open document or the index.
 		std::vector<Location> decls = d->analysis->declarationsAt( d->path, m.loc );
 		if ( ! decls.empty() && ! d->analysis->definitionOf( decls ) ) {
 			for ( auto & [path, other] : docs ) {
 				if ( &other == d || ! other.analysis ) continue;
 				if ( auto def = other.analysis->definitionOf( decls ) ) {
 					if ( auto j = lspLocation( other, *def, true ) ) return json::array( { *j } );
+				}
+			}
+			if ( auto t = targetAt( *d, m.loc ) ) {
+				std::vector<Source> srcs = sources();
+				for ( const Match & mt : matchEntities( srcs, t->name, t->keys ) ) {
+					const Source & s = srcs[mt.source];
+					const auto & def = s.table->entities[mt.entity].definition;
+					if ( ! def || hidden( s, def->file ) ) continue;
+					if ( auto j = lspLocation( s.snap, *def, true ) ) return json::array( { *j } );
 				}
 			}
 		}
@@ -898,12 +995,22 @@ nlohmann::json Server::references( const json & params ) {
 		if ( j && seen.insert( j->dump() ).second ) out.push_back( *j );
 	};
 	for ( const Location & l : d->analysis->references( d->path, m.loc, incl ) ) add( *d, l );
-	// Each open document's analysis has the uses in that document.
-	std::vector<Location> decls = d->analysis->declarationsAt( d->path, m.loc );
-	if ( ! decls.empty() ) {
-		for ( auto & [path, other] : docs ) {
-			if ( &other == d || ! other.analysis ) continue;
-			for ( const Location & l : other.analysis->referencesTo( decls, incl ) ) add( other, l );
+	// Each open document's table has the uses in that document, and the
+	// index those in the files on disk.
+	if ( auto t = targetAt( *d, m.loc ) ) {
+		std::vector<Source> srcs = sources();
+		for ( const Match & mt : matchEntities( srcs, t->name, t->keys ) ) {
+			const Source & s = srcs[mt.source];
+			for ( const auto & r : s.table->refs ) {
+				if ( r.entity == mt.entity && ! hidden( s, r.loc.file ) ) {
+					if ( auto j = lspLocation( s.snap, r.loc, true ); j && seen.insert( j->dump() ).second ) out.push_back( *j );
+				}
+			}
+			if ( ! incl ) continue;
+			for ( const Location & l : s.table->entities[mt.entity].declarations ) {
+				if ( hidden( s, l.file ) ) continue;
+				if ( auto j = lspLocation( s.snap, l, true ); j && seen.insert( j->dump() ).second ) out.push_back( *j );
+			}
 		}
 	}
 	return out;
@@ -1101,7 +1208,9 @@ std::optional<RenamePlan> Server::renameAt( const Document & d, const json & par
 nlohmann::json Server::prepareRename( const json & params ) {
 	Document * d = docFor( params );
 	if ( ! d || ! d->analysis ) return nullptr;
-	auto plan = renameAt( *d, params );
+	RenameSites sites;
+	auto plan = renameAcross( *d, params, sites );
+	if ( ! plan ) plan = renameAt( *d, params );
 	if ( ! plan ) return nullptr;
 	return { { "range", lspRange( d->text, plan->range ) }, { "placeholder", plan->name } };
 }
@@ -1113,6 +1222,16 @@ nlohmann::json Server::rename( const json & params ) {
 	if ( ! text::isIdentifier( name ) || Analysis::isKeyword( name ) ) throw LspError{ InvalidParams, "`" + name + "` is not a valid identifier" };
 	Document * d = docFor( params );
 	if ( ! d || ! d->analysis ) throw LspError{ RequestFailed, "the file has not been checked yet" };
+	RenameSites sites;
+	if ( renameAcross( *d, params, sites ) ) {
+		json changes = json::object();
+		for ( const auto & [file, entry] : sites ) {
+			json edits = json::array();
+			for ( const Range & r : entry.second ) edits.push_back( { { "range", lspRange( *entry.first, r ) }, { "newText", name } } );
+			changes[uriOf( file )] = edits;
+		}
+		return { { "changes", changes } };
+	}
 	auto plan = renameAt( *d, params );
 	if ( ! plan ) throw LspError{ RequestFailed, "there is no symbol to rename here" };
 	json edits = json::array();
@@ -1143,7 +1262,8 @@ nlohmann::json Server::switchSourceHeader( const json & params ) {
 	return nullptr;
 }
 
-// The symbols of the open documents and of the project headers they include.
+// The symbols of the open documents and of the project headers they include,
+// then those of the other files in the index.
 nlohmann::json Server::workspaceSymbol( const json & params ) {
 	const json & q = member( params, "query" );
 	std::string query = q.is_string() ? q.get<std::string>() : std::string();
@@ -1173,6 +1293,20 @@ nlohmann::json Server::workspaceSymbol( const json & params ) {
 				for ( const auto & c : s.children ) add( c, s.name );
 			};
 			for ( const Symbol & s : doc.analysis->documentSymbols( file ) ) add( s, "" );
+		}
+	}
+	// The files no open document includes, from the index.
+	for ( const auto & [path, e] : index ) {
+		if ( ! e.table ) continue;
+		Source src{ e.table, Snapshot(), true };
+		for ( const auto & sym : e.table->symbols ) {
+			if ( out.size() >= 1000 ) break;
+			if ( owned.count( fs::path( sym.loc.file ).lexically_normal().string() ) || ! fuzzyMatch( sym.name, query ) ) continue;
+			if ( auto loc = lspLocation( src.snap, sym.loc, false ) ) {
+				json j = { { "name", sym.name }, { "kind", sym.kind }, { "location", *loc } };
+				if ( ! sym.container.empty() ) j["containerName"] = sym.container;
+				if ( seen.insert( j.dump() ).second ) out.push_back( std::move( j ) );
+			}
 		}
 	}
 	return out;
@@ -1265,14 +1399,322 @@ nlohmann::json Server::formatting( const json & params, bool range ) {
 	return edits;
 }
 
+// ---------------------------------------------------------------- cross-file queries
+
+std::vector<Server::Source> Server::sources() {
+	std::vector<Source> out;
+	for ( const auto & [path, d] : docs ) {
+		if ( d.table ) out.push_back( { d.table, snapOf( d ), false } );
+	}
+	for ( const auto & [path, e] : index ) {
+		if ( e.table ) out.push_back( { e.table, Snapshot(), true } );
+	}
+	return out;
+}
+
+// The index read files from disk; an open document's own check knows its
+// current contents better.
+bool Server::hidden( const Source & s, const std::string & file ) const {
+	if ( ! s.index ) return false;
+	auto d = docs.find( fs::path( file ).lexically_normal().string() );
+	return d != docs.end() && d->second.analysis;
+}
+
+std::optional<Server::Target> Server::targetAt( const Document & d, Loc pos ) {
+	if ( ! d.analysis || ! d.table ) return std::nullopt;
+	std::vector<Location> decls = d.analysis->declarationsAt( d.path, pos );
+	if ( decls.empty() ) return std::nullopt;
+	for ( const auto & e : d.table->entities ) {
+		bool same = false;
+		for ( const Location & l : e.declarations ) {
+			if ( std::find( decls.begin(), decls.end(), l ) != decls.end() ) {
+				same = true;
+				break;
+			}
+		}
+		if ( ! same ) continue;
+		Target t;
+		t.name = e.name;
+		t.library = e.library;
+		t.function = e.function;
+		Snapshot snap = snapOf( d );
+		for ( const Location & l : decls ) {
+			if ( auto m = toClient( snap, l, true ) ) t.keys.insert( { m->loc.file, m->loc.range.start } );
+		}
+		return t;
+	}
+	return std::nullopt;
+}
+
+std::set<Server::Key> Server::keysOf( const Source & s, int entity ) {
+	std::set<Key> keys;
+	for ( const Location & l : s.table->entities[entity].declarations ) {
+		if ( auto m = toClient( s.snap, l, true ) ) keys.insert( { m->loc.file, m->loc.range.start } );
+	}
+	return keys;
+}
+
+// The entities called `name` with a declaration in `keys`. Their other
+// declarations join `keys`, so a prototype that one unit sees links to the
+// definition that another unit sees.
+std::vector<Server::Match> Server::matchEntities( const std::vector<Source> & srcs, const std::string & name,
+												  std::set<Key> & keys ) {
+	struct Cand {
+		Match m;
+		std::set<Key> keys;
+		bool in = false;
+	};
+	std::vector<Cand> cands;
+	for ( size_t s = 0; s < srcs.size(); s += 1 ) {
+		const auto & ents = srcs[s].table->entities;
+		for ( int e = 0; e < int( ents.size() ); e += 1 ) {
+			if ( ents[e].name == name ) cands.push_back( { { s, e }, keysOf( srcs[s], e ) } );
+		}
+	}
+	for ( bool grew = true; grew; ) {
+		grew = false;
+		for ( Cand & c : cands ) {
+			if ( c.in ) continue;
+			bool hit = false;
+			for ( const Key & k : c.keys ) hit = hit || keys.count( k );
+			if ( ! hit ) continue;
+			c.in = grew = true;
+			keys.insert( c.keys.begin(), c.keys.end() );
+		}
+	}
+	std::vector<Match> out;
+	for ( const Cand & c : cands ) {
+		if ( c.in ) out.push_back( c.m );
+	}
+	return out;
+}
+
+// A CallHierarchyItem: at the definition if one of `matches` has it, else at
+// the first declaration. `data` carries the declarations for the follow-up
+// requests.
+std::optional<nlohmann::json> Server::callItem( const std::vector<Source> & srcs, const std::vector<Match> & matches,
+											   const std::set<Key> & keys ) {
+	const Source * src = nullptr;
+	const UnitIndex::Entity * ent = nullptr;
+	for ( const Match & mt : matches ) {
+		const Source & s = srcs[mt.source];
+		const UnitIndex::Entity & e = s.table->entities[mt.entity];
+		if ( e.definition && ! hidden( s, e.definition->file ) ) {
+			src = &s;
+			ent = &e;
+			break;
+		}
+		if ( ! ent && ! e.declarations.empty() ) {
+			src = &s;
+			ent = &e;
+		}
+	}
+	if ( ! ent ) return std::nullopt;
+	std::optional<Mapped> sel, whole;
+	if ( ent->definition ) {
+		sel = toClient( src->snap, *ent->definition, false );
+		whole = toClient( src->snap, { ent->definition->file, ent->definitionRange }, false );
+	} else {
+		sel = whole = toClient( src->snap, ent->declarations.front(), false );
+	}
+	if ( ! sel || ! whole ) return std::nullopt;
+	Range r = whole->loc.range;
+	if ( sel->loc.range.start < r.start || r.end < sel->loc.range.end ) r = sel->loc.range;
+	json data = json::array();
+	for ( const auto & [file, at] : keys ) data.push_back( { file, at.line, at.col } );
+	json item = { { "name", ent->name }, { "kind", ent->kind }, { "uri", uriOf( sel->loc.file ) },
+				  { "range", lspRange( *whole->text, r ) }, { "selectionRange", lspRange( *sel->text, sel->loc.range ) },
+				  { "data", { { "name", ent->name }, { "keys", data } } } };
+	if ( ! ent->detail.empty() ) item["detail"] = ent->detail;
+	return item;
+}
+
+std::pair<std::string, std::optional<nlohmann::json>> Server::resolveEntity( const std::vector<Source> & srcs, size_t source,
+																			int entity ) {
+	const std::string & name = srcs[source].table->entities[entity].name;
+	std::set<Key> keys = keysOf( srcs[source], entity );
+	std::vector<Match> matches = matchEntities( srcs, name, keys );
+	if ( matches.empty() ) matches.push_back( { source, entity } );
+	std::string id = name + '\x1f';
+	if ( keys.empty() ) {
+		id += std::to_string( source ) + ':' + std::to_string( entity );
+	} else {
+		const Key & k = *keys.begin();
+		id += k.first + ':' + std::to_string( k.second.line ) + ':' + std::to_string( k.second.col );
+	}
+	return { id, callItem( srcs, matches, keys ) };
+}
+
+// The name and declarations a CallHierarchyItem stands for.
+std::pair<std::string, std::set<Server::Key>> Server::itemKeys( const json & item ) {
+	std::set<Key> keys;
+	const json & data = member( item, "data" );
+	std::string name = member( data, "name" ).is_string() ? member( data, "name" ).get<std::string>()
+		: member( item, "name" ).is_string() ? member( item, "name" ).get<std::string>() : "";
+	const json & ks = member( data, "keys" );
+	if ( ks.is_array() ) {
+		for ( const auto & k : ks ) {
+			if ( k.is_array() && k.size() == 3 && k[0].is_string() && k[1].is_number_integer() && k[2].is_number_integer() ) {
+				keys.insert( { k[0].get<std::string>(), Loc{ k[1].get<int>(), k[2].get<int>() } } );
+			}
+		}
+	}
+	if ( keys.empty() && member( item, "uri" ).is_string() ) {
+		if ( auto path = uriToPath( item["uri"].get<std::string>() ) ) {
+			std::string file = fs::path( *path ).lexically_normal().string();
+			const json & st = member( member( item, "selectionRange" ), "start" );
+			Loc at = textOf( file ).fromLsp( intOr( member( st, "line" ), 0 ), intOr( member( st, "character" ), 0 ), enc );
+			keys.insert( { file, at } );
+		}
+	}
+	return { name, keys };
+}
+
+nlohmann::json Server::prepareCallHierarchy( const json & params ) {
+	Document * d = docFor( params );
+	if ( ! d || ! d->analysis ) return nullptr;
+	auto pos = cursorInSnapshot( *d, params );
+	if ( ! pos ) return nullptr;
+	auto t = targetAt( *d, *pos );
+	if ( ! t || ! t->function ) return nullptr;
+	std::vector<Source> srcs = sources();
+	std::vector<Match> matches = matchEntities( srcs, t->name, t->keys );
+	auto item = callItem( srcs, matches, t->keys );
+	if ( ! item ) return nullptr;
+	return json::array( { *item } );
+}
+
+// Incoming: the calls of the item's function, grouped by the function they
+// are in. Outgoing: the calls in the item's function, grouped by callee.
+nlohmann::json Server::calls( const json & params, bool incoming ) {
+	auto [name, keys] = itemKeys( member( params, "item" ) );
+	json out = json::array();
+	if ( keys.empty() ) return out;
+	std::vector<Source> srcs = sources();
+	struct Group {
+		json item;
+		json ranges = json::array();
+		std::set<std::string> seen;
+	};
+	std::map<std::pair<size_t, int>, std::string> ids;
+	std::map<std::string, Group> groups;
+	std::vector<std::string> order;
+	for ( const Match & mt : matchEntities( srcs, name, keys ) ) {
+		const Source & s = srcs[mt.source];
+		for ( const auto & r : s.table->refs ) {
+			if ( ! r.call || hidden( s, r.loc.file ) ) continue;
+			if ( incoming ? r.entity != mt.entity || r.caller < 0 : r.caller != mt.entity ) continue;
+			int other = incoming ? r.caller : r.entity;
+			// Operators of the prelude and libcfa (int + int, sout | x) are noise here.
+			const UnitIndex::Entity & callee = s.table->entities[r.entity];
+			if ( ! incoming && callee.library && callee.name.find( '?' ) != std::string::npos ) continue;
+			auto at = toClient( s.snap, r.loc, true );
+			if ( ! at ) continue;
+			auto idIt = ids.find( { mt.source, other } );
+			if ( idIt == ids.end() ) {
+				auto [id, item] = resolveEntity( srcs, mt.source, other );
+				idIt = ids.emplace( std::pair{ mt.source, other }, id ).first;
+				if ( ! groups.count( id ) && item ) {
+					groups[id].item = *item;
+					order.push_back( id );
+				}
+			}
+			auto g = groups.find( idIt->second );
+			if ( g == groups.end() ) continue;
+			json range = lspRange( *at->text, at->loc.range );
+			if ( g->second.seen.insert( range.dump() ).second ) g->second.ranges.push_back( range );
+		}
+	}
+	for ( const std::string & id : order ) {
+		out.push_back( { { incoming ? "from" : "to", groups[id].item }, { "fromRanges", groups[id].ranges } } );
+	}
+	return out;
+}
+
+std::optional<RenamePlan> Server::renameAcross( const Document & d, const json & params, RenameSites & sites ) {
+	if ( ! d.table ) return std::nullopt;
+	auto pos = cursorInSnapshot( d, params );
+	if ( ! pos ) return std::nullopt;
+	auto t = targetAt( d, *pos );
+	if ( ! t ) return std::nullopt;						// a local
+	// Declared only in this .cfa file, nothing elsewhere can name it.
+	bool elsewhere = isHeader( d.path );
+	for ( const Key & k : t->keys ) elsewhere = elsewhere || k.first != d.path;
+	if ( ! elsewhere || ! indexing() ) return std::nullopt;
+	auto plan = d.analysis->rename( d.path, *pos, true );
+	if ( ! plan ) return std::nullopt;
+	if ( ! plan->error.empty() ) throw LspError{ RequestFailed, plan->error };
+	// A file nobody has checked yet may use it.
+	bool building = inflight && inflight->index;
+	for ( const auto & [path, e] : index ) building = building || e.stale;
+	if ( building ) throw LspError{ RequestFailed, "the workspace index is still being built; try again in a moment" };
+
+	const std::string quoted = "`" + plan->name + "`";
+	auto add = [&]( const Snapshot & snap, const Location & l ) {
+		std::string file = fs::path( l.file ).lexically_normal().string();
+		std::string where = fs::path( file ).filename().string() + " line " + std::to_string( l.range.start.line + 1 );
+		auto m = toClient( snap, l, true );
+		auto doc = docs.find( file );
+		if ( ! m || ( doc != docs.end() && m->text != &doc->second.text ) ) {
+			throw LspError{ RequestFailed, "the occurrence of " + quoted + " in " + where +
+											   " changed since it was last checked; try again after the next check" };
+		}
+		const Range & r = m->loc.range;
+		std::string_view line = m->text->line( r.start.line );
+		if ( r.start.line != r.end.line || r.end.col > (int)line.size() || line.substr( r.start.col, r.end.col - r.start.col ) != plan->name ) {
+			throw LspError{ RequestFailed, "the use of " + quoted + " in " + where + " comes from a macro; rename it by hand" };
+		}
+		auto & entry = sites[file];
+		entry.first = m->text;
+		if ( std::find( entry.second.begin(), entry.second.end(), r ) == entry.second.end() ) entry.second.push_back( r );
+	};
+	Snapshot snap = snapOf( d );
+	for ( const Range & r : plan->sites ) add( snap, { d.path, r } );
+	if ( auto m = toClient( snap, { d.path, plan->range }, true ) ) plan->range = m->loc.range;
+	else throw LspError{ RequestFailed, "the file changed since it was last checked; try again after the next check" };
+	plan->sites.clear();
+
+	std::vector<Source> srcs = sources();
+	for ( const Match & mt : matchEntities( srcs, t->name, t->keys ) ) {
+		const Source & s = srcs[mt.source];
+		for ( const auto & r : s.table->refs ) {
+			if ( r.entity == mt.entity && ! hidden( s, r.loc.file ) ) add( s.snap, r.loc );
+		}
+		for ( const Location & l : s.table->entities[mt.entity].declarations ) {
+			if ( ! hidden( s, l.file ) ) add( s.snap, l );
+		}
+	}
+	// Spellings the translator has no use for, in the files the rename edits,
+	// and in macro bodies anywhere.
+	for ( const Source & s : srcs ) {
+		for ( const auto & l : s.table->loose ) {
+			if ( l.name != plan->name || hidden( s, l.loc.file ) ) continue;
+			std::string file = fs::path( l.loc.file ).lexically_normal().string();
+			std::string where = "line " + std::to_string( l.loc.range.start.line + 1 ) + " of " + fs::path( file ).filename().string();
+			if ( l.macro ) {
+				throw LspError{ RequestFailed, quoted + " is used in the macro on " + where +
+												   ", which the translator doesn't see; rename it by hand" };
+			}
+			if ( file == d.path || ! sites.count( file ) ) continue;		// rename() checked this file
+			throw LspError{ RequestFailed, quoted + " appears on " + where +
+											   " where the translator recorded no use (an array dimension, a designator, dead code "
+											   "or code that failed to resolve); rename it by hand" };
+		}
+	}
+	return plan;
+}
+
 // ---------------------------------------------------------------- diagnostics
 
-nlohmann::json Server::diagJson( const Diag & d, const std::string & target, const std::string & source, uint64_t seq ) {
+nlohmann::json Server::diagJson( const Diag & d, const std::string & target, const std::string & source, const DiagSet & set ) {
 	const Text * text = &textOf( target );
 	Range r = d.range;
 	auto dit = docs.find( target );
 	if ( target == source && dit != docs.end() ) {
-		r = toCurrentClamped( dit->second.editsSince( seq ), r );
+		r = toCurrentClamped( dit->second.editsSince( set.seq ), r );
+	} else if ( auto rd = set.reads.find( target ); rd != set.reads.end() && dit != docs.end() ) {
+		// Another document's check read this file from its buffer.
+		r = toCurrentClamped( dit->second.editsSince( rd->second ), r );
 	} else if ( dit != docs.end() ) {
 		// Another document's check read this file from disk.
 		auto m = fromDisk( target, r, false );
@@ -1306,7 +1748,7 @@ nlohmann::json Server::publishFor( const std::string & target ) {
 	auto it = diagStore.find( target );
 	if ( it != diagStore.end() ) {
 		for ( const auto & [source, set] : it->second ) {
-			for ( const Diag & d : set.diags ) list.push_back( diagJson( d, target, source, set.seq ) );
+			for ( const Diag & d : set.diags ) list.push_back( diagJson( d, target, source, set ) );
 		}
 	}
 	json p = { { "uri", uriOf( target ) }, { "diagnostics", list } };
@@ -1315,7 +1757,8 @@ nlohmann::json Server::publishFor( const std::string & target ) {
 	return p;
 }
 
-void Server::storeDiags( const std::string & source, uint64_t seq, const std::vector<Diag> & diags, std::vector<json> & out ) {
+void Server::storeDiags( const std::string & source, uint64_t seq, const SeqMap & reads, const std::vector<Diag> & diags,
+						 std::vector<json> & out ) {
 	std::map<std::string, std::vector<Diag>> byTarget;
 	for ( const Diag & d : diags ) byTarget[d.file].push_back( d );
 	byTarget[source];							// always republish the source itself
@@ -1326,7 +1769,7 @@ void Server::storeDiags( const std::string & source, uint64_t seq, const std::ve
 	for ( auto & [t, list] : byTarget ) {
 		targets.insert( t );
 		if ( list.empty() ) diagStore[t].erase( source );
-		else diagStore[t][source] = DiagSet{ seq, std::move( list ) };
+		else diagStore[t][source] = DiagSet{ seq, reads, std::move( list ) };
 	}
 	for ( const auto & t : targets ) {
 		if ( ! byTarget.count( t ) ) diagStore[t].erase( source );
@@ -1337,14 +1780,14 @@ void Server::storeDiags( const std::string & source, uint64_t seq, const std::ve
 
 // ---------------------------------------------------------------- checking
 
-CheckRequest Server::makeRequest( const Document & doc ) const {
+CheckRequest Server::makeRequest( const std::string & path, const std::string & text ) const {
 	CheckRequest req;
-	req.path = doc.path;
-	req.text = doc.text.str();
+	req.path = path;
+	req.text = text;
 	req.backend = opts.backend;
 	req.stopAfterResolve = opts.stopAfterResolve;
 	req.timeout = std::chrono::milliseconds( opts.timeoutMs );
-	std::string dir = fs::path( doc.path ).parent_path().string();
+	std::string dir = fs::path( path ).parent_path().string();
 	if ( opts.flags ) {
 		req.flags = *opts.flags;
 		req.flagsBase = rootPath.empty() ? dir : rootPath;
@@ -1404,6 +1847,13 @@ void Server::workerLoop() {
 	for ( ;; ) {
 		if ( stopping ) return;
 		if ( pending.empty() ) {
+			// Idle: work on the index.
+			if ( indexRescan ) {
+				indexRescan = false;
+				scanWorkspace( lk );
+				continue;
+			}
+			if ( runIndexJob( lk ) ) continue;
 			cv.wait( lk );
 			continue;
 		}
@@ -1417,11 +1867,18 @@ void Server::workerLoop() {
 		pending.erase( next );
 		auto dit = docs.find( path );
 		if ( dit == docs.end() ) continue;
-		CheckRequest req = makeRequest( dit->second );
+		CheckRequest req = makeRequest( path, dit->second.text.str() );
 		uint64_t seq = dit->second.seq;
+		// Open headers with unsaved edits are read from their buffers.
+		SeqMap reads;
+		for ( const auto & [p, other] : docs ) {
+			if ( p == path || ! isHeader( p ) || ( other.diskSeq && *other.diskSeq == other.seq ) ) continue;
+			req.overlays[p] = other.text.str();
+			reads[p] = other.seq;
+		}
 		std::shared_ptr<const Checker> chk = checker;
 		auto token = std::make_shared<CancelToken>();
-		inflight = InFlight{ path, seq, token, Clock::now() };
+		inflight = InFlight{ path, seq, token, Clock::now(), reads, false };
 		lk.unlock();
 
 		log::info( "checking ", path );
@@ -1429,6 +1886,8 @@ void Server::workerLoop() {
 		FrontResult fr = chk->front( req, *token );
 		auto ms = []( auto d ) { return std::chrono::duration_cast<std::chrono::milliseconds>( d ).count(); };
 		log::info( "front end for ", path, ": status ", (int)fr.status, ", ", fr.diags.size(), " diagnostics, ", ms( Clock::now() - t0 ), " ms" );
+		std::shared_ptr<const UnitIndex> table;
+		if ( fr.analysis && ! token->cancelled() ) table = std::make_shared<const UnitIndex>( fr.analysis->unitIndex() );
 
 		std::vector<json> out;
 		lk.lock();
@@ -1442,6 +1901,8 @@ void Server::workerLoop() {
 		if ( fr.analysis && ( fr.usable || ! doc.analysis ) ) {
 			doc.analysis = fr.analysis;
 			doc.analysisSeq = seq;
+			doc.analysisReads = reads;
+			doc.table = table;
 			// Clients ask for inlay hints when the text changes, not when a
 			// check finishes, so the hints of a file just opened would stay empty.
 			if ( inlayHintRefresh ) {
@@ -1464,8 +1925,9 @@ void Server::workerLoop() {
 			doc.backDiags.clear();
 		}
 		bool carried = ! doc.backDiags.empty();
+		if ( ! fr.files.empty() ) doc.includes = fr.files;
 		diskCache.clear();
-		storeDiags( path, seq, diags, out );
+		storeDiags( path, seq, reads, diags, out );
 		trimLog( doc );
 		{
 			std::lock_guard<std::mutex> pub( publishMtx );
@@ -1490,7 +1952,7 @@ void Server::workerLoop() {
 					std::vector<Diag> merged = fr.diags;
 					mergeDiags( merged, back );
 					diskCache.clear();
-					storeDiags( path, seq, merged, out );
+					storeDiags( path, seq, reads, merged, out );
 				}
 			}
 			{
@@ -1509,6 +1971,132 @@ void Server::workerLoop() {
 			trimLog( it->second );
 		}
 	}
+}
+
+// ---------------------------------------------------------------- index
+
+bool Server::indexing() const {
+	return opts.index && ! rootPath.empty() && checker && ! checker->toolchain().cfa.empty() &&
+		   ! checker->toolchain().translator.empty();
+}
+
+// Finds the .cfa and .hfa files under the root (skipping hidden directories)
+// and marks index entries stale when a file they read has changed.
+void Server::scanWorkspace( std::unique_lock<std::mutex> & lk ) {
+	if ( ! indexing() ) return;
+	std::string root = rootPath;
+	lk.unlock();
+	std::vector<std::string> units, headers;
+	size_t visited = 0;
+	std::error_code ec;
+	for ( fs::recursive_directory_iterator it( root, fs::directory_options::skip_permission_denied, ec ), end;
+		  ! ec && it != end; it.increment( ec ) ) {
+		if ( ++visited > maxScanEntries ) {
+			log::warn( "index: stopped after ", maxScanEntries, " entries under ", root );
+			break;
+		}
+		std::error_code tec;
+		std::string name = it->path().filename().string();
+		if ( it->is_directory( tec ) ) {
+			if ( name.starts_with( "." ) ) it.disable_recursion_pending();
+			continue;
+		}
+		if ( ! it->is_regular_file( tec ) ) continue;
+		std::string ext = it->path().extension().string();
+		if ( ext == ".cfa" ) units.push_back( it->path().lexically_normal().string() );
+		else if ( ext == ".hfa" ) headers.push_back( it->path().lexically_normal().string() );
+	}
+	std::sort( units.begin(), units.end() );
+	std::sort( headers.begin(), headers.end() );
+	if ( units.size() > maxIndexedFiles ) {
+		log::warn( "index: ", units.size(), " .cfa files under ", root, "; indexing the first ", maxIndexedFiles );
+		units.resize( maxIndexedFiles );
+	}
+	lk.lock();
+	if ( stopping ) return;
+	bool headersChanged = headers != projectHeaders;
+	projectHeaders = std::move( headers );
+	std::set<std::string> found( units.begin(), units.end() );
+	for ( auto it = index.begin(); it != index.end(); ) {
+		if ( found.count( it->first ) ) ++it;
+		else it = index.erase( it );
+	}
+	for ( const std::string & u : units ) {
+		auto [it, fresh] = index.try_emplace( u );
+		IndexEntry & e = it->second;
+		if ( fresh || e.stale ) continue;
+		// A check that failed may work with the new set of headers.
+		bool changed = headersChanged && ! e.table;
+		for ( const auto & [f, when] : e.stamps ) {
+			std::error_code tec;
+			auto now = fs::last_write_time( f, tec );
+			if ( tec || now != when ) {
+				changed = true;
+				break;
+			}
+		}
+		if ( changed ) {
+			e.stale = true;
+			e.gen += 1;
+		}
+	}
+	log::info( "index: ", index.size(), " files, ", projectHeaders.size(), " headers under ", root );
+}
+
+// Checks one stale file of the index from disk, with every project header
+// as a focus file so their uses are recorded too.
+bool Server::runIndexJob( std::unique_lock<std::mutex> & lk ) {
+	if ( ! indexing() ) return false;
+	auto next = std::find_if( index.begin(), index.end(), []( const auto & e ) { return e.second.stale; } );
+	if ( next == index.end() ) return false;
+	std::string path = next->first;
+	uint64_t gen = next->second.gen;
+	std::vector<std::string> headers = projectHeaders;
+	std::shared_ptr<const Checker> chk = checker;
+	auto token = std::make_shared<CancelToken>();
+	inflight = InFlight{ path, 0, token, Clock::now(), {}, true };
+	lk.unlock();
+
+	// Taken before reading, so a change made during the check shows later.
+	std::map<std::string, fs::file_time_type> stamps;
+	auto stamp = [&stamps]( const std::string & f ) {
+		std::error_code ec;
+		auto t = fs::last_write_time( f, ec );
+		if ( ! ec ) stamps[f] = t;
+	};
+	stamp( path );
+	for ( const std::string & h : headers ) stamp( h );
+	std::shared_ptr<const UnitIndex> table;
+	bool usable = false, cancelled = false;
+	std::map<std::string, fs::file_time_type> kept;
+	if ( auto text = readFile( path ) ) {
+		CheckRequest req = makeRequest( path, *text );
+		req.backend = false;
+		req.stopAfterResolve = true;		// nothing after Resolve changes the dump
+		req.extraFocus = headers;
+		auto t0 = Clock::now();
+		FrontResult fr = chk->front( req, *token );
+		cancelled = token->cancelled() || fr.status == FrontResult::Cancelled;
+		usable = fr.usable;
+		if ( fr.analysis && ! cancelled ) table = std::make_shared<const UnitIndex>( fr.analysis->unitIndex() );
+		log::info( "indexed ", path, ": status ", (int)fr.status, ", ",
+				   std::chrono::duration_cast<std::chrono::milliseconds>( Clock::now() - t0 ).count(), " ms" );
+		for ( const std::string & f : fr.files ) {
+			if ( ! stamps.count( f ) ) stamp( f );		// outside the root
+			if ( stamps.count( f ) ) kept[f] = stamps[f];
+		}
+	}
+	if ( stamps.count( path ) ) kept[path] = stamps[path];
+
+	lk.lock();
+	inflight.reset();
+	auto it = index.find( path );
+	if ( stopping || cancelled || it == index.end() ) return true;
+	IndexEntry & e = it->second;
+	if ( table && ( usable || ! e.table ) ) e.table = table;
+	e.stamps = std::move( kept );
+	if ( e.gen == gen ) e.stale = false;
+	return true;
 }
 
 } // namespace cfalsp
