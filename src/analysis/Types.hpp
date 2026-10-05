@@ -1,6 +1,7 @@
 #pragma once
 
 #include <compare>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -100,6 +101,40 @@ struct SemanticToken {
 	int length = 0;							// bytes; tokens never span lines
 	int type = 0;							// index into Analysis::tokenTypes()
 	int modifiers = 0;						// bit set over Analysis::tokenModifiers()
+};
+
+// What one translation unit knows that matters outside it, for the server's
+// cross-file queries (Analysis::unitIndex). Locals, parameters and generated
+// declarations are left out. Locations are name ranges.
+struct UnitIndex {
+	// One entity: all declarations of a function, variable or type that the
+	// translator saw as the same thing (a prototype and its definition).
+	struct Entity {
+		std::string name;
+		int kind = 13;						// LSP SymbolKind
+		std::string detail;					// the declaration's signature, or its type
+		std::vector<Location> declarations;
+		std::optional<Location> definition;	// the declaration with a body
+		Range definitionRange;				// that declaration's whole range
+		bool function = false;
+		bool library = false;				// declared only in libcfa, the prelude or system headers
+	};
+	// A use in a focus file.
+	struct Ref {
+		Location loc;
+		int entity = -1;					// index into entities
+		bool call = false;
+		int caller = -1;					// entity of the function whose body holds the use
+	};
+	// A declaration in a project file, for workspace/symbol.
+	struct Sym {
+		std::string name, container;
+		int kind = 13;						// LSP SymbolKind
+		Location loc;
+	};
+	std::vector<Entity> entities;
+	std::vector<Ref> refs;
+	std::vector<Sym> symbols;
 };
 
 } // namespace cfalsp

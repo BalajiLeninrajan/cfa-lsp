@@ -2181,6 +2181,88 @@ std::vector<Symbol> Analysis::documentSymbols( const std::string & file ) const 
 	return out;
 }
 
+UnitIndex Analysis::unitIndex() const {
+	const Impl & m = *impl;
+	UnitIndex out;
+	auto inProject = [&]( int fi ) {
+		const File & f = m.files[fi];
+		return !isLibrary( f.origin ) && !f.path.empty() && f.path[0] == '/';
+	};
+	auto wanted = [&]( int d ) {
+		const Decl & x = m.decls[d];
+		if ( x.local || x.generated || x.name.empty() ) return false;
+		switch ( x.kind ) {
+		  case Kind::Parameter: case Kind::TypeParam: case Kind::Label: case Kind::Other:
+			return false;
+		  default:
+			return true;
+		}
+	};
+	std::unordered_map<int, int> slot;		// canonical decl -> index in out.entities
+	auto entityOf = [&]( int d ) -> int {
+		int e = m.entity[d];
+		if ( auto it = slot.find( e ); it != slot.end() ) return it->second;
+		const Decl & x = m.decls[e];
+		UnitIndex::Entity ent;
+		ent.name = x.name;
+		ent.kind = symbolKind( x );
+		ent.detail = x.signature.empty() ? x.type : x.signature;
+		ent.function = x.kind == Kind::Function;
+		ent.library = true;
+		for ( int k : m.entityMembers[e] ) {
+			const Decl & y = m.decls[k];
+			if ( y.file < 0 || !y.hasLoc || y.generated ) continue;
+			ent.declarations.push_back( m.location( k ) );
+			if ( inProject( y.file ) ) ent.library = false;
+		}
+		int def = m.definitionOf( e );
+		if ( m.decls[def].body && m.decls[def].hasLoc && m.decls[def].file >= 0 ) {
+			ent.definition = m.location( def );
+			ent.definitionRange = m.decls[def].range;
+		}
+		int i = int( out.entities.size() );
+		slot.emplace( e, i );
+		out.entities.push_back( std::move( ent ) );
+		return i;
+	};
+
+	for ( int fi = 0; fi < int( m.files.size() ); fi += 1 ) {
+		const File & f = m.files[fi];
+		if ( !f.focus || f.path.empty() || f.path[0] != '/' ) continue;
+		for ( int r : f.refs ) {
+			const Ref & ref = m.refs[r];
+			if ( !wanted( ref.decl ) ) continue;
+			UnitIndex::Ref u;
+			u.loc = { f.path, ref.range };
+			u.entity = entityOf( ref.decl );
+			u.call = ref.role == Role::Call;
+			// Calls in a nested function count for the function around it.
+			for ( int fn : m.enclosingFunctions( fi, ref.range.start ) ) {
+				if ( wanted( fn ) ) {
+					u.caller = entityOf( fn );
+					break;
+				}
+			}
+			out.refs.push_back( std::move( u ) );
+		}
+	}
+
+	std::function<void( const Symbol &, const std::string &, const std::string & )> flat =
+		[&]( const Symbol & s, const std::string & file, const std::string & container ) {
+			out.symbols.push_back( { s.name, container, s.kind, { file, s.selectionRange } } );
+			for ( const Symbol & c : s.children ) flat( c, file, s.name );
+		};
+	for ( int fi = 0; fi < int( m.files.size() ); fi += 1 ) {
+		if ( !inProject( fi ) ) continue;
+		for ( int d : m.files[fi].names ) {
+			if ( wanted( d ) ) entityOf( d );
+		}
+		const std::string & path = m.files[fi].path;
+		for ( const Symbol & s : documentSymbols( path ) ) flat( s, path, "" );
+	}
+	return out;
+}
+
 // libcfa marks its internal names with a '$' (thread$, file$).
 static bool internalName( const std::string & name, const std::string & prefix ) {
 	return name.find( '$' ) != std::string::npos && prefix.find( '$' ) == std::string::npos;

@@ -98,6 +98,11 @@ class Analysis {
 	std::vector<std::string> similarNames( const std::string & file, Loc pos, const std::string & name,
 										   size_t max = 3 ) const;
 
+	// The entities, uses and symbols of this unit that other files can see,
+	// for the server's index. Uses come from focus files only; symbols from
+	// every project file (not libcfa, the prelude or system headers).
+	UnitIndex unitIndex() const;
+
 	std::vector<SemanticToken> semanticTokens( const std::string & file ) const;
 	static const std::vector<std::string> & tokenTypes();		// LSP legend
 	static const std::vector<std::string> & tokenModifiers();	// LSP legend
