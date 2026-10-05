@@ -117,6 +117,23 @@ jobs:
           CCACHE_BASEDIR: ${{ github.workspace }}
         run: make -j"$(nproc)" test
 
+      # clangd needs entries for the translator sources too. Check there is
+      # one for each, and that the flags in one compile it.
+      - name: Check compile_commands.json
+        env:
+          CCACHE_DIR: /home/runner/.cache/ccache
+        run: |
+          make compile_commands.json
+          jq -e 'length > 0' compile_commands.json > /dev/null
+          for f in $(git -C cforall ls-files 'src/*.cpp' 'src/**/*.cpp' | sed 's|^|cforall/|'); do
+            jq -e --arg f "$PWD/$f" 'any(.[]; .file == $f)' compile_commands.json > /dev/null \
+              || { echo "no entry for $f"; missing=1; }
+          done
+          [ -z "$missing" ]
+          entry=$(jq -c --arg f "$PWD/cforall/src/LSP/Lsp.cpp" '.[] | select(.file == $f)' compile_commands.json)
+          cd "$(jq -r .directory <<<"$entry")"
+          eval "$(jq -r .command <<<"$entry") -fsyntax-only"
+
       - name: Save ccache
         if: always() && steps.ccache.outcome == 'success'
         uses: actions/cache/save@v6

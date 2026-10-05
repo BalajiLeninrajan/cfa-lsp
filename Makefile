@@ -76,17 +76,20 @@ uninstall:
 	rm -f $(PREFIX)/bin/cfa-lsp $(PREFIX)/libexec/cfa-lsp/cfa-cpp
 	-rmdir $(PREFIX)/libexec/cfa-lsp
 
-# One entry per server/analysis/test source, for clangd.
-compile_commands.json: Makefile $(MAIN_SRC) $(SERVER_SRCS) $(ANALYSIS_SRCS) $(TEST_SRCS)
-	@{ echo '['; sep=''; for f in $(MAIN_SRC) $(SERVER_SRCS) $(ANALYSIS_SRCS) $(TEST_SRCS); do \
-	    printf '%s{"directory":"%s","file":"%s","command":"%s %s %s -c %s"}\n' \
-	      "$$sep" "$(CURDIR)" "$$f" "$(CXX)" "$(CPPFLAGS)" "$(CXXFLAGS)" "$$f"; sep=','; \
-	  done; echo ']'; } > $@
-
 clean:
 	rm -rf $(BUILD)/obj $(SERVER_BIN) $(TEST_BIN) $(FAKE_CFA)
 
-# Defines `translator`, `parser` and TRANSLATOR_BIN (the forked cfa-cpp).
+# Defines `translator`, `parser`, TRANSLATOR_BIN (the forked cfa-cpp) and
+# the translator's compile commands.
 include translator.mk
+
+# One entry per server/analysis/test source, then one per translator source
+# once `make translator` has configured build/cforall, for clangd.
+compile_commands.json: Makefile translator.mk compile-commands.mk $(TRANSLATOR_MAKEFILE) \
+    $(MAIN_SRC) $(SERVER_SRCS) $(ANALYSIS_SRCS) $(TEST_SRCS)
+	@set -e; { echo '['; sep=''; for f in $(MAIN_SRC) $(SERVER_SRCS) $(ANALYSIS_SRCS) $(TEST_SRCS); do \
+	    printf '%s{"directory":"%s","file":"%s","command":"%s %s %s -c %s"}\n' \
+	      "$$sep" "$(CURDIR)" "$$f" "$(CXX)" "$(CPPFLAGS)" "$(CXXFLAGS)" "$$f"; sep=','; \
+	  done; $(TRANSLATOR_COMPILE_COMMANDS); echo ']'; } > $@.tmp; mv $@.tmp $@
 
 -include $(ANALYSIS_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_OBJS:.o=.d)
