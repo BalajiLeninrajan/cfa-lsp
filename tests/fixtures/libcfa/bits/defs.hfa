@@ -1,0 +1,4 @@
+// Not in a directory the driver passes with -I.
+#pragma once
+
+void internal_only( void );

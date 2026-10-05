@@ -1,0 +1,37 @@
+// A stand-in for an installed libcfa header, for the header index tests.
+#pragma once
+
+#include <iostream.hfa>
+
+// Output to a file.
+struct ofstream {
+	void * file;
+	bool sepOnOff;
+};
+
+forall( T & | sized( T ) ) {
+	T & persist( T & x );
+	static inline T * fresh( void ) {
+		T * p = 0;
+		return p;
+	}
+}
+
+extern "C" {
+	int fileno_of( ofstream & );
+}
+
+extern ofstream & sout, & serr;
+extern int verbosity = 0, quiet;
+typedef struct { int fd; } handle_t;
+typedef unsigned long fsize;
+enum FMode { ReadMode, WriteMode = 2, AppendMode = ( 1 << 2 ) };
+enum( char ) Sep { Space = ' ', Tab = '\t' };
+struct pending;
+void open( ofstream & os, const char name[], const char mode[] = "w" );
+void ?{}( ofstream & os );
+ofstream & ?|?( ofstream & os, int i );
+int _hidden( void );
+int intern$al( void );
+#define NL "\n"
+#define FS_MAX( a, b ) ((a) > (b) ? (a) : (b))

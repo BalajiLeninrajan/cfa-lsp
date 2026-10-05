@@ -1,0 +1,4 @@
+// Shadowed by the fstream.hfa a directory up, as it is for the preprocessor.
+#pragma once
+
+void shadowed( void );

@@ -1,0 +1,8 @@
+#pragma once
+
+struct string {
+	char * text;
+};
+
+string ?+?( string, string );
+size_t size( const string & s );
