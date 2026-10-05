@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Upstream cforall commit the fork is based on (cfa-cc-1.0.0.397). The tests
+  # need an installed CFA of this version for `cfa -E`, the prelude and the
+  # libcfa headers, so CI builds one from upstream and caches it.
+  CFA_COMMIT: fade1b551c966a956866b7fea0fa38b9e8ac4885
+  CFA_PREFIX: /home/runner/cfa-cc
+
+jobs:
+  test:
+    # Same OS as the cs343 student server, where CFA 1.0.0 is built with gcc-11.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq bison flex ccache gcc-11 g++-11
+
+      - name: Restore CFA toolchain
+        id: toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CFA_PREFIX }}
+          key: cfa-toolchain-${{ env.CFA_COMMIT }}-gcc11-v1
+
+      - name: Build CFA toolchain
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: |
+          git init -q "$RUNNER_TEMP/cfa-src"
+          cd "$RUNNER_TEMP/cfa-src"
+          git remote add origin https://github.com/cforall/cforall.git
+          git fetch -q --depth 1 origin "$CFA_COMMIT"
+          git checkout -q FETCH_HEAD
+          # Checkout gives every file the same mtime; keep make from trying to
+          # regenerate the tracked autotools, bison and flex output.
+          touch aclocal.m4
+          touch configure src/config.h.in Makefile.in */Makefile.in */*/Makefile.in tools/prettyprinter/Makefile.in
+          touch src/AST/BasicKind.hpp src/Parser/lex.cc src/Parser/parser.cc src/Parser/parser.hh
+          mkdir build && cd build
+          ../configure --quiet --prefix="$CFA_PREFIX" --with-target-hosts=x86_64:debug \
+            --disable-gprofiler CC=gcc-11 CXX=g++-11
+          make -s -j"$(nproc)"
+          make -s install
+
+      - name: Add cfa to PATH
+        run: |
+          echo "$CFA_PREFIX/bin" >> "$GITHUB_PATH"
+          "$CFA_PREFIX/bin/cfa" --version 2>&1 | head -1 || true
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ hashFiles('.gitmodules') }}-${{ github.sha }}
+          restore-keys: ccache-
+
+      - name: Build
+        env:
+          CXX: ccache g++
+          CCACHE_DIR: /home/runner/.cache/ccache
+          CCACHE_MAXSIZE: 2G
+          CCACHE_BASEDIR: ${{ github.workspace }}
+        run: |
+          ccache -z
+          make -j"$(nproc)" TRANSLATOR_JOBS="$(nproc)" server translator
+          ccache -s
+
+      - name: Test
+        env:
+          CXX: ccache g++
+          CCACHE_DIR: /home/runner/.cache/ccache
+          CCACHE_BASEDIR: ${{ github.workspace }}
+        run: make -j"$(nproc)" test
+
+      - name: Check generated files are unchanged
+        run: |
+          git diff --exit-code
+          git -C cforall diff --exit-code
