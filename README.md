@@ -208,17 +208,14 @@ the wrong spot in a few cases:
 - Each file is checked on its own. Open headers are checked as if they were
   the main file. Saving a header re-checks the open files; nothing else
   tracks dependencies between files.
-- Uses inside macro bodies have no references, and code the translator
-  generates (for example the bodies of `corun`) is not walked.
-- Array dimensions in declarations, postfix calls (`` x`f ``) and labels are
-  not references.
+- Uses inside macro bodies have no references.
 - Rename works within one file. It refuses a name declared in another file
   (a header, libcfa), a global or a field declared in a header (the files that
   include it aren't known), operators, and names used in a macro of the file.
   It also refuses when the name is spelled somewhere the dump has no reference
-  for, such as an array dimension, a designator, an `#if 0` block or a
-  function that failed to resolve. It does not check whether the new name
-  clashes with another one in scope.
+  for, such as a designator, an array dimension in a typedef, cast or
+  `sizeof`, an `#if 0` block or a function that failed to resolve. It does not
+  check whether the new name clashes with another one in scope.
 - Completion does not know about type-only contexts, `inline` member
   embedding or qualified enumerators (`Colour.Red`). libcfa names containing
   `$` are hidden unless the prefix has a `$`.
