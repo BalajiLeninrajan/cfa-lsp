@@ -82,6 +82,52 @@ TEST_CASE( "macros: hover and definition read #define lines, even from headers w
 	CHECK( h->markdown.find( "#define  MAGIC \\\n\t42" ) != std::string::npos );
 }
 
+TEST_CASE( "macros: cpp's output says which branch of an #if it kept" ) {
+	// FROM_CMDLINE comes from a -D flag, which the source doesn't show.
+	std::map<std::string, std::string> src = {
+		{ "/e/conf.h", "#define CONF 1\n" },
+		{ "/e/main.cfa", "#include \"conf.h\"\n"		// 0
+						 "#ifndef FROM_CMDLINE\n"
+						 "int dead_code;\n"
+						 "#define CHOSEN 2\n"
+						 "#else\n"
+						 "int live_code;\n"			// 5
+						 "#define CHOSEN 1\n"
+						 "#endif\n"
+						 "#ifdef OUTER\n"
+						 "#ifdef INNER\n"
+						 "int inner_code;\n"			// 10
+						 "#endif\n"
+						 "#define IN_OUTER 1\n"		// no code of its own: nothing to see
+						 "#endif\n"
+						 "int x = CHOSEN + IN_OUTER;\n" },
+	};
+	const char * pp =
+		"# 1 \"/e/main.cfa\"\n"
+		"# 1 \"/e/conf.h\" 1\n"
+		"# 2 \"/e/main.cfa\" 2\n"
+		"# 6 \"/e/main.cfa\"\n"
+		"int live_code;\n"
+		"# 15 \"/e/main.cfa\"\n"
+		"int x = 1 + 1;\n";
+	auto read = [src]( const std::string & path ) -> std::optional<std::string> {
+		auto it = src.find( path );
+		if ( it == src.end() ) return std::nullopt;
+		return it->second;
+	};
+	json dump = { { "format", 1 }, { "complete", true }, { "diagnostics", json::array() },
+				  { "decls", { decl( 1, "x", "/e/main.cfa", 15, 4 ) } },
+				  { "refs", json::array() }, { "exprs", json::array() }, { "scopes", json::array() } };
+	SourceMap map( pp, read );
+	auto a = Analysis::load( dump, map, read );
+	auto h = a->hover( "/e/main.cfa", { 14, 9 } );
+	REQUIRE( h );
+	CHECK( h->markdown.find( "#define CHOSEN 1" ) != std::string::npos );
+	h = a->hover( "/e/main.cfa", { 14, 18 } );
+	REQUIRE( h );
+	CHECK( h->markdown.find( "#define IN_OUTER 1" ) != std::string::npos );
+}
+
 TEST_CASE( "a use that only the macro body spells is not a ref" ) {
 	auto a = load();
 	CHECK( a->references( "/m/main.cfa", { 1, 4 }, false ).empty() );

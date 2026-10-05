@@ -46,6 +46,10 @@ class SourceMap {
 	// Every file named in a line marker (empty for identity()).
 	std::vector<std::string> files() const;
 
+	// The 0-based lines of `file` that left text in the preprocessed output,
+	// sorted. nullopt if no line marker names the file, and for identity().
+	std::optional<std::vector<int>> outputLines( const std::string & file ) const;
+
   private:
 	struct Impl;
 	std::unique_ptr<Impl> impl;				// null for identity()

@@ -102,6 +102,69 @@ TEST_CASE( "fallbacks: no answer for a word in a comment or a string" ) {
 	CHECK( contains( h->markdown, "int resumeAt" ) );
 }
 
+TEST_CASE( "macros: #if conditions are evaluated with the macros known so far" ) {
+	std::map<std::string, std::string> src = {
+		{ "/m/cfg.h", "#define LEVEL 2\n"
+					  "#define NAME_A 10\n"
+					  "#if LEVEL > 1 && defined( NAME_A )\n"
+					  "#define HIGH 1\n"
+					  "#else\n"
+					  "#define LOW 1\n"
+					  "#endif\n"
+					  "#if LEVEL == 1\n"
+					  "#define ONE 1\n"
+					  "#elif LEVEL * 2 == 4 /* LEVEL is 2 */\n"
+					  "#define TWO 1\n"
+					  "#else\n"
+					  "#define OTHER 1\n"
+					  "#endif\n"
+					  "#if __GNUC__ >= 4\n"			// from the compiler: unknown, so both branches count
+					  "#define MAYBE 1\n"
+					  "#else\n"
+					  "#define MAYBE_NOT 1\n"
+					  "#endif\n"
+					  "#if 0 || \\\n"
+					  "    defined __cforall\n"
+					  "#define CONT 1\n"
+					  "#endif\n"
+					  "#define U 1\n"
+					  "#undef U\n"
+					  "#ifdef U\n"
+					  "#define AFTER_UNDEF 1\n"
+					  "#endif\n"
+					  "/*\n"
+					  "#define IN_COMMENT 1\n"
+					  "*/\n"
+					  "int cfg;\n" },
+		{ "/m/main.cfa", "#include \"cfg.h\"\n"
+						 "#if LEVEL != 2\n"			// LEVEL from the header
+						 "#define FROM_HEADER_WRONG 1\n"
+						 "#endif\n"
+						 "int a = HIGH + LOW + ONE + TWO + OTHER + MAYBE + MAYBE_NOT + CONT + AFTER_UNDEF + IN_COMMENT + FROM_HEADER_WRONG;\n" },
+	};
+	Dump d;
+	d.decl( "a", "variable", "/m/main.cfa", 5, 4, { { "local", true } } );	// makes main.cfa a focus file
+	d.decl( "cfg", "variable", "/m/cfg.h", 32, 4 );
+	auto a = d.load( src );
+	std::string line = "int a = HIGH + LOW + ONE + TWO + OTHER + MAYBE + MAYBE_NOT + CONT + AFTER_UNDEF + IN_COMMENT + FROM_HEADER_WRONG;";
+	auto defined = [&]( const std::string & name ) {
+		int col = int( line.find( name + " " ) == std::string::npos ? line.find( name + ";" ) : line.find( name + " " ) );
+		auto h = a->hover( "/m/main.cfa", { 4, col + 1 } );
+		return h && contains( h->markdown, "#define " + name );
+	};
+	CHECK( defined( "HIGH" ) );
+	CHECK_FALSE( defined( "LOW" ) );
+	CHECK_FALSE( defined( "ONE" ) );
+	CHECK( defined( "TWO" ) );
+	CHECK_FALSE( defined( "OTHER" ) );
+	CHECK( defined( "MAYBE" ) );
+	CHECK( defined( "MAYBE_NOT" ) );
+	CHECK( defined( "CONT" ) );
+	CHECK_FALSE( defined( "AFTER_UNDEF" ) );
+	CHECK_FALSE( defined( "IN_COMMENT" ) );
+	CHECK_FALSE( defined( "FROM_HEADER_WRONG" ) );
+}
+
 TEST_CASE( "macros: only definitions cpp kept and that are not #undef'd" ) {
 	std::map<std::string, std::string> src = {
 		{ "/m/coll.h", "#ifdef __cforall\n"
