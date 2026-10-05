@@ -174,12 +174,13 @@ the wrong spot in a few cases:
 ## Development
 
 ```
-src/server/      LSP transport, documents, the check pipeline (C++20)
-src/analysis/    dump loading, SourceMap (column mapping), queries
-cforall/         the CFA source, with the LSP dump in cforall/src/LSP
-docs/            the translator's JSON format
-tests/           doctest tests, one binary; fixtures in tests/fixtures
-translator.mk    builds the translator
+src/server/          LSP transport, documents, the check pipeline (C++20)
+src/analysis/        dump loading, SourceMap (column mapping), queries
+cforall/             the CFA source, with the LSP dump in cforall/src/LSP
+docs/                the translator's JSON format
+tests/               doctest tests, one binary; fixtures in tests/fixtures
+translator.mk        builds the translator
+compile-commands.mk  translator entries for compile_commands.json
 ```
 
 Build and test:
@@ -189,7 +190,14 @@ make -j8                  # server and translator
 make -j8 test             # every test
 make test ARGS='-ts=integration'
 make BUILD=build/mine test   # a separate object directory
+make compile_commands.json   # for clangd
 ```
+
+`compile_commands.json` covers the server, the analysis code and the tests,
+and the translator sources in `cforall/src` once `make translator` has
+configured `build/cforall`. The translator entries use the compile command
+from that configured build. Run it again after the first `make translator`
+to pick them up.
 
 `make test` builds the server and the test binary, then runs everything.
 Tests that need `cfa` or the translator skip themselves when those are

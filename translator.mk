@@ -81,3 +81,20 @@ $(CFA_PARSER)/lex.cc: $(CFA_PARSER)/lex.ll
 
 parser:
 	@$(TRANSLATOR_LOCK) sh -c 'set -e; cd $(CFORALL_SRC)/src; $(YACC_CMD); $(LEX_CMD)'
+
+# compile_commands.json entries for cforall/src, one per line, each starting
+# with a comma. The configured Makefile expands its own compile command and
+# source list (compile-commands.mk), so the entries match the real build. The
+# grep drops anything else that make prints, such as config.status output if
+# the Makefile is out of date. There are none until `make translator` has
+# configured TRANSLATOR_DIR.
+TRANSLATOR_MAKEFILE := $(wildcard $(TRANSLATOR_DIR)/src/Makefile)
+TRANSLATOR_COMPILE_COMMANDS = \
+  if [ -f $(TRANSLATOR_DIR)/src/Makefile ]; then \
+    (unset MAKEFLAGS MFLAGS MAKEOVERRIDES; \
+     $(MAKE) --no-print-directory -s -C $(TRANSLATOR_DIR)/src \
+       -f Makefile -f $(CURDIR)/compile-commands.mk cfa-lsp-compile-commands) \
+      | grep '^,{"directory"'; \
+  else \
+    echo "no compile commands for cforall/src until make translator configures $(TRANSLATOR_DIR)" >&2; \
+  fi
