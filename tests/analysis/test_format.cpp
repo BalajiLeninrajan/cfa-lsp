@@ -175,6 +175,53 @@ TEST_CASE( "format: bodies without braces are one level in" ) {
 		   "}\n" );
 }
 
+TEST_CASE( "format: an else lines up with its if inside another body" ) {
+	std::string src =
+		"void h( int n ) {\n"
+		"for ( i; n )\n"
+		"if ( i ) {\n"
+		"a();\n"
+		"} else {\n"
+		"b();\n"
+		"}\n"
+		"for ( i; n )\n"
+		"if ( i )\n"
+		"a();\n"
+		"else\n"
+		"b();\n"
+		"if ( n )\n"
+		"if ( n > 1 )\n"
+		"a();\n"
+		"else\n"
+		"b();\n"
+		"else\n"
+		"c();\n"
+		"d();\n"
+		"}\n";
+	CHECK( formatText( src, spaces() ) ==
+		   "void h( int n ) {\n"
+		   "    for ( i; n )\n"
+		   "        if ( i ) {\n"
+		   "            a();\n"
+		   "        } else {\n"
+		   "            b();\n"
+		   "        }\n"
+		   "    for ( i; n )\n"
+		   "        if ( i )\n"
+		   "            a();\n"
+		   "        else\n"
+		   "            b();\n"
+		   "    if ( n )\n"
+		   "        if ( n > 1 )\n"
+		   "            a();\n"
+		   "        else\n"
+		   "            b();\n"
+		   "    else\n"
+		   "        c();\n"
+		   "    d();\n"
+		   "}\n" );
+}
+
 TEST_CASE( "format: continuation lines keep their alignment" ) {
 	std::string src =
 		"int main() {\n"
