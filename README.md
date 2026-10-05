@@ -164,8 +164,9 @@ the wrong spot in a few cases:
   `$` are hidden unless the prefix has a `$`.
 - Type and signature text comes from the translator's pretty printer, so it
   can differ from what you wrote (`Fib &f`, assertions left out).
-- If the translator crashes on an internal assertion there are no results for
-  that check; the error is reported on the file.
+- If the translator fails an internal assertion or crashes, the check reports
+  `internal translator error` on line 1, and unless the crash came after
+  resolution the previous results stay in use.
 - `workspace/didChangeConfiguration` is not handled. Restart the server to
   change options.
 

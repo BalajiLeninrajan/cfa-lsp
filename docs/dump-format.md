@@ -17,7 +17,10 @@ cfa-cpp --lsp OUT.json [--lsp-focus PATH]... [--lsp-c-out OUT.c] [usual cfa-cpp 
   real path, never the temp path.
 - `--lsp OUT.json` turns LSP mode on. Errors and warnings go into the JSON,
   not stderr. The exit status is 0 whenever `OUT.json` was written, even if it
-  contains errors. Non-zero means the translator crashed or could not write.
+  contains errors. A failed assertion, `abort` or fatal signal (`SIGSEGV`,
+  `SIGBUS`, `SIGFPE`, `SIGABRT`) still writes `OUT.json`, with an internal
+  error (see Diagnostic), and exits with 0. Non-zero means the translator
+  could not write the dump at all.
 - `--lsp-focus PATH` (repeatable) names the files the user is editing. Local
   declarations, `refs`, `exprs` and `scopes` are emitted only for focus files.
   Global declarations are emitted for every file, including libcfa headers and
@@ -120,8 +123,14 @@ range of a `for` loop, and reports its errors once per copy.
 
 A diagnostic whose location has a line but no column covers the whole line. A
 diagnostic with no location at all is put at line 1, column 0 of the first
-focus file. A translator failure that is not a user error (an uncaught
-exception) is an error whose message starts with `internal translator error:`.
+focus file. A translator failure that is not a user error is an error with no
+location whose message starts with `internal translator error:`, followed by
+what failed: an uncaught exception, `assertion "EXPR" failed in FUNCTION
+(FILE:LINE)` and the assertion's message, `segmentation fault`, `bus error`,
+`arithmetic exception (SIGFPE)`, `aborted` or `out of memory`. After a crash
+the dump has the diagnostics collected until then. It keeps the snapshot (and
+`complete: true`) only if the crash came after a `Resolve` without errors;
+otherwise `complete` is false and decls, refs, exprs and scopes are empty.
 `severity` is `error` or `warning`; the translator has no notes.
 
 ### Decl
