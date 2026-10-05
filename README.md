@@ -21,6 +21,13 @@ Features:
   after `.` and `->`
 - signature help
 - semantic tokens
+- document highlight
+- inlay hints: parameter names at call sites, and the type a call of a
+  `forall` function returns when it differs from the declared return type
+- rename within one file
+- workspace symbols from the open documents and the project headers they
+  include
+- clangd's `textDocument/switchSourceHeader`, between `x.cfa` and `x.hfa`
 
 It runs on Linux and needs an installed CFA 1.0.0 (`cfa` on `PATH`). The
 translator fork is based on the same version (upstream commit `fade1b55`).
@@ -58,6 +65,20 @@ vim.lsp.config( 'cfa_lsp', {
   root_markers = { 'cfa_flags.txt', '.git' },
 } )
 vim.lsp.enable( 'cfa_lsp' )
+```
+
+Inlay hints are off by default in Neovim; `vim.lsp.inlay_hint.enable()` turns
+them on. Switching between a source file and its header is a clangd extension,
+so it needs a command of its own:
+
+```lua
+vim.api.nvim_create_user_command( 'CfaSwitch', function()
+  local client = vim.lsp.get_clients( { bufnr = 0, name = 'cfa_lsp' } )[1]
+  if not client then return end
+  client:request( 'textDocument/switchSourceHeader', { uri = vim.uri_from_bufnr( 0 ) }, function( _, uri )
+    if uri then vim.cmd.edit( vim.uri_to_fname( uri ) ) end
+  end, 0 )
+end, {} )
 ```
 
 Any client that can start a stdio server for `.cfa` and `.hfa` files works
@@ -161,6 +182,10 @@ the wrong spot in a few cases:
   generates (for example the bodies of `corun`) is not walked.
 - Array dimensions in declarations, postfix calls (`` x`f ``) and labels are
   not references.
+- Rename works within one file. It refuses a name declared in another file
+  (a header, libcfa), a global or a field declared in a header (the files that
+  include it aren't known), operators, and names used in a macro of the file,
+  since uses in macro bodies have no references.
 - Completion does not know about type-only contexts, `inline` member
   embedding or qualified enumerators (`Colour.Red`). libcfa names containing
   `$` are hidden unless the prefix has a `$`.
