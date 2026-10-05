@@ -215,6 +215,7 @@ struct FakeEnv {
 		setenv( "FAKE_CFA_DIR", ( fixtures() + "/server" ).c_str(), 1 );
 		setenv( "FAKE_CFA_LOG", ( scratch.path() + "/log" ).c_str(), 1 );
 		setenv( "FAKE_CFA_PIDS", ( scratch.path() + "/pids" ).c_str(), 1 );
+		setenv( "FAKE_CFA_STARTED", ( scratch.path() + "/started" ).c_str(), 1 );
 		fs::create_directories( scratch.path() + "/tmp" );
 		setenv( "TMPDIR", ( scratch.path() + "/tmp" ).c_str(), 1 );
 	}
@@ -231,6 +232,14 @@ struct FakeEnv {
 		return n;
 	}
 };
+
+bool waitForFile( const std::string & path ) {
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+	while ( ! fs::exists( path ) && std::chrono::steady_clock::now() < deadline ) {
+		std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
+	}
+	return fs::exists( path );
+}
 
 bool processGone( pid_t pid ) {
 	std::ifstream stat( "/proc/" + std::to_string( pid ) + "/stat" );
@@ -522,7 +531,7 @@ TEST_CASE( "checks publish translator, preprocessor and backend diagnostics" ) {
 	CHECK( env.tempDirsLeft() == 0 );
 }
 
-TEST_CASE( "a newer edit cancels the running check and kills its processes" ) {
+TEST_CASE( "closing the document cancels the running check and kills its processes" ) {
 	if ( fakeCfa().empty() ) {
 		MESSAGE( "CFA_LSP_FAKE_CFA not set; skipping (run through make test)" );
 		return;
@@ -537,11 +546,7 @@ TEST_CASE( "a newer edit cancels the running check and kills its processes" ) {
 	s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 },
 															{ "text", "// FAKE_SLOW\n" + text } } } } );
 	std::string pidFile = env.scratch.path() + "/pids";
-	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
-	while ( ! fs::exists( pidFile ) && std::chrono::steady_clock::now() < deadline ) {
-		std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
-	}
-	REQUIRE( fs::exists( pidFile ) );
+	REQUIRE( waitForFile( pidFile ) );
 	pid_t child = 0, grandchild = 0;
 	std::ifstream( pidFile ) >> child >> grandchild;
 	REQUIRE( child > 0 );
@@ -552,19 +557,60 @@ TEST_CASE( "a newer edit cancels the running check and kills its processes" ) {
 	s.request( "textDocument/hover", { { "textDocument", { { "uri", uri } } }, { "position", pos( 0, 0 ) } } );
 	CHECK( std::chrono::steady_clock::now() - t0 < std::chrono::seconds( 1 ) );
 
-	s.notify( "textDocument/didChange", { { "textDocument", { { "uri", uri }, { "version", 2 } } },
-										  { "contentChanges", { { { "range", { { "start", pos( 0, 0 ) }, { "end", pos( 1, 0 ) } } }, { "text", "" } } } } } );
-	// The replacement check finishes quickly and publishes.
-	auto d = s.diagnosticsFor( uri, []( const json & ) { return true; }, std::chrono::seconds( 10 ) );
+	s.notify( "textDocument/didClose", { { "textDocument", { { "uri", uri } } } } );
+	auto d = s.diagnosticsFor( uri, []( const json & ds ) { return ds.empty(); }, std::chrono::seconds( 10 ) );
 	REQUIRE( d );
-	CHECK( ( *d )["version"] == 2 );
-	CHECK( processGone( child ) );
-	deadline = std::chrono::steady_clock::now() + std::chrono::seconds( 5 );
-	while ( ! processGone( grandchild ) && std::chrono::steady_clock::now() < deadline ) {
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds( 5 );
+	while ( ! ( processGone( child ) && processGone( grandchild ) ) && std::chrono::steady_clock::now() < deadline ) {
 		std::this_thread::sleep_for( std::chrono::milliseconds( 20 ) );
 	}
+	CHECK( processGone( child ) );
 	CHECK( processGone( grandchild ) );
+	if ( ! processGone( child ) ) kill( child, SIGKILL );
 	if ( ! processGone( grandchild ) ) kill( grandchild, SIGKILL );
+	s.request( "shutdown" );
+	s.notify( "exit", nullptr );
+	CHECK( s.finish() == 0 );
+	CHECK( env.tempDirsLeft() == 0 );
+}
+
+TEST_CASE( "an edit lets the running check finish and publish, mapped through the edit" ) {
+	if ( fakeCfa().empty() ) {
+		MESSAGE( "CFA_LSP_FAKE_CFA not set; skipping (run through make test)" );
+		return;
+	}
+	FakeEnv env;
+	std::string path = fs::canonical( fixtures() + "/server/hello.cfa" ).string();
+	std::string uri = pathToUri( path );
+	std::string text = readAll( path );
+
+	Session s;
+	s.initialize( fakeOptions() );
+	// The translator takes 1.5 s on this text. Its canned backend warning is
+	// on line 3 of the text it read.
+	s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 },
+															{ "text", "// FAKE_DELAY\n" + text } } } } );
+	REQUIRE( waitForFile( env.scratch.path() + "/started" ) );
+
+	// While it runs, turn the first line into two.
+	s.notify( "textDocument/didChange", { { "textDocument", { { "uri", uri }, { "version", 2 } } },
+										  { "contentChanges", { { { "range", { { "start", pos( 0, 0 ) }, { "end", pos( 1, 0 ) } } },
+																  { "text", "// edited\n\n" } } } } } );
+	// The first check still publishes, with its warning moved down a line.
+	auto d = s.diagnosticsFor( uri, []( const json & ds ) { return ! ds.empty(); } );
+	REQUIRE( d );
+	CHECK( ( *d )["version"] == 2 );
+	CHECK( ( *d )["diagnostics"][0]["range"]["start"]["line"] == 4 );
+	// Then the check of the edited text runs.
+	d = s.diagnosticsFor( uri, []( const json & ds ) { return ! ds.empty(); } );
+	REQUIRE( d );
+	CHECK( ( *d )["version"] == 2 );
+	CHECK( ( *d )["diagnostics"][0]["range"]["start"]["line"] == 3 );
+
+	std::string log = readAll( env.scratch.path() + "/log" );
+	size_t runs = 0;
+	for ( size_t p = log.find( "--lsp " ); p != std::string::npos; p = log.find( "--lsp ", p + 1 ) ) runs += 1;
+	CHECK( runs == 2 );
 	s.request( "shutdown" );
 	s.notify( "exit", nullptr );
 	CHECK( s.finish() == 0 );

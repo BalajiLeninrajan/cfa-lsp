@@ -15,7 +15,9 @@
 //                        from a pass that only checks), where the C also gets a
 //                        FAKE_GCC_ERROR line. If the input contains FAKE_SLOW
 //                        it first forks a grandchild, writes both pids to
-//                        $FAKE_CFA_PIDS and sleeps.
+//                        $FAKE_CFA_PIDS and sleeps. If it contains FAKE_DELAY
+//                        it creates $FAKE_CFA_STARTED and sleeps for 1.5 s
+//                        first.
 //   -fsyntax-only ... C  backend: print $FAKE_CFA_DIR/gcc.err to stderr with
 //                        @CFILE@ replaced by C, and an error on line 6 if C
 //                        contains FAKE_GCC_ERROR.
@@ -129,6 +131,10 @@ int main( int argc, char * argv[] ) {
 				std::rename( ( env( "FAKE_CFA_PIDS" ) + ".tmp" ).c_str(), env( "FAKE_CFA_PIDS" ).c_str() );
 			}
 			sleep( 60 );
+		}
+		if ( readFile( in ).find( "FAKE_DELAY" ) != std::string::npos ) {
+			if ( ! env( "FAKE_CFA_STARTED" ).empty() ) std::ofstream( env( "FAKE_CFA_STARTED" ) ) << getpid() << '\n';
+			usleep( 1500 * 1000 );
 		}
 		std::string focusDir = focus.substr( 0, focus.rfind( '/' ) );
 		bool headerError = readFile( in ).find( "FAKE_HEADER_ERROR" ) != std::string::npos;
