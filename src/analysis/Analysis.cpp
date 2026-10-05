@@ -149,20 +149,31 @@ const json & array( const json & dump, const char * key ) {
 	return *it;
 }
 
-std::optional<Range> mapped( const json & j, const std::string & file, const SourceMap & map ) {
+// `body`, if given, is set when the start came from a macro's body, so the
+// source does not spell what is there (see SourceMap::inMacroBody).
+std::optional<Range> mapped( const json & j, const std::string & file, const SourceMap & map, bool * body = nullptr ) {
+	if ( body ) *body = false;
 	if ( !j.is_object() ) return std::nullopt;
 	int line = smallInt( j, "line", 0 );
 	if ( line <= 0 ) return std::nullopt;				// unknown location
 	int col = std::max( smallInt( j, "col", 0 ), 0 );
 	int endLine = smallInt( j, "endLine", line );
 	int endCol = smallInt( j, "endCol", endLine == line ? col : 0 );
-	if ( endLine < line || ( endLine == line && endCol < col ) ) {
+	// The line in the preprocessed text, when the translator gave it.
+	int pline = std::max( smallInt( j, "pline", 0 ), 0 );
+	int endPline = std::max( smallInt( j, "endPline", 0 ), 0 );
+	// A range can end on a later piece of a split line, at a smaller column.
+	bool laterPiece = pline > 0 && endPline > 0 && endPline != pline;
+	if ( endLine < line || ( endLine == line && ( laterPiece ? endPline < pline : endCol < col ) ) ) {
 		endLine = line;
 		endCol = col;
+		endPline = pline;
 	}
-	Range r = map.mapRange( file, line, col, endLine, endCol );
+	SourceMap::Point start{ line, col, pline }, end{ endLine, endCol, endPline };
+	Range r = map.mapRange( file, start, end );
 	if ( r.start.line < 0 ) r.start = { 0, 0 };
 	if ( r.end < r.start ) r.end = r.start;
+	if ( body ) *body = map.inMacroBody( file, start );
 	return r;
 }
 
@@ -633,8 +644,9 @@ void Analysis::Impl::load( const json & dump, const SourceMap & map ) {
 			d.file = fileOf( path );
 			if ( auto r = mapped( j, path, map ) ) { d.hasLoc = true; d.range = *r; }
 			auto nr = j.find( "nameRange" );
+			bool madeUp = false;			// the name came from a macro's body
 			if ( nr != j.end() ) {
-				if ( auto r = mapped( *nr, path, map ) ) { d.hasName = true; d.nameRange = *r; }
+				if ( auto r = mapped( *nr, path, map, &madeUp ) ; r && !madeUp ) { d.hasName = true; d.nameRange = *r; }
 			}
 			if ( d.hasName && !d.hasLoc ) { d.hasLoc = true; d.range = d.nameRange; }
 			if ( d.hasLoc && !d.hasName ) d.nameRange = { d.range.start, d.range.start };
@@ -677,8 +689,9 @@ void Analysis::Impl::load( const json & dump, const SourceMap & map ) {
 		if ( !j.is_object() ) continue;
 		std::string path = string( j, "file" );
 		int d = index( optId( j, "decl" ) );
-		auto r = mapped( j, path, map );
-		if ( path.empty() || d < 0 || !r ) continue;
+		bool inBody = false;			// a use that only a macro's body spells
+		auto r = mapped( j, path, map, &inBody );
+		if ( path.empty() || d < 0 || !r || inBody ) continue;
 		if ( auto ft = text( fileOf( path ) ) ) {
 			r = spelledUse( *ft, *r, decls[d].name );
 			if ( !r ) continue;

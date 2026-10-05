@@ -134,6 +134,50 @@ TEST_CASE( "a use that only the macro body spells is not a ref" ) {
 	for ( const auto & t : a->semanticTokens( "/m/main.cfa" ) ) CHECK( ( t.start.line != 2 || t.start.col < 8 ) );
 }
 
+TEST_CASE( "a name from a macro's body that is also its argument is not a ref" ) {
+	// GETX( x ) expands to ( (x).x ): the first x is the parameter, written
+	// as the argument; the second is the field, from the body.
+	const std::map<std::string, std::string> src = {
+		{ "/s/main.cfa", "#define GETX( p ) ( (p).x )\n"
+						 "struct Pt { int x, y; };\n"
+						 "int f( struct Pt x ) {\n"
+						 "\treturn GETX( x );\n"
+						 "}\n" } };
+	const char * prep =
+		"# 1 \"/s/main.cfa\"\n"
+		"\n"
+		"struct Pt { int x, y; };\n"
+		"int f( struct Pt x ) {\n"
+		" return ( (x).x );\n"
+		"}\n";
+	SourceMap::Reader read = [src]( const std::string & path ) -> std::optional<std::string> {
+		auto it = src.find( path );
+		if ( it == src.end() ) return std::nullopt;
+		return it->second;
+	};
+	json field = decl( 1, "x", "/s/main.cfa", 2, 16 ), param = decl( 2, "x", "/s/main.cfa", 3, 17 );
+	field["kind"] = "field";
+	param["kind"] = "parameter";
+	param["local"] = true;
+	auto ref = []( int col, int d, const char * role ) {
+		return json{ { "file", "/s/main.cfa" }, { "line", 4 }, { "col", col }, { "endLine", 4 }, { "endCol", col + 1 },
+					 { "pline", 5 }, { "endPline", 5 }, { "decl", d }, { "role", role } };
+	};
+	json dump = { { "format", 1 }, { "complete", true }, { "diagnostics", json::array() },
+				  { "decls", { field, param } },
+				  { "refs", { ref( 11, 2, "read" ), ref( 14, 1, "member" ) } },
+				  { "exprs", json::array() }, { "scopes", json::array() } };
+	SourceMap map( prep, read );
+	auto a = Analysis::load( dump, map, read );
+	CHECK( a->references( "/s/main.cfa", { 1, 16 }, false ).empty() );
+	auto d = a->definition( "/s/main.cfa", { 3, 14 } );
+	REQUIRE( d.size() == 1 );
+	CHECK( d[0].range.start == Loc{ 2, 17 } );
+	auto r = a->references( "/s/main.cfa", { 2, 17 }, false );
+	REQUIRE( r.size() == 1 );
+	CHECK( r[0].range == Range{ { 3, 14 }, { 3, 15 } } );
+}
+
 TEST_CASE( "definition on an #include line opens the file" ) {
 	auto a = load();
 	auto d = a->definition( "/m/main.cfa", { 0, 12 } );

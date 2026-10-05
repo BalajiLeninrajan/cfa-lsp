@@ -152,21 +152,128 @@ TEST_CASE( "sourcemap: pragmas, #line, escaped names" ) {
 
 TEST_CASE( "sourcemap: header included twice" ) {
 	Files f;
-	f.text["/r/m.c"] = "#include \"t.h\"\n#define T 1\n#include \"t.h\"\n";
+	f.text["/r/m.c"] = "#include \"t.h\"\n#define T 1000\n#include \"t.h\"\n";
 	f.text["/r/t.h"] = "int  v = T;\n";
 	std::string prep =
-		"# 1 \"/r/m.c\"\n"
-		"# 1 \"/r/t.h\" 1\n"
-		"int v = T;\n"
-		"# 2 \"/r/m.c\" 2\n"
-		"\n"
-		"# 1 \"/r/t.h\" 1\n"
-		"int v = 1;\n"
-		"# 4 \"/r/m.c\" 2\n";
+		"# 1 \"/r/m.c\"\n"				// 1
+		"# 1 \"/r/t.h\" 1\n"			// 2
+		"int v = T;\n"					// 3
+		"# 2 \"/r/m.c\" 2\n"			// 4
+		"\n"							// 5
+		"# 1 \"/r/t.h\" 1\n"			// 6
+		"int v = 1000;\n"				// 7
+		"# 4 \"/r/m.c\" 2\n";			// 8
 	SourceMap m( prep, f.reader() );
-	// The first copy is used.
-	CHECK( m.map( "/r/t.h", 1, 4 ) == L( 0, 5 ) );
-	CHECK( m.map( "/r/t.h", 1, 8 ) == L( 0, 9 ) );
+	const std::string H = "/r/t.h";
+	// Without pline, the first copy is used: column 12 is past its end.
+	CHECK( m.map( H, 1, 4 ) == L( 0, 5 ) );
+	CHECK( m.map( H, 1, 8 ) == L( 0, 9 ) );
+	CHECK( m.map( H, 1, 12 ) == L( 0, 11 ) );
+	// pline picks the copy.
+	CHECK( m.map( H, { 1, 8, 3 } ) == L( 0, 9 ) );
+	CHECK( m.map( H, { 1, 9, 3 } ) == L( 0, 10 ) );				// ; in the first copy
+	CHECK( m.map( H, { 1, 8, 7 } ) == L( 0, 9 ) );				// 1000 -> T
+	CHECK( m.map( H, { 1, 12, 7 } ) == L( 0, 10 ) );				// ; in the second copy
+	CHECK( m.mapRange( H, { 1, 4, 7 }, { 1, 13, 7 } ) == Range{ L( 0, 5 ), L( 0, 11 ) } );
+	// A pline that is not a line of this file with this number is ignored.
+	CHECK( m.map( H, { 1, 12, 4 } ) == L( 0, 11 ) );
+	CHECK( m.map( H, { 2, 12, 7 } ) == L( 1, 0 ) );
+	CHECK( m.map( H, { 1, 12, 99 } ) == L( 0, 11 ) );
+}
+
+// A #line in the source makes the markers give other line numbers; the
+// file's own directives say which real lines they are.
+TEST_CASE( "sourcemap: #line in the source" ) {
+	Files f;
+	f.text["/r/l.cfa"] =
+		"int a;\n"						// 0
+		"#line 100\n"					// 1
+		"int   b;\n"					// 2
+		"int c;\n"						// 3
+		"#line 4\n"						// 4
+		"int  d;\n"						// 5
+		"# 4 \"/r/l.cfa\"\n"				// 6
+		"int  e;\n";						// 7
+	std::string prep =
+		"# 1 \"/r/l.cfa\"\n"				// 1
+		"int a;\n"						// 2
+		"# 100 \"/r/l.cfa\"\n"			// 3
+		"int b;\n"						// 4
+		"int c;\n"						// 5
+		"# 4 \"/r/l.cfa\"\n"				// 6
+		"int d;\n"						// 7
+		"# 4 \"/r/l.cfa\"\n"				// 8
+		"int e;\n";						// 9
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/l.cfa";
+	CHECK( m.map( F, 1, 4 ) == L( 0, 4 ) );
+	CHECK( m.map( F, 100, 4 ) == L( 2, 6 ) );
+	CHECK( m.map( F, 101, 4 ) == L( 3, 4 ) );
+	CHECK( m.mapRange( F, 100, 4, 100, 5 ) == Range{ L( 2, 6 ), L( 2, 7 ) } );
+	CHECK( m.mapRange( F, 100, 0, 101, 6 ) == Range{ L( 2, 0 ), L( 3, 6 ) } );
+	// d and e are both on line 4 as far as the markers go: the first one wins
+	// without pline. Repeating the number is not a split line, so e is not a
+	// piece of d's line.
+	CHECK( m.map( F, 4, 4 ) == L( 5, 5 ) );
+	CHECK( m.map( F, { 4, 4, 7 } ) == L( 5, 5 ) );
+	CHECK( m.map( F, { 4, 4, 9 } ) == L( 7, 5 ) );
+	CHECK( m.map( F, { 4, 6, 9 }, true ) == L( 7, 7 ) );
+}
+
+// An identifier in a macro's body that is also an argument: the expansion is
+// redone from the #define, so the body's tmp maps to the whole invocation and
+// the argument's to the argument.
+TEST_CASE( "sourcemap: macro body identifier that is also an argument" ) {
+	Files f;
+	f.text["/r/swap.h"] = "#define SWAP( a, b ) \\\n\t{ int tmp = a; a = b; b = tmp; }\n";
+	f.text["/r/w.cfa"] =
+		"#include \"swap.h\"\n"
+		"void f( int x, int tmp ) {\n"
+		"\tSWAP( x, tmp );\n"
+		"\tSWAP( tmp, x );\n"
+		"}\n";
+	std::string prep =
+		"# 1 \"/r/w.cfa\"\n"
+		"# 1 \"/r/swap.h\" 1\n"
+		"# 2 \"/r/w.cfa\" 2\n"
+		"void f( int x, int tmp ) {\n"
+		" { int tmp = x; x = tmp; tmp = tmp; };\n"
+		" { int tmp = tmp; tmp = x; x = tmp; };\n"
+		"}\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/w.cfa";
+	// " { int tmp = x; x = tmp; tmp = tmp; };"
+	//   0123456789012345678901234567890123456
+	Loc swap = L( 2, 1 ), x = L( 2, 7 ), tmp = L( 2, 10 );
+	CHECK( m.map( F, 3, 7 ) == swap );						// int tmp: the body's
+	CHECK( m.map( F, 3, 10, true ) == L( 2, 15 ) );			// ... ends with the invocation
+	CHECK( m.inMacroBody( F, { 3, 7 } ) );
+	CHECK( m.map( F, 3, 13 ) == x );
+	CHECK_FALSE( m.inMacroBody( F, { 3, 13 } ) );
+	CHECK( m.map( F, 3, 16 ) == x );
+	CHECK( m.map( F, 3, 20 ) == tmp );						// a = b: the argument
+	CHECK_FALSE( m.inMacroBody( F, { 3, 20 } ) );
+	CHECK( m.map( F, 3, 25 ) == tmp );
+	CHECK( m.map( F, 3, 31 ) == swap );						// b = tmp: the body's
+	CHECK( m.inMacroBody( F, { 3, 31 } ) );
+	CHECK( m.inMacroBody( F, { 3, 11 } ) );					// = from the body
+	CHECK( m.map( F, 3, 37 ) == L( 2, 15 ) );				// ;
+	CHECK_FALSE( m.inMacroBody( F, { 3, 37 } ) );
+	// " { int tmp = tmp; tmp = x; x = tmp; };"
+	CHECK( m.map( F, 4, 7 ) == L( 3, 1 ) );
+	CHECK( m.map( F, 4, 13 ) == L( 3, 7 ) );				// = a: the argument tmp
+	CHECK( m.map( F, 4, 18 ) == L( 3, 7 ) );
+	CHECK( m.map( F, 4, 24 ) == L( 3, 12 ) );				// x
+	CHECK( m.map( F, 4, 27 ) == L( 3, 12 ) );
+	CHECK( m.map( F, 4, 31 ) == L( 3, 1 ) );				// = tmp: the body's
+	CHECK( m.inMacroBody( F, { 4, 31 } ) );
+
+	// Without the definition the argument is the only guess.
+	Files g = f;
+	g.text["/r/swap.h"] = "";
+	SourceMap n( prep, g.reader() );
+	CHECK( n.map( F, 3, 7 ) == tmp );
+	CHECK_FALSE( n.inMacroBody( F, { 3, 7 } ) );
 }
 
 TEST_CASE( "sourcemap: macro expansions" ) {
@@ -274,6 +381,15 @@ TEST_CASE( "sourcemap: lines split by markers" ) {
 	CHECK( m.mapRange( F, 3, 24, 3, 26 ) == Range{ L( 2, 25 ), L( 2, 27 ) } );
 	CHECK( m.map( F, 3, 1 ) == L( 2, 1 ) );										// if
 	CHECK( m.map( F, 4, 0 ) == L( 3, 0 ) );
+
+	// pline names the piece, so a column that several pieces have is exact.
+	CHECK( m.map( F, { 2, 2, 11 } ) == L( 1, 17 ) );							// ; on "));"
+	CHECK( m.map( F, { 2, 2, 7 } ) == L( 1, 1 ) );								// ) of "(0)", from assert's body
+	CHECK( m.map( F, { 2, 0, 5 } ) == L( 1, 1 ) );
+	CHECK( m.mapRange( F, { 2, 3, 3 }, { 2, 3, 11 } ) == Range{ L( 1, 9 ), L( 1, 18 ) } );	// across pieces
+	CHECK( m.mapRange( F, { 3, 7, 16 }, { 3, 9, 16 } ) == Range{ L( 2, 17 ), L( 2, 19 ) } );
+	CHECK( m.map( F, { 3, 7, 14 } ) == L( 2, 8 ) );								// ( from isdigit's body
+	CHECK( m.map( F, { 3, 21, 20 } ) == L( 2, 22 ) );
 }
 
 TEST_CASE( "sourcemap: lines too long for one alignment table" ) {
