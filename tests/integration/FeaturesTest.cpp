@@ -229,15 +229,22 @@ TEST_CASE( "rename within one file, and refusals" ) {
 	CHECK( o.c.shutdown() == 0 );
 }
 
-TEST_CASE( "rename refuses names used in macros and globals of a header" ) {
+TEST_CASE( "rename refuses names used in macros or where the dump has no ref, and globals of a header" ) {
 	if ( ! ready() ) return;
 	std::string text =
 		"int n = 3;\n"
 		"#define TWICE (n * 2)\n"
 		"#define SQ( n ) ((n) * (n))\n"
+		"enum { SIZE = 4 };\n"
 		"int main() {\n"
 		"\tint m = TWICE + SQ( 2 );\n"
-		"\treturn m + n;\n"
+		"\tint arr[SIZE];\n"
+		"\tint hidden = SIZE;\n"
+		"#if 0\n"
+		"\thidden += 1;\n"
+		"#endif\n"
+		"\tarr[0] = hidden;\n"
+		"\treturn m + n + arr[0];\n"
 		"}\n";
 	Opened o( projectDir() + "/scratch_rename.cfa", text );
 	json err = o.c.request( "textDocument/rename", renameParams( o.uri, o.pos( "n = 3" ), "count" ) )["error"];
@@ -246,6 +253,14 @@ TEST_CASE( "rename refuses names used in macros and globals of a header" ) {
 	// SQ's parameter n is not a use of the global, and m isn't in any macro.
 	json r = o.c.result( "textDocument/rename", renameParams( o.uri, o.pos( "m = TWICE" ), "k" ) );
 	CHECK( r["changes"][o.uri].size() == 2 );
+
+	// Spellings the translator has no ref for: dead code, an array dimension.
+	err = o.c.request( "textDocument/rename", renameParams( o.uri, o.pos( "hidden = SIZE" ), "shown" ) )["error"];
+	CHECK( err["code"] == -32803 );
+	CHECK( contains( err["message"], "line 10" ) );
+	err = o.c.request( "textDocument/prepareRename", at( o.uri, o.pos( "SIZE;" ) ) )["error"];
+	CHECK( err["code"] == -32803 );
+	CHECK( contains( err["message"], "line 7" ) );
 
 	// In a header, only local names.
 	std::string header = projectDir() + "/geometry.hfa";

@@ -75,7 +75,8 @@ class Analysis {
 	// The occurrences in `file` of the entity at `pos`, or why it can't be
 	// renamed: its declarations must all be in `file`, and in a header only
 	// local names qualify, since uses in the files that include it are not
-	// known. nullopt if nothing renameable is at `pos`.
+	// known; and every spelling of the name in `file` must be a ref or a
+	// declaration in the dump. nullopt if nothing renameable is at `pos`.
 	std::optional<RenamePlan> rename( const std::string & file, Loc pos ) const;
 	static bool isKeyword( std::string_view word );
 

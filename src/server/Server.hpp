@@ -150,6 +150,7 @@ class Server {
 	Encoding enc = Encoding::Utf16;
 	bool hierarchicalSymbols = false;
 	bool prepareRenameSupport = false;
+	bool inlayHintRefresh = false;			// the client takes workspace/inlayHint/refresh
 	std::string rootPath;
 	Options opts;
 	std::unique_ptr<Checker> checker;
@@ -169,6 +170,7 @@ class Server {
 	bool stopping = false;
 	std::thread worker;
 	std::map<std::string, Text> diskCache;	// cleared per request
+	int refreshRequests = 0;				// ids of the requests we send
 };
 
 } // namespace cfalsp
