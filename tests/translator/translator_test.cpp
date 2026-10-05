@@ -96,6 +96,7 @@ const Tools & tools() {
 struct Run {
 	std::string file;									// the fixture, absolute
 	std::vector<std::string> lines;						// its original text, 1-based via line()
+	std::vector<std::string> input;						// the preprocessed text the translator read
 	json dump;
 	int status = -1;
 	std::string c;										// generated C, with --lsp-c-out
@@ -145,6 +146,8 @@ const Run * run( const std::string & name, bool withC = false, bool stop = false
 
 	std::string pre = t.cfa + " -E " + quote( r.file ) + " > " + quote( ( work / "in.i" ).string() ) + " 2> " + quote( ( work / "cpp.err" ).string() );
 	REQUIRE_MESSAGE( std::system( pre.c_str() ) == 0, "cfa -E failed: " << readFile( work / "cpp.err" ) );
+	std::stringstream input( readFile( work / "in.i" ) );
+	for ( std::string l; std::getline( input, l ); ) r.input.push_back( l );
 
 	std::string cmd = quote( t.translator ) + " --prelude-dir=" + quote( t.prelude )
 		+ " --lsp " + quote( ( work / "out.json" ).string() ) + " --lsp-focus " + quote( r.file )
@@ -247,6 +250,16 @@ void checkInvariants( const Run & r ) {
 		CHECK( ref["file"] == r.file );
 		std::string role = ref["role"];
 		CHECK( std::set<std::string>{ "read", "call", "member", "type", "with" }.count( role ) );
+		// A ref is a token the translator read, so it has its line in the input, and its columns are on that line.
+		INFO( "ref " << ref.dump() );
+		REQUIRE( ref.contains( "pline" ) );
+		CHECK( ref["endPline"] == ref["pline"] );
+		int pline = ref["pline"];
+		REQUIRE( pline >= 1 );
+		REQUIRE( pline <= (int)r.input.size() );
+		const std::string & text = r.input[pline - 1];
+		CHECK( ( text.empty() || text[0] != '#' ) );
+		CHECK( ref["endCol"].get<int>() <= (int)text.size() );
 	}
 	for ( const json & d : decls ) {
 		for ( const char * link : { "parent", "typeDecl" } ) {
@@ -479,10 +492,21 @@ TEST_CASE( "translator: macros and irregular spacing (lines only)" ) {
 	CHECK( positive );
 	CHECK( declAt( *r, "spaced", 11 ) );
 	CHECK( declAt( *r, "tabbed", 12 ) );
-	// cpp splits line 8 around the expansion of bool; the name is in the second piece.
+	// cpp splits line 8 around the expansion of bool; the name is in the second piece, and pline says which.
 	const json * p = declAt( *r, "positive", 8 );
 	REQUIRE( p );
 	CHECK_FALSE( (*p)["generated"].get<bool>() );
+	const json & name = (*p)["nameRange"];
+	REQUIRE( name.contains( "pline" ) );
+	int pline = name["pline"];
+	REQUIRE( pline >= 1 );
+	REQUIRE( pline <= (int)r->input.size() );
+	CHECK( r->input[pline - 1].substr( name["col"].get<int>(), 8 ) == "positive" );
+	CHECK( name["endPline"] == pline );
+	// The whole declaration starts on the first piece, with bool.
+	REQUIRE( p->contains( "pline" ) );
+	CHECK( (*p)["pline"].get<int>() < pline );
+	CHECK( (*p)["endPline"].get<int>() >= pline );
 }
 
 TEST_CASE( "translator: syntax error" ) {
