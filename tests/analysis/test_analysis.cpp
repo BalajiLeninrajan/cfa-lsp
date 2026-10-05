@@ -851,4 +851,28 @@ TEST_CASE( "queries stay fast on large dumps" ) {
 	CHECK( ms( t3 - t2 ) < 2000 );
 }
 
+TEST_CASE( "similar names for an undeclared identifier" ) {
+	auto a = fixture::load( "shapes" );
+	Loc inBlock{ 35, 8 };								// sout | inner | ...
+	auto first = [&]( const std::string & name, Loc pos ) {
+		auto v = a->similarNames( cfa, pos, name );
+		return v.empty() ? std::string() : v[0];
+	};
+	CHECK( first( "innr", inBlock ) == "inner" );			// a dropped letter
+	CHECK( first( "Inner", inBlock ) == "inner" );
+	CHECK( first( "aera", inBlock ) == "area" );			// swapped letters
+	CHECK( first( "Wlaker", inBlock ) == "Walker" );
+	CHECK( first( "sotu", inBlock ) == "sout" );			// a library global
+	CHECK( a->similarNames( cfa, inBlock, "aera", 1 ).size() == 1 );
+	// One letter is not a typo of another, and far names don't count.
+	CHECK( a->similarNames( cfa, inBlock, "x" ).empty() );
+	CHECK( a->similarNames( cfa, inBlock, "zzzzzz" ).empty() );
+	// Reserved library names only when the typo has the underscores too.
+	CHECK( a->similarNames( cfa, inBlock, "cfa_flags" ).empty() );
+	CHECK( first( "__cfa_flag", inBlock ) == "__cfa_flags" );
+	// Locals of another function are out of scope.
+	auto inArea = a->similarNames( cfa, { 4, 4 }, "innr" );
+	CHECK( std::find( inArea.begin(), inArea.end(), "inner" ) == inArea.end() );
+}
+
 } // TEST_SUITE
