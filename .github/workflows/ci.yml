@@ -57,6 +57,9 @@ jobs:
             --disable-gprofiler CC=gcc-11 CXX=g++-11
           make -s -j"$(nproc)"
           make -s install
+          # An installed toolchain doesn't have its build tree; the prelude's line
+          # markers should point at files that don't exist, as they do for users.
+          cd / && rm -rf "$RUNNER_TEMP/cfa-src"
 
       # Saved right away, so a failing build or test later doesn't throw it away.
       - name: Save CFA toolchain

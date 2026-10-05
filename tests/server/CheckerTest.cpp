@@ -156,11 +156,13 @@ TEST_CASE( "real cfa and translator: declarations from the prelude's builtins po
 	req.backend = false;
 	FrontResult fr = ch.front( req, CancelToken() );
 	REQUIRE( fr.analysis );
-	// builtins.cfa names the files it was made from on the build machine; they don't exist here.
+	// builtins.cfa names the files it was made from on the build machine. Where
+	// they don't exist (an installed toolchain), definitions go to builtins.cfa;
+	// where they do (CFA built from source on this machine), to the real file.
 	auto def = fr.analysis->definition( main, { 2, 19 } );
 	REQUIRE( def.size() == 1 );
 	INFO( def[0].file );
-	CHECK( def[0].file.ends_with( "/builtins.cfa" ) );
+	CHECK( ( def[0].file.ends_with( "/builtins.cfa" ) || std::filesystem::exists( def[0].file ) ) );
 	std::ifstream in( def[0].file );
 	std::string line;
 	for ( int i = 0; i <= def[0].range.start.line && std::getline( in, line ); i += 1 ) {}
