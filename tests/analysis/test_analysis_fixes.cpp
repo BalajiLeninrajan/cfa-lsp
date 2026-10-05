@@ -373,6 +373,38 @@ TEST_CASE( "operators, postfix calls and the outline" ) {
 	CHECK_FALSE( outline.count( "Vec_vt" ) );
 }
 
+TEST_CASE( "subscript, call and constructor operators are refs at their opening bracket" ) {
+	std::map<std::string, std::string> src = {
+		{ "/b/main.cfa", "struct Vec { int x; };\n"
+						 "int ?[?]( Vec v, int i );\n"
+						 "int ?()( Vec v, int i );\n"
+						 "int n = v[2] + v( 3 );\n" },
+	};
+	Dump d;
+	const std::string f = "/b/main.cfa";
+	d.decl( "Vec", "struct", f, 1, 7 );
+	int index = d.decl( "?[?]", "function", f, 2, 4, { { "signature", "int ?[?]( Vec v, int i )" } } );
+	int call = d.decl( "?()", "function", f, 3, 4, { { "signature", "int ?()( Vec v, int i )" } } );
+	d.ref( f, 4, 9, 1, index, "call" );
+	d.ref( f, 4, 16, 1, call, "call" );
+	auto a = d.load( src );
+	auto h = a->hover( f, { 3, 9 } );
+	REQUIRE( h );
+	CHECK( contains( h->markdown, "int ?[?]( Vec v, int i )" ) );
+	CHECK( h->range == Range{ { 3, 9 }, { 3, 10 } } );
+	h = a->hover( f, { 3, 16 } );
+	REQUIRE( h );
+	CHECK( contains( h->markdown, "int ?()( Vec v, int i )" ) );
+	auto refs = a->references( f, { 1, 5 }, false );
+	REQUIRE( refs.size() == 1 );
+	CHECK( refs[0].range.start == Loc{ 3, 9 } );
+	// A bracket is not coloured as a function.
+	for ( const auto & t : a->semanticTokens( f ) ) {
+		CHECK_FALSE( t.start == Loc{ 3, 9 } );
+		CHECK_FALSE( t.start == Loc{ 3, 16 } );
+	}
+}
+
 TEST_CASE( "a field of a generic aggregate shows its type in the instance" ) {
 	std::map<std::string, std::string> src = {
 		{ "/g/main.cfa", "forall( T ) struct Pair { T first; };\nint z = pi.first;\n" },

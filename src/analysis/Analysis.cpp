@@ -576,9 +576,13 @@ static std::optional<Range> spelledName( const FileText & ft, Range r, const std
 }
 
 // How a use of a declaration can be spelled besides its name: a postfix
-// function ?`len is called as x`len, and an operator ?+? is written +.
+// function ?`len is called as x`len, an operator ?+? is written +, and
+// ?[?], ?() and ?{} are refs at their opening bracket (a[i], f( x ), p{ 1 }).
 static std::string otherSpelling( const std::string & name ) {
 	if ( name.starts_with( "?`" ) ) return name.substr( 2 );
+	if ( name == "?[?]" ) return "[";
+	if ( name == "?()" ) return "(";
+	if ( name == "?{}" ) return "{";
 	if ( name.size() < 2 || name.find( '?' ) == std::string::npos ) return {};
 	std::string symbol;
 	for ( char c : name ) if ( c != '?' ) symbol += c;
