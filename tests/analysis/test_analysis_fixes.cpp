@@ -300,6 +300,59 @@ TEST_CASE( "member completion: declarations typed since the snapshot, (*p) and p
 	CHECK( complete( "wheel." ) == S{ "centre", "radius" } );
 }
 
+TEST_CASE( "hover and definition on declarations typed since the snapshot" ) {
+	const std::string f = "/p/main.cfa";
+	std::map<std::string, std::string> src = { { f, "struct Rect { int w, h; };\nint main() {\n}\n" } };
+	Dump d;
+	int rect = d.decl( "Rect", "struct", f, 1, 7 );
+	d.decl( "w", "field", f, 1, 17, { { "parent", rect }, { "type", "int" } } );
+	d.decl( "main", "function", f, 2, 4, { { "body", Dump::range( 2, 11, 3, 1 ) } } );
+	auto a = d.load( src );
+	// The buffer now, with lines the snapshot has never seen.
+	std::string text =
+		"struct Rect { int w, h; };\n"						// 0
+		"int main() {\n"									// 1
+		"\tconst Rect * r2 = 0;\n"							// 2
+		"\tunsigned long n;\n"								// 3
+		"\t// Rect fake;\n"									// 4
+		"\tr2->w = n;\n"									// 5
+		"\treturn r2\n"										// 6
+		"\tlater = 1; Rect later;\n"						// 7
+		"\tunknown thing;\n"								// 8
+		"\tthing;\n"										// 9
+		"}\n";
+	auto at = [&]( const std::string & needle, int nth = 0 ) {
+		size_t k = text.find( needle );
+		while ( nth-- > 0 ) k = text.find( needle, k + 1 );
+		REQUIRE( k != std::string::npos );
+		return k;
+	};
+
+	auto h = a->hoverInText( text, at( "r2->" ) + 1 );
+	REQUIRE( h );
+	CHECK( contains( h->markdown, "const Rect * r2" ) );
+	CHECK( contains( h->markdown, "line 3" ) );
+	CHECK( h->range == Range{ { 5, 1 }, { 5, 3 } } );
+	auto r = a->declarationInText( text, at( "r2->" ) );
+	REQUIRE( r );
+	CHECK( *r == Range{ { 2, 14 }, { 2, 16 } } );
+	// On the declaration itself, and at the end of the name.
+	CHECK( a->declarationInText( text, at( "r2 =" ) + 2 ) == r );
+	CHECK( a->declarationInText( text, at( "return r2" ) + 9 ) == r );
+
+	h = a->hoverInText( text, at( "n;" ) );
+	REQUIRE( h );
+	CHECK( contains( h->markdown, "unsigned long n" ) );
+
+	// Not in a comment, only declarations before the name, and only types the analysis knows.
+	CHECK_FALSE( a->hoverInText( text, at( "fake" ) ) );
+	CHECK_FALSE( a->declarationInText( text, at( "later" ) ) );
+	CHECK( a->declarationInText( text, at( "later", 1 ) ) == Range{ { 7, 17 }, { 7, 22 } } );
+	CHECK_FALSE( a->declarationInText( text, at( "thing;", 1 ) ) );
+	CHECK_FALSE( a->hoverInText( text, at( "return" ) ) );
+	CHECK_FALSE( a->hoverInText( text, at( "\n}" ) + 1 ) );
+}
+
 TEST_CASE( "completion and signature help: macros, and no libcfa internal overloads" ) {
 	std::map<std::string, std::string> src = {
 		{ "/s/main.cfa", "#define SQUARE( x ) ((x) * (x))\n"

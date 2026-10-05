@@ -467,6 +467,15 @@ TEST_CASE( "answers for text typed since the last check" ) {
 	// A local declared since the check, and a dereferenced pointer.
 	insert( "a1 >\tsout", 4, " 0 ) {}\n\tCircle & cr = wheel;\n\tcr." );
 	CHECK( labels( c.result( "textDocument/completion", at( uri, posOf( text, "cr.\tsout", 3 ) ) ) ) == std::set<std::string>{ "centre", "radius" } );
+	// Hover and definition find that declaration in the text too.
+	std::string h = hoverText( c.result( "textDocument/hover", at( uri, posOf( text, "cr.\tsout" ) ) ) );
+	CHECK( contains( h, "Circle & cr" ) );
+	CHECK( contains( h, "from the text" ) );
+	json def = c.result( "textDocument/definition", at( uri, posOf( text, "cr.\tsout", 1 ) ) );
+	REQUIRE( def.size() == 1 );
+	CHECK( def[0]["uri"] == uri );
+	CHECK( def[0]["range"]["start"] == posOf( text, "cr = wheel" ) );
+	CHECK( def[0]["range"]["end"] == posOf( text, "cr = wheel", 2 ) );
 	insert( "cr.\tsout", 3, "centre;\n\t(*pbox)." );
 	CHECK( labels( c.result( "textDocument/completion", at( uri, posOf( text, "(*pbox).\tsout", 8 ) ) ) ) == std::set<std::string>{ "lo", "hi" } );
 

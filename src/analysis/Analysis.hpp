@@ -48,6 +48,13 @@ class Analysis {
 	// The declaration with a body of that entity, if this analysis has one.
 	std::optional<Location> definitionOf( const std::vector<Location> & declarations ) const;
 
+	// For a name the snapshot doesn't have (declared since it was taken, or in code that did not parse): the
+	// declaration that scanning `text`, the current buffer, finds for the name at byte offset `offset`. Only a
+	// declaration whose type is a type this analysis knows counts. Ranges are positions in `text`. The type is
+	// shown as written; overloads and resolved types need a check.
+	std::optional<HoverResult> hoverInText( const std::string & text, size_t offset ) const;
+	std::optional<Range> declarationInText( const std::string & text, size_t offset ) const;
+
 	// `lineBefore` is the CURRENT buffer text of the cursor's line up to the
 	// cursor; it may contain code the snapshot has never seen (e.g. "x." or
 	// "pu"). `pos` is the cursor mapped into snapshot coordinates (clamped to

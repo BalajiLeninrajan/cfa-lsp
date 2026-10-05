@@ -720,14 +720,19 @@ nlohmann::json Server::hover( const json & params ) {
 	Loc cur = d->text.fromLsp( intOr( member( p, "line" ), 0 ), intOr( member( p, "character" ), 0 ), enc );
 	EditList edits = d->editsSince( d->analysisSeq );
 	MappedLoc m = toSnapshot( edits, cur );
-	if ( ! m.exact || ! sameIdentifier( *d, cur, edits ) ) return nullptr;
-	auto h = d->analysis->hover( d->path, m.loc );
-	if ( ! h ) return nullptr;
-	json out = { { "contents", { { "kind", "markdown" }, { "value", h->markdown } } } };
-	if ( auto r = toCurrentExact( edits, h->range ) ) {
-		if ( r->start != r->end ) out["range"] = lspRange( d->text, *r );
+	if ( m.exact && sameIdentifier( *d, cur, edits ) ) {
+		if ( auto h = d->analysis->hover( d->path, m.loc ) ) {
+			json out = { { "contents", { { "kind", "markdown" }, { "value", h->markdown } } } };
+			if ( auto r = toCurrentExact( edits, h->range ) ) {
+				if ( r->start != r->end ) out["range"] = lspRange( d->text, *r );
+			}
+			return out;
+		}
 	}
-	return out;
+	// A name the snapshot doesn't have: declared since, or in code that didn't parse.
+	auto h = d->analysis->hoverInText( d->text.str(), d->text.offset( cur ) );
+	if ( ! h ) return nullptr;
+	return { { "contents", { { "kind", "markdown" }, { "value", h->markdown } } }, { "range", lspRange( d->text, h->range ) } };
 }
 
 nlohmann::json Server::definition( const json & params ) {
@@ -737,20 +742,26 @@ nlohmann::json Server::definition( const json & params ) {
 	Loc cur = d->text.fromLsp( intOr( member( p, "line" ), 0 ), intOr( member( p, "character" ), 0 ), enc );
 	EditList edits = d->editsSince( d->analysisSeq );
 	MappedLoc m = toSnapshot( edits, cur );
-	if ( ! m.exact || ! sameIdentifier( *d, cur, edits ) ) return json::array();
 	json out = json::array();
-	// A prototype whose body is in another open document (a header and its .cfa): go to the body.
-	std::vector<Location> decls = d->analysis->declarationsAt( d->path, m.loc );
-	if ( ! decls.empty() && ! d->analysis->definitionOf( decls ) ) {
-		for ( auto & [path, other] : docs ) {
-			if ( &other == d || ! other.analysis ) continue;
-			if ( auto def = other.analysis->definitionOf( decls ) ) {
-				if ( auto j = lspLocation( other, *def, true ) ) return json::array( { *j } );
+	if ( m.exact && sameIdentifier( *d, cur, edits ) ) {
+		// A prototype whose body is in another open document (a header and its .cfa): go to the body.
+		std::vector<Location> decls = d->analysis->declarationsAt( d->path, m.loc );
+		if ( ! decls.empty() && ! d->analysis->definitionOf( decls ) ) {
+			for ( auto & [path, other] : docs ) {
+				if ( &other == d || ! other.analysis ) continue;
+				if ( auto def = other.analysis->definitionOf( decls ) ) {
+					if ( auto j = lspLocation( other, *def, true ) ) return json::array( { *j } );
+				}
 			}
 		}
+		for ( const Location & l : d->analysis->definition( d->path, m.loc ) ) {
+			if ( auto j = lspLocation( *d, l, true ) ) out.push_back( *j );
+		}
+		if ( ! out.empty() ) return out;
 	}
-	for ( const Location & l : d->analysis->definition( d->path, m.loc ) ) {
-		if ( auto j = lspLocation( *d, l, true ) ) out.push_back( *j );
+	// A name the snapshot doesn't have: declared since, or in code that didn't parse.
+	if ( auto r = d->analysis->declarationInText( d->text.str(), d->text.offset( cur ) ) ) {
+		out.push_back( json{ { "uri", d->uri }, { "range", lspRange( d->text, *r ) } } );
 	}
 	return out;
 }
