@@ -2276,6 +2276,90 @@ std::vector<CompletionItem> Analysis::completion( const std::string & file, Loc 
 	return out;
 }
 
+// Optimal string alignment distance (Levenshtein plus swaps of neighbouring
+// characters), or limit + 1 once it is known to exceed `limit`.
+static int editDistance( std::string_view a, std::string_view b, int limit ) {
+	int na = int( a.size() ), nb = int( b.size() );
+	if ( std::abs( na - nb ) > limit ) return limit + 1;
+	std::vector<int> prev2( nb + 1 ), prev( nb + 1 ), cur( nb + 1 );
+	for ( int j = 0; j <= nb; j += 1 ) prev[j] = j;
+	for ( int i = 1; i <= na; i += 1 ) {
+		cur[0] = i;
+		int best = cur[0];
+		for ( int j = 1; j <= nb; j += 1 ) {
+			int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+			cur[j] = std::min( { prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost } );
+			if ( i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] ) cur[j] = std::min( cur[j], prev2[j - 2] + 1 );
+			best = std::min( best, cur[j] );
+		}
+		if ( best > limit ) return limit + 1;
+		std::swap( prev2, prev );
+		std::swap( prev, cur );
+	}
+	return std::min( prev[nb], limit + 1 );
+}
+
+std::vector<std::string> Analysis::similarNames( const std::string & file, Loc pos, const std::string & name, size_t max ) const {
+	const Impl & m = *impl;
+	if ( !text::isIdentifier( name ) ) return {};
+	// About one edit in three characters, and never all of either name: x is not a typo of y.
+	const int limit = std::max( 1, ( int( name.size() ) + 2 ) / 3 );
+	struct Cand { int dist, rank; std::string name; };
+	std::vector<Cand> cands;
+	std::unordered_set<std::string> seen;
+	auto distance = [&]( const std::string & n ) {
+		if ( n == name || !text::isIdentifier( n ) ) return limit + 1;
+		int d = editDistance( name, n, limit );
+		return d >= int( name.size() ) || d >= int( n.size() ) ? limit + 1 : d;
+	};
+	auto consider = [&]( const std::string & n, int rank ) {
+		if ( seen.count( n ) ) return;
+		int d = distance( n );
+		if ( d > limit ) return;
+		seen.insert( n );
+		cands.push_back( { d, rank, n } );
+	};
+	auto rankOf = []( Origin o ) { return o == Origin::Focus ? 2 : o == Origin::Project ? 3 : 4; };
+	bool wantUnderscore = name[0] == '_';
+
+	int fi = m.findFile( file );
+	if ( fi >= 0 ) {
+		for ( int d : m.localsAt( fi, pos ) ) {
+			if ( !m.decls[d].generated ) consider( m.decls[d].name, 0 );
+		}
+		for ( int agg : m.withAggregates( fi, pos ) ) {
+			for ( int f : m.fieldsOf( agg ) ) consider( m.decls[f].name, 1 );
+		}
+	}
+	for ( const NameEntry & e : m.globals ) {
+		Origin o = m.origin( e.decls.front() );
+		if ( isLibrary( o ) && ( ( e.name[0] == '_' && !wantUnderscore ) || internalName( e.name, name ) ) ) continue;
+		consider( e.name, rankOf( o ) );
+	}
+	if ( fi >= 0 ) {
+		m.loadMacros();
+		for ( const auto & [n, list] : m.macros ) {
+			if ( seen.count( n ) || distance( n ) > limit ) continue;
+			const Impl::Macro * mac = m.macroNamed( n, fi, pos );
+			if ( !mac ) continue;
+			Origin o = m.files[mac->file].origin;
+			if ( isLibrary( o ) && n[0] == '_' && !wantUnderscore ) continue;
+			consider( n, rankOf( o ) );
+		}
+	}
+	std::sort( cands.begin(), cands.end(), []( const Cand & a, const Cand & b ) {
+		if ( a.dist != b.dist ) return a.dist < b.dist;
+		if ( a.rank != b.rank ) return a.rank < b.rank;
+		return a.name < b.name;
+	} );
+	std::vector<std::string> out;
+	for ( const Cand & c : cands ) {
+		if ( out.size() == max ) break;
+		out.push_back( c.name );
+	}
+	return out;
+}
+
 std::optional<SignatureHelp> Analysis::signatureHelp( const std::string & file, Loc pos, const std::string & textBefore ) const {
 	const Impl & m = *impl;
 	auto call = text::callBefore( textBefore );

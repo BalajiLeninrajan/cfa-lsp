@@ -91,6 +91,13 @@ class Analysis {
 	// libcfa, the prelude or system headers). For workspace symbols.
 	std::vector<std::string> projectFiles() const;
 
+	// Names visible at `pos` that are a small edit away from `name` (a typo:
+	// letters added, dropped, changed or swapped), closest first, then locals
+	// before globals and project names before library ones. For the "did you
+	// mean" fix on an undeclared identifier.
+	std::vector<std::string> similarNames( const std::string & file, Loc pos, const std::string & name,
+										   size_t max = 3 ) const;
+
 	std::vector<SemanticToken> semanticTokens( const std::string & file ) const;
 	static const std::vector<std::string> & tokenTypes();		// LSP legend
 	static const std::vector<std::string> & tokenModifiers();	// LSP legend
