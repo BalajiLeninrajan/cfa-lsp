@@ -554,9 +554,21 @@ void Server::didChange( const json & params ) {
 			d->log.push_back( { d->seq, makeEdit( s, e, ins ) } );
 		}
 	}
-	// The check in flight keeps running. Cancelling it here would starve
-	// diagnostics while someone types with pauses shorter than the debounce
-	// plus the check time; its results are mapped through these edits.
+	// The check in flight keeps running and its results are mapped through
+	// these edits. Cancelling it would starve diagnostics while someone types
+	// with pauses shorter than the debounce plus the check time. A check that
+	// has run more than twice as long as the last one is probably stuck on
+	// text this edit may have fixed, such as an expression the resolver takes
+	// minutes on, so that one is cancelled. Raising lastCheck to the time it
+	// ran means a check that got slower for good still finishes after a few
+	// edits.
+	if ( inflight && inflight->path == d->path && ! inflight->token->cancelled() && d->lastCheck > Clock::duration::zero() ) {
+		Clock::duration ran = Clock::now() - inflight->started;
+		if ( ran > 2 * d->lastCheck ) {
+			inflight->token->cancel();
+			d->lastCheck = ran;
+		}
+	}
 	schedule( d->path, opts.debounceMs );
 	trimLog( *d );
 }
@@ -1195,7 +1207,7 @@ void Server::workerLoop() {
 		uint64_t seq = dit->second.seq;
 		std::shared_ptr<const Checker> chk = checker;
 		auto token = std::make_shared<CancelToken>();
-		inflight = InFlight{ path, seq, token };
+		inflight = InFlight{ path, seq, token, Clock::now() };
 		lk.unlock();
 
 		log::info( "checking ", path );
@@ -1276,8 +1288,12 @@ void Server::workerLoop() {
 		}
 		fr = FrontResult();					// removes the temp dir
 		lk.lock();
+		Clock::duration took = Clock::now() - inflight->started;
 		inflight.reset();
-		if ( auto it = docs.find( path ); it != docs.end() ) trimLog( it->second );
+		if ( auto it = docs.find( path ); it != docs.end() ) {
+			if ( ! token->cancelled() ) it->second.lastCheck = took;
+			trimLog( it->second );
+		}
 	}
 }
 
