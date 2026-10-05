@@ -194,6 +194,12 @@ condition with the macros defined so far, and counts as kept when the
 condition depends on something the source doesn't show, such as a compiler
 macro or a `-D` flag.
 
+An edit does not cancel the check in flight. It finishes and publishes its
+diagnostics, mapped through the edits made since it started, and the next
+check starts after it. Otherwise, while you type with pauses a little longer
+than `debounceMs`, every check would be cancelled before it finished and the
+diagnostics would never update. Closing the file does cancel its check.
+
 ### Columns
 
 `cfa -E` collapses whitespace between tokens and expands macros, so the

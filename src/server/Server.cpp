@@ -554,7 +554,9 @@ void Server::didChange( const json & params ) {
 			d->log.push_back( { d->seq, makeEdit( s, e, ins ) } );
 		}
 	}
-	if ( inflight && inflight->path == d->path ) inflight->token->cancel();
+	// The check in flight keeps running. Cancelling it here would starve
+	// diagnostics while someone types with pauses shorter than the debounce
+	// plus the check time; its results are mapped through these edits.
 	schedule( d->path, opts.debounceMs );
 	trimLog( *d );
 }
@@ -582,12 +584,10 @@ void Server::didSave( const json & params ) {
 	if ( ! d ) return;
 	d->diskSeq = d->seq;
 	// Skip if the check in flight already covers this text. Otherwise save
-	// always re-checks: headers on disk may have changed.
+	// always re-checks (after the check in flight): headers on disk may have
+	// changed.
 	bool covered = inflight && inflight->path == d->path && inflight->seq == d->seq;
-	if ( ! covered ) {
-		if ( inflight && inflight->path == d->path ) inflight->token->cancel();
-		schedule( d->path, 0 );
-	}
+	if ( ! covered ) schedule( d->path, 0 );
 	if ( isHeader( d->path ) ) {
 		for ( auto & [p, other] : docs ) {
 			if ( p != d->path ) schedule( p, opts.debounceMs );

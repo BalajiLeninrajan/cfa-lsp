@@ -26,7 +26,9 @@ namespace cfalsp {
 
 // The language server: reads JSON-RPC from one fd, writes to another.
 // Requests are answered on the calling thread from the last good analysis;
-// one worker thread runs checks and publishes diagnostics.
+// one worker thread runs checks and publishes diagnostics. An edit does not
+// cancel the check in flight: it finishes and publishes, mapped through the
+// edits made since, and the next check starts after it.
 class Server {
   public:
 	Server( int inFd, int outFd, std::string exeDir );
