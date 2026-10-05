@@ -1,0 +1,44 @@
+// Array parameters and dimensions, labels, assertions, bracket operators and split lines.
+enum Size { N = 4 };
+const int M = 3;
+int table[N];
+struct Vec { int x, y; int cells[M]; };
+int ?[?]( Vec v, int i ) { return v.x + i; }
+struct Fn { int base; };
+int ?()( Fn f, int x ) { return f.base + x; }
+struct Pt { int x, y; };
+void ?{}( Pt & p, int a, int b, int c ) { p.x = a + b; p.y = c; }
+int sum( int n, int a[], int b[N] ) { return n + a[0] + b[1]; }
+forall( T | { int ?<?( T, T ); } ) T smaller( T a, T b ) { return a < b ? a : b; }
+trait Shape( S ) { int area( S ); };
+forall( S | Shape( S ) ) int twice( S s ) { return area( s ) * 2; }
+int main() {
+int local[M];
+Vec v;
+Fn f;
+Pt q = { 1, 2, 3 };
+q{ 4, 5, 6 };
+int i = v[2] + f( 3 );
+for ( k; 3 ) {
+if ( k == 1 ) goto done;
+}
+outer: for ( j; 2 ) {
+for ( l; 2 ) { if ( l ) break outer; }
+}
+done: i = i
++ 1;
+with ( q ) { i += x; }
+i += q.
+
+
+
+
+
+
+
+
+
+
+y;
+return i + local[0] + table[0] + sum( 1, local, local );
+}

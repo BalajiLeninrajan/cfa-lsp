@@ -1,0 +1,9 @@
+// Code inside corun moves into a nested function the translator makes.
+#include <cofor.hfa>
+void bump( long * total, long v ) { *total += v; }
+int main() {
+long total = 0;
+corun { long step = 2; bump( &total, step ); }
+corun bump( &total, 3 );
+return total > 0 ? 0 : 1;
+}
