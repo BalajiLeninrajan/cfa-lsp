@@ -433,6 +433,7 @@ void Server::applyOptions( const json & io ) {
 	o.debounceMs = std::max( 0, intOr( member( io, "debounceMs" ), 500 ) );
 	o.timeoutMs = std::max( 1, intOr( member( io, "timeoutMs" ), 120000 ) );
 	if ( member( io, "backend" ).is_boolean() ) o.backend = member( io, "backend" ).get<bool>();
+	if ( member( io, "stopAfterResolve" ).is_boolean() ) o.stopAfterResolve = member( io, "stopAfterResolve" ).get<bool>();
 	const json & fl = member( io, "flags" );
 	if ( fl.is_array() ) {
 		std::vector<std::string> v;
@@ -477,7 +478,7 @@ void Server::applySettings( const json & s ) {
 	// Our settings override initializationOptions key by key; null removes
 	// one. Other keys are someone else's.
 	json eff = initOptions;
-	for ( const char * k : { "cfa", "translator", "preludeDir", "flags", "backend", "cc", "debounceMs", "timeoutMs" } ) {
+	for ( const char * k : { "cfa", "translator", "preludeDir", "flags", "backend", "stopAfterResolve", "cc", "debounceMs", "timeoutMs" } ) {
 		auto it = settings.find( k );
 		if ( it == settings.end() ) continue;
 		if ( it->is_null() ) eff.erase( k );
@@ -1115,6 +1116,7 @@ CheckRequest Server::makeRequest( const Document & doc ) const {
 	req.path = doc.path;
 	req.text = doc.text.str();
 	req.backend = opts.backend;
+	req.stopAfterResolve = opts.stopAfterResolve;
 	req.timeout = std::chrono::milliseconds( opts.timeoutMs );
 	std::string dir = fs::path( doc.path ).parent_path().string();
 	if ( opts.flags ) {
@@ -1223,9 +1225,11 @@ void Server::workerLoop() {
 		}
 		// The last backend warnings stay until the backend runs again, which
 		// it can't while the translator reports errors that stop it before
-		// code generation.
+		// code generation. With stopAfterResolve it never runs, so nothing
+		// is carried.
 		bool runBack = fr.backendReady && req.backend;
-		bool carry = req.backend && fr.status != FrontResult::Fallback && fr.status != FrontResult::NoCfa;
+		bool carry = req.backend && ! req.stopAfterResolve && fr.status != FrontResult::Fallback &&
+					 fr.status != FrontResult::NoCfa;
 		std::vector<Diag> diags = fr.diags;
 		if ( carry ) {
 			rebaseBackend( doc, seq );

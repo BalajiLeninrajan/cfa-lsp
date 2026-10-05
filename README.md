@@ -120,6 +120,7 @@ All optional.
 | `flags` | from `cfa_flags.txt` | Flags as an array, or a string in `cfa_flags.txt` format. Overrides the file. |
 | `backend` | `true` | Run gcc `-fsyntax-only` on the generated C for gcc's warnings. |
 | `cc` | `gcc` | The C compiler for the backend check. |
+| `stopAfterResolve` | `false` | Stop the translator after `Resolve`. Checks take 40 to 45% less time, but you lose the warnings and errors of the later passes and gcc's warnings (see below). |
 | `debounceMs` | `500` | Wait after the last edit before checking. |
 | `timeoutMs` | `120000` | Limit for each child process. |
 
@@ -134,6 +135,14 @@ change re-checks every open file. In Neovim:
 ```lua
 vim.lsp.config( 'cfa_lsp', { settings = { ['cfa-lsp'] = { backend = false } } } )
 ```
+
+With `stopAfterResolve`, the translator skips `Fix Init` and the passes after
+it. Their checks are the ones you lose: the self-assignment warning, jumps
+past an initialization, fields used before they are constructed or never
+constructed, `waitfor` without `monitor.hfa`, a second `main`, bad virtual
+casts, the rvalue to reference conversion warning and unbound type variables
+in `Box`. No C is generated, so `backend` has no effect.
+`docs/dump-format.md` has the details.
 
 ### Logging
 
@@ -205,6 +214,7 @@ the wrong spot in a few cases:
 - A check takes as long as compiling the file: about 3 seconds for a small
   program that includes `fstream.hfa`, 5 seconds with `string.hfa`. Almost
   all of it is the translator, and half of that is the resolver.
+  `stopAfterResolve` cuts 40 to 45% of it.
 - Each file is checked on its own. Open headers are checked as if they were
   the main file. Saving a header re-checks the open files; nothing else
   tracks dependencies between files.
