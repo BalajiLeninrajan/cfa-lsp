@@ -13,12 +13,14 @@
 # The submodule also tracks the bison and flex output (parser.cc, parser.hh,
 # lex.cc). git gives every file it checks out the current time, so on a fresh
 # clone parser.yy can be newer than parser.cc. When make finds an output older
-# than its grammar, the grammar and the output are compared with the
-# submodule's commit. If none of them differ, the output is up to date and is
-# only touched. Otherwise it is regenerated in the source tree through
-# automake's ylwrap, the way the cforall build does it. So bison and flex are
-# needed only after an edit to parser.yy or lex.ll (or outside a git
-# checkout).
+# than its grammar, it asks git whether the output is current: the grammar and
+# the output must match the submodule's commit, and the last commit that
+# changed the grammar must also be (or precede) the last one that changed the
+# output. The second test catches a grammar edit committed before the output
+# was regenerated. If both pass, the output is only touched. Otherwise it is
+# regenerated in the source tree through automake's ylwrap, the way the
+# cforall build does it. So bison and flex are needed only after an edit to
+# parser.yy or lex.ll (or outside a git checkout).
 #
 # configure is given YACC and LEX so that it doesn't look for bison and flex,
 # and the cforall build never runs them. (configure gives up on flex when
@@ -47,10 +49,12 @@ LEX_CMD := $(SHELL) ../automake/ylwrap Parser/lex.ll lex.yy.c Parser/lex.cc -- f
 
 # $(call regen,GRAMMAR OUTPUTS,COMMAND): recipe for bison or flex output that
 # make found older than its grammar (paths relative to cforall/src). git
-# fails outside a checkout, which counts as a difference.
+# fails outside a checkout, which counts as stale output.
 regen = $(TRANSLATOR_LOCK) sh -c '\
   set -e; cd $(CFORALL_SRC)/src; \
-  if git diff --quiet HEAD -- $(1) 2>/dev/null; then \
+  if git diff --quiet HEAD -- $(1) 2>/dev/null && \
+     git merge-base --is-ancestor $$(git rev-list -1 HEAD -- $(firstword $(1))) \
+       $$(git rev-list -1 HEAD -- $(wordlist 2,$(words $(1)),$(1))) 2>/dev/null; then \
     touch $(wordlist 2,$(words $(1)),$(1)); \
   else \
     echo "regenerating $(wordlist 2,$(words $(1)),$(1))"; \
