@@ -1,11 +1,14 @@
 #include "Server.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <climits>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <set>
 #include <sstream>
+#include <tuple>
 
 #include "Flags.hpp"
 #include "Log.hpp"
@@ -25,6 +28,8 @@ enum ErrorCode {
 	InvalidParams = -32602,
 	InternalError = -32603,
 	ServerNotInitialized = -32002,
+	RequestFailed = -32803,
+	RequestCancelled = -32800,
 };
 
 struct LspError {
@@ -57,6 +62,20 @@ const nlohmann::json & member( const nlohmann::json & j, const char * key ) {
 
 int intOr( const nlohmann::json & j, int dflt ) { return j.is_number_integer() ? j.get<int>() : dflt; }
 
+std::string methodOf( const nlohmann::json & msg ) {
+	const nlohmann::json & m = member( msg, "method" );
+	return m.is_string() ? m.get<std::string>() : std::string();
+}
+
+// Adds the diagnostics in `more` that `into` doesn't have on the same line.
+void mergeDiags( std::vector<Diag> & into, const std::vector<Diag> & more ) {
+	std::set<std::tuple<std::string, int, std::string>> seen;
+	for ( const auto & d : into ) seen.insert( { d.file, d.range.start.line, d.message } );
+	for ( const auto & d : more ) {
+		if ( seen.insert( { d.file, d.range.start.line, d.message } ).second ) into.push_back( d );
+	}
+}
+
 // A full-text change as a few small edits, so the snapshot mapping stays
 // useful for clients that only send whole buffers: one edit per changed run
 // of lines, last first, so each edit's positions are in the text before it.
@@ -68,6 +87,15 @@ bool wholeName( const Text & text, Range r ) {
 	bool left = r.start.col == 0 || ! text::isIdentChar( line[r.start.col - 1] );
 	bool right = r.end.col >= (int)line.size() || ! text::isIdentChar( line[r.end.col] );
 	return left && right;
+}
+
+// Does `name` have the characters of `query` in order, ignoring case?
+bool fuzzyMatch( std::string_view name, std::string_view query ) {
+	size_t k = 0;
+	for ( char c : name ) {
+		if ( k < query.size() && std::tolower( (unsigned char)c ) == std::tolower( (unsigned char)query[k] ) ) k += 1;
+	}
+	return k == query.size();
 }
 
 std::vector<std::pair<Range, std::string>> diffEdits( const Text & oldText, const std::string & newText ) {
@@ -144,28 +172,78 @@ EditList Server::Document::editsSince( uint64_t s ) const {
 	return out;
 }
 
+EditList Server::Document::editsBetween( uint64_t from, uint64_t to ) const {
+	EditList out;
+	for ( const auto & [seq, e] : log ) {
+		if ( seq > from && seq <= to ) out.push_back( e );
+	}
+	return out;
+}
+
+Server::Incoming Server::parse( const std::string & body ) {
+	Incoming in;
+	try {
+		in.msg = json::parse( body );
+	} catch ( const std::exception & e ) {
+		in.error = e.what();
+	}
+	return in;
+}
+
 int Server::run() {
 	for ( ;; ) {
-		auto body = reader.read();
-		if ( ! body ) {
-			log::info( "end of input" );
-			stopWorker();
-			return phase == Phase::ShuttingDown ? 0 : 1;
+		if ( inbox.empty() ) {
+			auto body = reader.read();
+			if ( ! body ) {
+				log::info( "end of input" );
+				stopWorker();
+				return phase == Phase::ShuttingDown ? 0 : 1;
+			}
+			inbox.push_back( parse( *body ) );
 		}
-		json msg;
-		try {
-			msg = json::parse( *body );
-		} catch ( const std::exception & e ) {
+		Incoming in = std::move( inbox.front() );
+		inbox.pop_front();
+		if ( ! in.error.empty() ) {
 			send( { { "jsonrpc", "2.0" }, { "id", nullptr },
-					{ "error", { { "code", ParseError }, { "message", e.what() } } } } );
+					{ "error", { { "code", ParseError }, { "message", in.error } } } } );
 			continue;
 		}
-		if ( msg.is_object() && msg.value( "method", "" ) == "exit" ) {
+		const json & msg = in.msg;
+		if ( methodOf( msg ) == "exit" ) {
 			log::info( "exit" );
 			stopWorker();
 			return phase == Phase::ShuttingDown ? 0 : 1;
 		}
+		// Requests are answered in order, so a request can wait behind a slow
+		// one. Its cancel may have arrived meanwhile.
+		if ( msg.is_object() && msg.contains( "id" ) && msg.contains( "method" ) ) {
+			readAhead( msg["id"] );
+			auto c = cancelled.find( msg["id"].dump() );
+			if ( c != cancelled.end() ) {
+				cancelled.erase( c );
+				send( { { "jsonrpc", "2.0" }, { "id", msg["id"] },
+						{ "error", { { "code", RequestCancelled }, { "message", "request cancelled" } } } } );
+				continue;
+			}
+		}
 		handle( msg );
+	}
+}
+
+void Server::readAhead( const json & current ) {
+	while ( auto body = reader.tryRead() ) {
+		Incoming in = parse( *body );
+		if ( in.error.empty() && methodOf( in.msg ) == "$/cancelRequest" ) {
+			const json & id = member( member( in.msg, "params" ), "id" );
+			bool known = id == current;
+			for ( const Incoming & q : inbox ) {
+				known = known || ( q.msg.is_object() && q.msg.contains( "method" ) && member( q.msg, "id" ) == id );
+			}
+			// A cancel for a request already answered needs nothing.
+			if ( known && ! id.is_null() ) cancelled.insert( id.dump() );
+			continue;
+		}
+		inbox.push_back( std::move( in ) );
 	}
 }
 
@@ -191,8 +269,10 @@ void Server::handle( const json & msg ) {
 		if ( ! hasId ) {
 			send( { { "jsonrpc", "2.0" }, { "id", nullptr },
 					{ "error", { { "code", InvalidRequest }, { "message", "missing method" } } } } );
+		} else {
+			response( msg );						// to something we sent
 		}
-		return;										// a response to something we sent
+		return;
 	}
 	const std::string method = *mit;
 	const json & params = member( msg, "params" );
@@ -242,20 +322,24 @@ nlohmann::json Server::request( const std::string & method, const json & params 
 	if ( method == "textDocument/completion" ) return completion( params );
 	if ( method == "textDocument/signatureHelp" ) return signatureHelp( params );
 	if ( method == "textDocument/semanticTokens/full" ) return semanticTokens( params );
+	if ( method == "textDocument/documentHighlight" ) return documentHighlight( params );
+	if ( method == "textDocument/inlayHint" ) return inlayHint( params );
+	if ( method == "textDocument/prepareRename" ) return prepareRename( params );
+	if ( method == "textDocument/rename" ) return rename( params );
+	if ( method == "textDocument/switchSourceHeader" ) return switchSourceHeader( params );
+	if ( method == "workspace/symbol" ) return workspaceSymbol( params );
 	throw LspError{ MethodNotFound, "unhandled method " + method };
 }
 
 void Server::notification( const std::string & method, const json & params ) {
 	if ( phase == Phase::Uninitialized ) return;		// dropped, per spec
 	if ( method == "initialized" ) {
-		const Toolchain & tc = checker->toolchain();
-		std::string missing;
-		if ( tc.cfa.empty() ) missing = "the cfa compiler (not on PATH; set initializationOptions.cfa)";
-		else if ( tc.translator.empty() ) missing = "the cfa-lsp translator (set initializationOptions.translator or CFA_LSP_TRANSLATOR); only compiler errors will be shown";
-		if ( ! missing.empty() && ! warnedMissing ) {
-			warnedMissing = true;
-			notify( "window/showMessage", { { "type", 2 }, { "message", "cfa-lsp: cannot find " + missing + "." } } );
+		warnMissing();
+		if ( configurationRegistration ) {
+			sendRequest( "client/registerCapability",
+						 { { "registrations", { { { "id", "cfa-lsp-configuration" }, { "method", "workspace/didChangeConfiguration" } } } } } );
 		}
+		if ( configurationPull ) requestConfiguration();
 		return;
 	}
 	if ( phase == Phase::ShuttingDown ) return;
@@ -263,8 +347,24 @@ void Server::notification( const std::string & method, const json & params ) {
 	else if ( method == "textDocument/didChange" ) didChange( params );
 	else if ( method == "textDocument/didClose" ) didClose( params );
 	else if ( method == "textDocument/didSave" ) didSave( params );
-	// $/cancelRequest: requests are answered in order as they arrive, so by
-	// the time a cancel is read its request has been answered.
+	else if ( method == "workspace/didChangeConfiguration" ) didChangeConfiguration( params );
+	// $/cancelRequest is handled when reading ahead (see run()); by the time
+	// one gets here, its request has been answered.
+}
+
+int Server::sendRequest( const std::string & method, json params ) {
+	int id = nextRequestId++;
+	send( { { "jsonrpc", "2.0" }, { "id", id }, { "method", method }, { "params", std::move( params ) } } );
+	return id;
+}
+
+void Server::response( const json & msg ) {
+	const json & id = member( msg, "id" );
+	if ( ! id.is_number_integer() || configRequests.erase( id.get<int>() ) == 0 ) return;
+	// After shutdown the worker is gone; there is nothing to re-check.
+	if ( phase != Phase::Running ) return;
+	const json & result = member( msg, "result" );
+	if ( result.is_array() && ! result.empty() ) applySettings( result[0] );
 }
 
 nlohmann::json Server::initialize( const json & params ) {
@@ -277,6 +377,11 @@ nlohmann::json Server::initialize( const json & params ) {
 		}
 	}
 	hierarchicalSymbols = member( member( member( caps, "textDocument" ), "documentSymbol" ), "hierarchicalDocumentSymbolSupport" ) == true;
+	prepareRenameSupport = member( member( member( caps, "textDocument" ), "rename" ), "prepareSupport" ) == true;
+	inlayHintRefresh = member( member( member( caps, "workspace" ), "inlayHint" ), "refreshSupport" ) == true;
+	const json & ws = member( caps, "workspace" );
+	configurationPull = member( ws, "configuration" ) == true;
+	configurationRegistration = member( member( ws, "didChangeConfiguration" ), "dynamicRegistration" ) == true;
 
 	const json & root = member( params, "rootUri" );
 	if ( root.is_string() ) {
@@ -286,31 +391,9 @@ nlohmann::json Server::initialize( const json & params ) {
 	}
 
 	const json & io = member( params, "initializationOptions" );
-	ToolchainOptions to;
-	to.exeDir = exeDir;
-	auto str = [&]( const char * k ) { return member( io, k ).is_string() ? member( io, k ).get<std::string>() : std::string(); };
-	to.cfa = str( "cfa" );
-	to.translator = str( "translator" );
-	to.preludeDir = str( "preludeDir" );
-	to.cc = str( "cc" );
-	opts.debounceMs = std::max( 0, intOr( member( io, "debounceMs" ), 500 ) );
-	opts.timeoutMs = std::max( 1, intOr( member( io, "timeoutMs" ), 120000 ) );
-	if ( member( io, "backend" ).is_boolean() ) opts.backend = member( io, "backend" ).get<bool>();
-	const json & fl = member( io, "flags" );
-	if ( fl.is_array() ) {
-		std::vector<std::string> v;
-		for ( const auto & f : fl ) {
-			if ( f.is_string() ) v.push_back( f );
-		}
-		opts.flags = v;
-	} else if ( fl.is_string() ) {
-		opts.flags = parseFlagsFile( fl.get<std::string>() );
-	}
-
-	Toolchain tc = discoverToolchain( to );
-	log::info( "cfa: ", tc.cfa.empty() ? "(none)" : tc.cfa, "; translator: ", tc.translator.empty() ? "(none)" : tc.translator,
-			   "; encoding: ", enc == Encoding::Utf8 ? "utf-8" : "utf-16" );
-	checker = std::make_unique<Checker>( tc );
+	initOptions = io.is_object() ? io : json::object();
+	log::info( "encoding: ", enc == Encoding::Utf8 ? "utf-8" : "utf-16" );
+	applyOptions( initOptions );
 	phase = Phase::Running;
 	startWorker();
 
@@ -328,8 +411,98 @@ nlohmann::json Server::initialize( const json & params ) {
 		{ "signatureHelpProvider", { { "triggerCharacters", { "(", "," } } } },
 		{ "semanticTokensProvider", { { "legend", { { "tokenTypes", tokenTypes }, { "tokenModifiers", tokenModifiers } } },
 									  { "full", true } } },
+		{ "documentHighlightProvider", true },
+		{ "inlayHintProvider", true },
+		{ "renameProvider", prepareRenameSupport ? json{ { "prepareProvider", true } } : json( true ) },
+		{ "workspaceSymbolProvider", true },
 	};
 	return { { "capabilities", capabilities }, { "serverInfo", { { "name", "cfa-lsp" }, { "version", "0.1.0" } } } };
+}
+
+// ---------------------------------------------------------------- configuration
+
+void Server::applyOptions( const json & io ) {
+	ToolchainOptions to;
+	to.exeDir = exeDir;
+	auto str = [&]( const char * k ) { return member( io, k ).is_string() ? member( io, k ).get<std::string>() : std::string(); };
+	to.cfa = str( "cfa" );
+	to.translator = str( "translator" );
+	to.preludeDir = str( "preludeDir" );
+	to.cc = str( "cc" );
+	Options o;
+	o.debounceMs = std::max( 0, intOr( member( io, "debounceMs" ), 500 ) );
+	o.timeoutMs = std::max( 1, intOr( member( io, "timeoutMs" ), 120000 ) );
+	if ( member( io, "backend" ).is_boolean() ) o.backend = member( io, "backend" ).get<bool>();
+	if ( member( io, "stopAfterResolve" ).is_boolean() ) o.stopAfterResolve = member( io, "stopAfterResolve" ).get<bool>();
+	const json & fl = member( io, "flags" );
+	if ( fl.is_array() ) {
+		std::vector<std::string> v;
+		for ( const auto & f : fl ) {
+			if ( f.is_string() ) v.push_back( f );
+		}
+		o.flags = v;
+	} else if ( fl.is_string() ) {
+		o.flags = parseFlagsFile( fl.get<std::string>() );
+	}
+
+	Toolchain tc = discoverToolchain( to );
+	log::info( "cfa: ", tc.cfa.empty() ? "(none)" : tc.cfa, "; translator: ", tc.translator.empty() ? "(none)" : tc.translator );
+	auto chk = std::make_shared<const Checker>( tc );
+	std::lock_guard<std::mutex> lock( mtx );
+	opts = o;
+	checker = chk;
+	effective = io;
+}
+
+void Server::didChangeConfiguration( const json & params ) {
+	const json & s = member( params, "settings" );
+	if ( s.is_object() && ! s.empty() ) applySettings( s );
+	else if ( configurationPull ) requestConfiguration();	// the pull model sends no settings
+}
+
+void Server::requestConfiguration() {
+	configRequests.insert( sendRequest( "workspace/configuration", { { "items", { { { "section", "cfa-lsp" } } } } } ) );
+}
+
+void Server::applySettings( const json & s ) {
+	// Settings pushed by the client are usually keyed by server name; a
+	// workspace/configuration answer is our section already.
+	const json * section = &s;
+	for ( const char * k : { "cfa-lsp" } ) {
+		if ( member( s, k ).is_object() ) {
+			section = &member( s, k );
+			break;
+		}
+	}
+	settings = section->is_object() ? *section : json::object();
+	// Our settings override initializationOptions key by key; null removes
+	// one. Other keys are someone else's.
+	json eff = initOptions;
+	for ( const char * k : { "cfa", "translator", "preludeDir", "flags", "backend", "stopAfterResolve", "cc", "debounceMs", "timeoutMs" } ) {
+		auto it = settings.find( k );
+		if ( it == settings.end() ) continue;
+		if ( it->is_null() ) eff.erase( k );
+		else eff[k] = *it;
+	}
+	if ( eff == effective ) return;
+	log::info( "configuration changed: ", eff.dump() );
+	applyOptions( eff );
+	{
+		std::lock_guard<std::mutex> lock( mtx );
+		if ( inflight ) inflight->token->cancel();
+		for ( auto & [path, doc] : docs ) schedule( path, 0 );
+	}
+	warnMissing();
+}
+
+void Server::warnMissing() {
+	const Toolchain & tc = checker->toolchain();
+	std::string missing;
+	if ( tc.cfa.empty() ) missing = "the cfa compiler (not on PATH; set initializationOptions.cfa)";
+	else if ( tc.translator.empty() ) missing = "the cfa-lsp translator (set initializationOptions.translator or CFA_LSP_TRANSLATOR); only compiler errors will be shown";
+	if ( missing == warnedMissing ) return;
+	warnedMissing = missing;
+	if ( ! missing.empty() ) notify( "window/showMessage", { { "type", 2 }, { "message", "cfa-lsp: cannot find " + missing + "." } } );
 }
 
 // ---------------------------------------------------------------- documents
@@ -381,7 +554,21 @@ void Server::didChange( const json & params ) {
 			d->log.push_back( { d->seq, makeEdit( s, e, ins ) } );
 		}
 	}
-	if ( inflight && inflight->path == d->path ) inflight->token->cancel();
+	// The check in flight keeps running and its results are mapped through
+	// these edits. Cancelling it would starve diagnostics while someone types
+	// with pauses shorter than the debounce plus the check time. A check that
+	// has run more than twice as long as the last one is probably stuck on
+	// text this edit may have fixed, such as an expression the resolver takes
+	// minutes on, so that one is cancelled. Raising lastCheck to the time it
+	// ran means a check that got slower for good still finishes after a few
+	// edits.
+	if ( inflight && inflight->path == d->path && ! inflight->token->cancelled() && d->lastCheck > Clock::duration::zero() ) {
+		Clock::duration ran = Clock::now() - inflight->started;
+		if ( ran > 2 * d->lastCheck ) {
+			inflight->token->cancel();
+			d->lastCheck = ran;
+		}
+	}
 	schedule( d->path, opts.debounceMs );
 	trimLog( *d );
 }
@@ -400,6 +587,7 @@ void Server::didClose( const json & params ) {
 	std::lock_guard<std::mutex> pub( publishMtx );
 	lock.unlock();
 	for ( auto & p : out ) notify( "textDocument/publishDiagnostics", std::move( p ) );
+	if ( testHook ) testHook( "closed" );
 }
 
 void Server::didSave( const json & params ) {
@@ -408,12 +596,10 @@ void Server::didSave( const json & params ) {
 	if ( ! d ) return;
 	d->diskSeq = d->seq;
 	// Skip if the check in flight already covers this text. Otherwise save
-	// always re-checks: headers on disk may have changed.
+	// always re-checks (after the check in flight): headers on disk may have
+	// changed.
 	bool covered = inflight && inflight->path == d->path && inflight->seq == d->seq;
-	if ( ! covered ) {
-		if ( inflight && inflight->path == d->path ) inflight->token->cancel();
-		schedule( d->path, 0 );
-	}
+	if ( ! covered ) schedule( d->path, 0 );
 	if ( isHeader( d->path ) ) {
 		for ( auto & [p, other] : docs ) {
 			if ( p != d->path ) schedule( p, opts.debounceMs );
@@ -437,6 +623,7 @@ void Server::trimLog( Document & doc ) {
 	}
 	if ( inflight && inflight->path == doc.path ) keep = std::min( keep, inflight->seq );
 	if ( doc.diskSeq ) keep = std::min( keep, *doc.diskSeq );
+	if ( ! doc.backDiags.empty() ) keep = std::min( keep, doc.backSeq );
 	auto it = std::find_if( doc.log.begin(), doc.log.end(), [&]( const auto & e ) { return e.first > keep; } );
 	doc.log.erase( doc.log.begin(), it );
 }
@@ -710,6 +897,160 @@ nlohmann::json Server::semanticTokens( const json & params ) {
 	return { { "data", data } };
 }
 
+std::optional<Loc> Server::cursorInSnapshot( const Document & d, const json & params ) const {
+	const json & p = member( params, "position" );
+	Loc cur = d.text.fromLsp( intOr( member( p, "line" ), 0 ), intOr( member( p, "character" ), 0 ), enc );
+	EditList edits = d.editsSince( d.analysisSeq );
+	MappedLoc m = toSnapshot( edits, cur );
+	if ( ! m.exact || ! sameIdentifier( d, cur, edits ) ) return std::nullopt;
+	return m.loc;
+}
+
+nlohmann::json Server::documentHighlight( const json & params ) {
+	Document * d = docFor( params );
+	if ( ! d || ! d->analysis ) return json::array();
+	auto pos = cursorInSnapshot( *d, params );
+	if ( ! pos ) return json::array();
+	json out = json::array();
+	for ( const DocumentHighlight & h : d->analysis->documentHighlights( d->path, *pos ) ) {
+		if ( auto j = lspLocation( *d, Location{ d->path, h.range }, true ) ) {
+			out.push_back( { { "range", ( *j )["range"] }, { "kind", h.kind } } );
+		}
+	}
+	return out;
+}
+
+nlohmann::json Server::inlayHint( const json & params ) {
+	Document * d = docFor( params );
+	if ( ! d || ! d->analysis ) return json::array();
+	const json & r = member( params, "range" );
+	const json & s = member( r, "start" ), & e = member( r, "end" );
+	Loc a = d->text.fromLsp( intOr( member( s, "line" ), 0 ), intOr( member( s, "character" ), 0 ), enc );
+	Loc b = d->text.fromLsp( intOr( member( e, "line" ), INT_MAX ), intOr( member( e, "character" ), 0 ), enc );
+	EditList edits = d->editsSince( d->analysisSeq );
+	Range snap{ toSnapshot( edits, a ).loc, toSnapshot( edits, b ).loc };
+	json out = json::array();
+	for ( const InlayHint & h : d->analysis->inlayHints( d->path, snap ) ) {
+		Loc p = h.pos;
+		if ( ! edits.empty() ) {
+			// The hints of a call edited since the check may be wrong.
+			if ( ! toCurrentExact( edits, h.span ) ) continue;
+			auto m = toCurrentExact( edits, Range{ h.pos, h.pos } );
+			if ( ! m ) continue;
+			p = m->start;
+		}
+		if ( p < a || b < p ) continue;
+		out.push_back( { { "position", lspPos( d->text, p ) }, { "label", h.label }, { "kind", h.kind },
+						 { "paddingLeft", false }, { "paddingRight", h.kind == 2 } } );
+	}
+	return out;
+}
+
+std::optional<RenamePlan> Server::renameAt( const Document & d, const json & params ) {
+	auto pos = cursorInSnapshot( d, params );
+	if ( ! pos ) return std::nullopt;
+	auto plan = d.analysis->rename( d.path, *pos );
+	if ( ! plan ) return std::nullopt;
+	if ( ! plan->error.empty() ) throw LspError{ RequestFailed, plan->error };
+	EditList edits = d.editsSince( d.analysisSeq );
+	auto current = [&]( Range r ) {
+		auto m = toCurrentExact( edits, r );
+		bool spelled = false;
+		if ( m && m->start.line == m->end.line && m->start.col <= m->end.col ) {
+			std::string_view line = d.text.line( m->start.line );
+			spelled = size_t( m->end.col ) <= line.size() && line.substr( m->start.col, m->end.col - m->start.col ) == plan->name;
+		}
+		if ( ! spelled || ( ! edits.empty() && ! wholeName( d.text, *m ) ) ) {
+			throw LspError{ RequestFailed, "an occurrence of `" + plan->name +
+											   "` changed since the file was last checked; try again after the next check" };
+		}
+		return *m;
+	};
+	plan->range = current( plan->range );
+	for ( Range & r : plan->sites ) r = current( r );
+	return plan;
+}
+
+nlohmann::json Server::prepareRename( const json & params ) {
+	Document * d = docFor( params );
+	if ( ! d || ! d->analysis ) return nullptr;
+	auto plan = renameAt( *d, params );
+	if ( ! plan ) return nullptr;
+	return { { "range", lspRange( d->text, plan->range ) }, { "placeholder", plan->name } };
+}
+
+nlohmann::json Server::rename( const json & params ) {
+	const json & nn = member( params, "newName" );
+	if ( ! nn.is_string() ) throw LspError{ InvalidParams, "missing newName" };
+	std::string name = nn.get<std::string>();
+	if ( ! text::isIdentifier( name ) || Analysis::isKeyword( name ) ) throw LspError{ InvalidParams, "`" + name + "` is not a valid identifier" };
+	Document * d = docFor( params );
+	if ( ! d || ! d->analysis ) throw LspError{ RequestFailed, "the file has not been checked yet" };
+	auto plan = renameAt( *d, params );
+	if ( ! plan ) throw LspError{ RequestFailed, "there is no symbol to rename here" };
+	json edits = json::array();
+	for ( const Range & r : plan->sites ) edits.push_back( { { "range", lspRange( d->text, r ) }, { "newText", name } } );
+	json changes = json::object();
+	changes[d->uri] = edits;
+	return { { "changes", changes } };
+}
+
+// clangd's extension: the header of a source file, or the other way round, by stem.
+nlohmann::json Server::switchSourceHeader( const json & params ) {
+	const json & uri = member( params, "uri" );
+	if ( ! uri.is_string() ) throw LspError{ InvalidParams, "missing uri" };
+	auto path = uriToPath( uri.get<std::string>() );
+	if ( ! path ) return nullptr;
+	fs::path p = fs::path( *path ).lexically_normal();
+	std::string other = p.extension() == ".cfa" ? ".hfa" : p.extension() == ".hfa" ? ".cfa" : "";
+	if ( other.empty() ) return nullptr;
+	fs::path next = p;
+	next.replace_extension( other );
+	std::error_code ec;
+	if ( docs.count( next.string() ) || fs::is_regular_file( next, ec ) ) return uriOf( next.string() );
+	// An open document elsewhere with the same stem, such as include/x.hfa for src/x.cfa.
+	for ( const auto & [q, doc] : docs ) {
+		fs::path qp( q );
+		if ( qp.stem() == p.stem() && qp.extension() == other ) return doc.uri;
+	}
+	return nullptr;
+}
+
+// The symbols of the open documents and of the project headers they include.
+nlohmann::json Server::workspaceSymbol( const json & params ) {
+	const json & q = member( params, "query" );
+	std::string query = q.is_string() ? q.get<std::string>() : std::string();
+	// A file that is open and checked gets its symbols from its own analysis.
+	std::set<std::string> owned;
+	for ( const auto & [path, doc] : docs ) {
+		if ( doc.analysis ) owned.insert( path );
+	}
+	json out = json::array();
+	std::set<std::string> seen;
+	for ( const auto & entry : docs ) {
+		const std::string & path = entry.first;
+		const Document & doc = entry.second;
+		if ( ! doc.analysis ) continue;
+		for ( const std::string & file : doc.analysis->projectFiles() ) {
+			std::string norm = fs::path( file ).lexically_normal().string();
+			if ( norm != path && owned.count( norm ) ) continue;
+			std::function<void( const Symbol &, const std::string & )> add = [&]( const Symbol & s, const std::string & container ) {
+				if ( out.size() >= 1000 ) return;
+				if ( fuzzyMatch( s.name, query ) ) {
+					if ( auto loc = lspLocation( doc, Location{ file, s.selectionRange }, false ) ) {
+						json j = { { "name", s.name }, { "kind", s.kind }, { "location", *loc } };
+						if ( ! container.empty() ) j["containerName"] = container;
+						if ( seen.insert( j.dump() ).second ) out.push_back( std::move( j ) );
+					}
+				}
+				for ( const auto & c : s.children ) add( c, s.name );
+			};
+			for ( const Symbol & s : doc.analysis->documentSymbols( file ) ) add( s, "" );
+		}
+	}
+	return out;
+}
+
 // ---------------------------------------------------------------- diagnostics
 
 nlohmann::json Server::diagJson( const Diag & d, const std::string & target, const std::string & source, uint64_t seq ) {
@@ -787,6 +1128,7 @@ CheckRequest Server::makeRequest( const Document & doc ) const {
 	req.path = doc.path;
 	req.text = doc.text.str();
 	req.backend = opts.backend;
+	req.stopAfterResolve = opts.stopAfterResolve;
 	req.timeout = std::chrono::milliseconds( opts.timeoutMs );
 	std::string dir = fs::path( doc.path ).parent_path().string();
 	if ( opts.flags ) {
@@ -823,6 +1165,26 @@ void Server::stopWorker() {
 	if ( worker.joinable() ) worker.join();
 }
 
+void Server::rebaseBackend( Document & doc, uint64_t seq ) {
+	if ( ! doc.backDiags.empty() && doc.backSeq != seq ) {
+		EditList edits = doc.editsBetween( doc.backSeq, seq );
+		std::vector<Diag> kept;
+		for ( Diag & d : doc.backDiags ) {
+			if ( d.file == doc.path ) {
+				// Backend diagnostics cover whole lines; drop the ones whose
+				// line has been edited.
+				int l = d.range.start.line;
+				auto m = toCurrentExact( edits, Range{ { l, 0 }, { l + 1, 0 } } );
+				if ( ! m || m->start.col != 0 || m->end != Loc{ m->start.line + 1, 0 } ) continue;
+				d.range = { m->start, m->start };
+			}
+			kept.push_back( std::move( d ) );
+		}
+		doc.backDiags = std::move( kept );
+	}
+	doc.backSeq = seq;
+}
+
 void Server::workerLoop() {
 	std::unique_lock<std::mutex> lk( mtx );
 	for ( ;; ) {
@@ -843,13 +1205,14 @@ void Server::workerLoop() {
 		if ( dit == docs.end() ) continue;
 		CheckRequest req = makeRequest( dit->second );
 		uint64_t seq = dit->second.seq;
+		std::shared_ptr<const Checker> chk = checker;
 		auto token = std::make_shared<CancelToken>();
-		inflight = InFlight{ path, seq, token };
+		inflight = InFlight{ path, seq, token, Clock::now() };
 		lk.unlock();
 
 		log::info( "checking ", path );
 		auto t0 = Clock::now();
-		FrontResult fr = checker->front( req, *token );
+		FrontResult fr = chk->front( req, *token );
 		auto ms = []( auto d ) { return std::chrono::duration_cast<std::chrono::milliseconds>( d ).count(); };
 		log::info( "front end for ", path, ": status ", (int)fr.status, ", ", fr.diags.size(), " diagnostics, ", ms( Clock::now() - t0 ), " ms" );
 
@@ -861,36 +1224,60 @@ void Server::workerLoop() {
 			continue;
 		}
 		Document & doc = dit->second;
+		std::optional<json> refresh;
 		if ( fr.analysis && ( fr.usable || ! doc.analysis ) ) {
 			doc.analysis = fr.analysis;
 			doc.analysisSeq = seq;
+			// Clients ask for inlay hints when the text changes, not when a
+			// check finishes, so the hints of a file just opened would stay empty.
+			if ( inlayHintRefresh ) {
+				refresh = json{ { "jsonrpc", "2.0" }, { "id", "cfa-lsp-refresh-" + std::to_string( ++refreshRequests ) },
+								{ "method", "workspace/inlayHint/refresh" } };
+			}
 		}
+		// The last backend warnings stay until the backend runs again, which
+		// it can't while the translator reports errors that stop it before
+		// code generation. With stopAfterResolve it never runs, so nothing
+		// is carried.
+		bool runBack = fr.backendReady && req.backend;
+		bool carry = req.backend && ! req.stopAfterResolve && fr.status != FrontResult::Fallback &&
+					 fr.status != FrontResult::NoCfa;
+		std::vector<Diag> diags = fr.diags;
+		if ( carry ) {
+			rebaseBackend( doc, seq );
+			mergeDiags( diags, doc.backDiags );
+		} else {
+			doc.backDiags.clear();
+		}
+		bool carried = ! doc.backDiags.empty();
 		diskCache.clear();
-		storeDiags( path, seq, fr.diags, out );
+		storeDiags( path, seq, diags, out );
 		trimLog( doc );
-		bool runBack = fr.backendReady && opts.backend;
 		{
 			std::lock_guard<std::mutex> pub( publishMtx );
 			lk.unlock();
+			if ( refresh ) send( *refresh );
+			if ( testHook ) testHook( "publish" );
 			for ( auto & p : out ) notify( "textDocument/publishDiagnostics", std::move( p ) );
 		}
 		out.clear();
 
 		if ( runBack ) {
 			auto t1 = Clock::now();
-			std::vector<Diag> back = checker->back( req, fr, *token );
+			std::vector<Diag> back = chk->back( req, fr, *token );
 			log::info( "backend for ", path, ": ", back.size(), " diagnostics, ", ms( Clock::now() - t1 ), " ms" );
 			lk.lock();
 			dit = docs.find( path );
-			if ( ! token->cancelled() && dit != docs.end() && ! stopping && ! back.empty() ) {
-				std::vector<Diag> merged = fr.diags;
-				std::set<std::tuple<std::string, int, std::string>> seen;
-				for ( const auto & d : merged ) seen.insert( { d.file, d.range.start.line, d.message } );
-				for ( auto & d : back ) {
-					if ( seen.insert( { d.file, d.range.start.line, d.message } ).second ) merged.push_back( std::move( d ) );
+			if ( ! token->cancelled() && dit != docs.end() && ! stopping ) {
+				dit->second.backDiags = back;
+				dit->second.backSeq = seq;
+				// The first publish had the carried warnings; replace them.
+				if ( ! back.empty() || carried ) {
+					std::vector<Diag> merged = fr.diags;
+					mergeDiags( merged, back );
+					diskCache.clear();
+					storeDiags( path, seq, merged, out );
 				}
-				diskCache.clear();
-				storeDiags( path, seq, merged, out );
 			}
 			{
 				std::lock_guard<std::mutex> pub( publishMtx );
@@ -901,8 +1288,12 @@ void Server::workerLoop() {
 		}
 		fr = FrontResult();					// removes the temp dir
 		lk.lock();
+		Clock::duration took = Clock::now() - inflight->started;
 		inflight.reset();
-		if ( auto it = docs.find( path ); it != docs.end() ) trimLog( it->second );
+		if ( auto it = docs.find( path ); it != docs.end() ) {
+			if ( ! token->cancelled() ) it->second.lastCheck = took;
+			trimLog( it->second );
+		}
 	}
 }
 

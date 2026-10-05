@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cstdlib>
+#include <poll.h>
 #include <unistd.h>
 
 #include "Log.hpp"
@@ -77,10 +78,34 @@ std::optional<std::string> MessageReader::read() {
 	for ( ;; ) {
 		if ( auto m = parser.next() ) return m;
 		if ( parser.takeError() ) log::warn( "skipped a message header without Content-Length" );
+		if ( eof ) return std::nullopt;
 		char chunk[65536];
 		ssize_t n = ::read( fd, chunk, sizeof( chunk ) );
 		if ( n < 0 && errno == EINTR ) continue;
-		if ( n <= 0 ) return std::nullopt;
+		if ( n <= 0 ) {
+			eof = true;
+			return std::nullopt;
+		}
+		parser.feed( chunk, (size_t)n );
+	}
+}
+
+std::optional<std::string> MessageReader::tryRead() {
+	for ( ;; ) {
+		if ( auto m = parser.next() ) return m;
+		if ( parser.takeError() ) log::warn( "skipped a message header without Content-Length" );
+		if ( eof ) return std::nullopt;
+		pollfd p{ fd, POLLIN, 0 };
+		int r = ::poll( &p, 1, 0 );
+		if ( r < 0 && errno == EINTR ) continue;
+		if ( r <= 0 ) return std::nullopt;
+		char chunk[65536];
+		ssize_t n = ::read( fd, chunk, sizeof( chunk ) );
+		if ( n < 0 && errno == EINTR ) continue;
+		if ( n <= 0 ) {
+			eof = true;
+			return std::nullopt;
+		}
 		parser.feed( chunk, (size_t)n );
 	}
 }

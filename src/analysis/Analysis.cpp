@@ -1,8 +1,10 @@
 #include "Analysis.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <climits>
 #include <cctype>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <set>
@@ -92,6 +94,7 @@ struct File {
 	std::string path;
 	Origin origin = Origin::Project;
 	bool focus = false;
+	std::optional<std::vector<int>> present;	// lines that left text in the preprocessed output
 	std::vector<int> refs;					// sorted by range start
 	std::vector<int> exprs;					// sorted by range start
 	std::vector<int> exprEnds;				// sorted by range end
@@ -146,20 +149,31 @@ const json & array( const json & dump, const char * key ) {
 	return *it;
 }
 
-std::optional<Range> mapped( const json & j, const std::string & file, const SourceMap & map ) {
+// `body`, if given, is set when the start came from a macro's body, so the
+// source does not spell what is there (see SourceMap::inMacroBody).
+std::optional<Range> mapped( const json & j, const std::string & file, const SourceMap & map, bool * body = nullptr ) {
+	if ( body ) *body = false;
 	if ( !j.is_object() ) return std::nullopt;
 	int line = smallInt( j, "line", 0 );
 	if ( line <= 0 ) return std::nullopt;				// unknown location
 	int col = std::max( smallInt( j, "col", 0 ), 0 );
 	int endLine = smallInt( j, "endLine", line );
 	int endCol = smallInt( j, "endCol", endLine == line ? col : 0 );
-	if ( endLine < line || ( endLine == line && endCol < col ) ) {
+	// The line in the preprocessed text, when the translator gave it.
+	int pline = std::max( smallInt( j, "pline", 0 ), 0 );
+	int endPline = std::max( smallInt( j, "endPline", 0 ), 0 );
+	// A range can end on a later piece of a split line, at a smaller column.
+	bool laterPiece = pline > 0 && endPline > 0 && endPline != pline;
+	if ( endLine < line || ( endLine == line && ( laterPiece ? endPline < pline : endCol < col ) ) ) {
 		endLine = line;
 		endCol = col;
+		endPline = pline;
 	}
-	Range r = map.mapRange( file, line, col, endLine, endCol );
+	SourceMap::Point start{ line, col, pline }, end{ endLine, endCol, endPline };
+	Range r = map.mapRange( file, start, end );
 	if ( r.start.line < 0 ) r.start = { 0, 0 };
 	if ( r.end < r.start ) r.end = r.start;
+	if ( body ) *body = map.inMacroBody( file, start );
 	return r;
 }
 
@@ -573,9 +587,13 @@ static std::optional<Range> spelledName( const FileText & ft, Range r, const std
 }
 
 // How a use of a declaration can be spelled besides its name: a postfix
-// function ?`len is called as x`len, and an operator ?+? is written +.
+// function ?`len is called as x`len, an operator ?+? is written +, and
+// ?[?], ?() and ?{} are refs at their opening bracket (a[i], f( x ), p{ 1 }).
 static std::string otherSpelling( const std::string & name ) {
 	if ( name.starts_with( "?`" ) ) return name.substr( 2 );
+	if ( name == "?[?]" ) return "[";
+	if ( name == "?()" ) return "(";
+	if ( name == "?{}" ) return "{";
 	if ( name.size() < 2 || name.find( '?' ) == std::string::npos ) return {};
 	std::string symbol;
 	for ( char c : name ) if ( c != '?' ) symbol += c;
@@ -626,8 +644,9 @@ void Analysis::Impl::load( const json & dump, const SourceMap & map ) {
 			d.file = fileOf( path );
 			if ( auto r = mapped( j, path, map ) ) { d.hasLoc = true; d.range = *r; }
 			auto nr = j.find( "nameRange" );
+			bool madeUp = false;			// the name came from a macro's body
 			if ( nr != j.end() ) {
-				if ( auto r = mapped( *nr, path, map ) ) { d.hasName = true; d.nameRange = *r; }
+				if ( auto r = mapped( *nr, path, map, &madeUp ) ; r && !madeUp ) { d.hasName = true; d.nameRange = *r; }
 			}
 			if ( d.hasName && !d.hasLoc ) { d.hasLoc = true; d.range = d.nameRange; }
 			if ( d.hasLoc && !d.hasName ) d.nameRange = { d.range.start, d.range.start };
@@ -670,8 +689,9 @@ void Analysis::Impl::load( const json & dump, const SourceMap & map ) {
 		if ( !j.is_object() ) continue;
 		std::string path = string( j, "file" );
 		int d = index( optId( j, "decl" ) );
-		auto r = mapped( j, path, map );
-		if ( path.empty() || d < 0 || !r ) continue;
+		bool inBody = false;			// a use that only a macro's body spells
+		auto r = mapped( j, path, map, &inBody );
+		if ( path.empty() || d < 0 || !r || inBody ) continue;
 		if ( auto ft = text( fileOf( path ) ) ) {
 			r = spelledUse( *ft, *r, decls[d].name );
 			if ( !r ) continue;
@@ -723,6 +743,7 @@ void Analysis::Impl::load( const json & dump, const SourceMap & map ) {
 	for ( const std::string & f : map.files() ) {
 		if ( !f.empty() && f[0] != '<' ) fileOf( f );
 	}
+	for ( auto & f : files ) f.present = map.outputLines( f.path );
 
 	// Focus files are the ones with resolved uses or locals.
 	for ( auto & f : files ) f.focus = !f.refs.empty() || !f.exprs.empty() || !f.scopes.empty();
@@ -1339,68 +1360,456 @@ CompletionItem Analysis::Impl::item( int d, char rank, const std::string & detai
 
 namespace {
 
-// Whether cpp kept a conditional branch, as far as a text scan can tell.
+// Whether cpp kept a conditional branch, as far as we can tell.
 enum class Branch { Live, Dead, Unknown };
 
-// `#ifdef __cforall` and friends: the only conditions worth evaluating here.
-Branch evaluate( std::string_view directive, std::string_view rest ) {
-	std::string cond = stripSpaces( rest );
-	bool negate = directive == "ifndef";
-	if ( directive == "if" || directive == "elif" ) {
-		if ( cond == "0" ) return Branch::Dead;
-		if ( cond == "1" ) return Branch::Live;
-		if ( cond.starts_with( "!" ) ) {
-			negate = true;
-			cond = cond.substr( 1 );
+// The first character of `l` outside comments and whitespace, or -1.
+// `comment` says whether a /* */ comment is open, at the start of the line
+// and after it.
+int firstCode( std::string_view l, bool & comment ) {
+	int first = -1;
+	for ( size_t i = 0; i < l.size(); ) {
+		if ( comment ) {
+			size_t e = l.find( "*/", i );
+			if ( e == std::string_view::npos ) return first;
+			comment = false;
+			i = e + 2;
+			continue;
 		}
-		if ( cond.starts_with( "defined(" ) && cond.ends_with( ")" ) ) cond = cond.substr( 8, cond.size() - 9 );
-		else if ( cond.starts_with( "defined" ) ) cond = cond.substr( 7 );
-		else return Branch::Unknown;
+		char c = l[i];
+		if ( c == '/' && i + 1 < l.size() && l[i + 1] == '/' ) return first;
+		if ( c == '/' && i + 1 < l.size() && l[i + 1] == '*' ) {
+			comment = true;
+			i += 2;
+			continue;
+		}
+		if ( std::isspace( (unsigned char)c ) ) {
+			i += 1;
+			continue;
+		}
+		if ( first < 0 ) first = int( i );
+		if ( c == '"' || c == '\'' ) {
+			size_t j = i + 1;
+			while ( j < l.size() && l[j] != c ) j += l[j] == '\\' ? 2 : 1;
+			i = j + 1;
+			continue;
+		}
+		i += 1;
 	}
-	bool defined;
-	if ( cond == "__cforall" || cond == "__CFA__" ) defined = true;
-	else if ( cond == "__cplusplus" ) defined = false;
-	else return Branch::Unknown;
-	return defined != negate ? Branch::Live : Branch::Dead;
+	return first;
+}
+
+bool continues( std::string_view l ) {
+	size_t e = l.find_last_not_of( " \t\r" );
+	return e != std::string_view::npos && l[e] == '\\';
+}
+
+// The directive on a line whose first code character is the '#' at `hash`:
+// its name and the text after it.
+std::pair<std::string_view, std::string_view> directiveAt( std::string_view l, int hash ) {
+	size_t i = l.find_first_not_of( " \t", hash + 1 );
+	if ( i == std::string_view::npos ) return {};
+	size_t e = i;
+	while ( e < l.size() && text::isIdentChar( l[e] ) ) e += 1;
+	return { l.substr( i, e - i ), l.substr( e ) };
+}
+
+// What a macro means in an #if.
+struct MacroDef {
+	enum State { Unknown, Undefined, Defined } state = Unknown;
+	std::string body;						// replacement text, for Defined
+	bool function = false;
+};
+
+// Evaluates a #if expression as far as the known macros allow: nullopt when
+// it depends on something unknown (a macro from the compiler or the command
+// line, a function-like macro, __has_include, ...).
+class CondEval {
+  public:
+	using Lookup = std::function<MacroDef( const std::string & )>;
+	explicit CondEval( Lookup lookup ) : lookup( std::move( lookup ) ) {}
+
+	std::optional<long long> run( std::string_view expr ) {
+		// Saved for a nested run, which evaluates a macro's body.
+		std::vector<std::string> saved = toks;
+		size_t savedAt = at;
+		bool savedBad = bad;
+		toks = tokenize( expr );
+		at = 0;
+		bad = false;
+		V v = cond();
+		if ( at != toks.size() ) bad = true;
+		bool failed = bad;
+		toks = std::move( saved );
+		at = savedAt;
+		bad = savedBad;
+		if ( failed || !v.known ) return std::nullopt;
+		return v.value;
+	}
+
+  private:
+	struct V {
+		bool known = false;
+		long long value = 0;
+	};
+	static V unknown() { return {}; }
+	static V of( long long v ) { return { true, v }; }
+
+	Lookup lookup;
+	std::vector<std::string> toks;
+	size_t at = 0;
+	bool bad = false;
+	std::set<std::string> expanding;		// macros being evaluated, against recursion
+
+	static std::vector<std::string> tokenize( std::string_view s ) {
+		std::vector<std::string> out;
+		static const char * two[] = { "&&", "||", "==", "!=", "<=", ">=", "<<", ">>" };
+		for ( size_t i = 0; i < s.size(); ) {
+			char c = s[i];
+			if ( std::isspace( (unsigned char)c ) || c == '\\' ) {
+				i += 1;
+			} else if ( c == '/' && i + 1 < s.size() && s[i + 1] == '/' ) {
+				break;
+			} else if ( c == '/' && i + 1 < s.size() && s[i + 1] == '*' ) {
+				size_t e = s.find( "*/", i + 2 );
+				i = e == std::string_view::npos ? s.size() : e + 2;
+			} else if ( text::isIdentChar( c ) ) {		// identifiers and numbers, with their suffixes
+				size_t e = i;
+				while ( e < s.size() && text::isIdentChar( s[e] ) ) e += 1;
+				out.emplace_back( s.substr( i, e - i ) );
+				i = e;
+			} else if ( c == '\'' ) {
+				size_t e = i + 1;
+				while ( e < s.size() && s[e] != '\'' ) e += s[e] == '\\' ? 2 : 1;
+				e = std::min( e + 1, s.size() );
+				out.emplace_back( s.substr( i, e - i ) );
+				i = e;
+			} else {
+				std::string op( 1, c );
+				for ( const char * t : two ) {
+					if ( s.compare( i, 2, t ) == 0 ) op = t;
+				}
+				out.push_back( op );
+				i += op.size();
+			}
+		}
+		return out;
+	}
+
+	bool peek( const char * t ) const { return at < toks.size() && toks[at] == t; }
+	bool take( const char * t ) {
+		if ( !peek( t ) ) return false;
+		at += 1;
+		return true;
+	}
+	void expect( const char * t ) {
+		if ( !take( t ) ) bad = true;
+	}
+
+	V cond() {
+		V c = lor();
+		if ( !take( "?" ) ) return c;
+		V a = cond();
+		expect( ":" );
+		V b = cond();
+		if ( !c.known ) return unknown();
+		return c.value ? a : b;
+	}
+	V lor() {
+		V a = land();
+		while ( take( "||" ) ) {
+			V b = land();
+			if ( ( a.known && a.value ) || ( b.known && b.value ) ) a = of( 1 );
+			else if ( a.known && b.known ) a = of( 0 );
+			else a = unknown();
+		}
+		return a;
+	}
+	V land() {
+		V a = binary( 0 );
+		while ( take( "&&" ) ) {
+			V b = binary( 0 );
+			if ( ( a.known && !a.value ) || ( b.known && !b.value ) ) a = of( 0 );
+			else if ( a.known && b.known ) a = of( 1 );
+			else a = unknown();
+		}
+		return a;
+	}
+	// Left-associative binary operators, loosest first.
+	V binary( int level ) {
+		static const std::vector<std::vector<std::string>> levels = {
+			{ "|" }, { "^" }, { "&" }, { "==", "!=" }, { "<", ">", "<=", ">=" }, { "<<", ">>" }, { "+", "-" }, { "*", "/", "%" },
+		};
+		if ( level == int( levels.size() ) ) return unary();
+		V a = binary( level + 1 );
+		for ( ;; ) {
+			if ( at >= toks.size() ) return a;
+			const std::string & op = toks[at];
+			if ( std::find( levels[level].begin(), levels[level].end(), op ) == levels[level].end() ) return a;
+			at += 1;
+			V b = binary( level + 1 );
+			if ( !a.known || !b.known ) {
+				a = unknown();
+				continue;
+			}
+			long long x = a.value, y = b.value;
+			if ( ( op == "/" || op == "%" ) && ( y == 0 || ( x == LLONG_MIN && y == -1 ) ) ) {
+				a = unknown();
+				continue;
+			}
+			if ( ( op == "<<" || op == ">>" ) && ( y < 0 || y > 62 ) ) {
+				a = unknown();
+				continue;
+			}
+			// +, -, * and << wrap instead of overflowing, which is undefined
+			// for signed numbers.
+			unsigned long long ux = (unsigned long long)x, uy = (unsigned long long)y;
+			long long r = op == "|" ? x | y : op == "^" ? x ^ y : op == "&" ? x & y : op == "==" ? x == y : op == "!=" ? x != y
+						: op == "<" ? x < y : op == ">" ? x > y : op == "<=" ? x <= y : op == ">=" ? x >= y
+						: op == "<<" ? (long long)( ux << y ) : op == ">>" ? x >> y : op == "+" ? (long long)( ux + uy )
+						: op == "-" ? (long long)( ux - uy ) : op == "*" ? (long long)( ux * uy ) : op == "/" ? x / y : x % y;
+			a = of( r );
+		}
+	}
+	V unary() {
+		if ( take( "!" ) ) { V v = unary(); return v.known ? of( !v.value ) : v; }
+		if ( take( "~" ) ) { V v = unary(); return v.known ? of( ~v.value ) : v; }
+		if ( take( "-" ) ) { V v = unary(); return v.known ? of( (long long)( 0ULL - (unsigned long long)v.value ) ) : v; }
+		if ( take( "+" ) ) return unary();
+		return primary();
+	}
+	// Skips a parenthesised argument list, if one follows.
+	void skipArgs() {
+		if ( !take( "(" ) ) return;
+		for ( int depth = 1; at < toks.size() && depth > 0; at += 1 ) {
+			if ( toks[at] == "(" ) depth += 1;
+			else if ( toks[at] == ")" ) depth -= 1;
+		}
+	}
+	V primary() {
+		if ( at >= toks.size() ) {
+			bad = true;
+			return unknown();
+		}
+		std::string t = toks[at++];
+		if ( t == "(" ) {
+			V v = cond();
+			expect( ")" );
+			return v;
+		}
+		if ( t[0] == '\'' ) return character( t );
+		if ( std::isdigit( (unsigned char)t[0] ) ) return number( t );
+		if ( !text::isIdentStart( t[0] ) ) {
+			bad = true;
+			return unknown();
+		}
+		if ( t == "defined" ) {
+			bool paren = take( "(" );
+			if ( at >= toks.size() || !text::isIdentStart( toks[at][0] ) ) {
+				bad = true;
+				return unknown();
+			}
+			MacroDef d = lookup( toks[at++] );
+			if ( paren ) expect( ")" );
+			if ( d.state == MacroDef::Unknown ) return unknown();
+			return of( d.state == MacroDef::Defined );
+		}
+		MacroDef d = lookup( t );
+		if ( d.state == MacroDef::Undefined ) return of( 0 );		// as in cpp
+		if ( d.state == MacroDef::Unknown || d.function || expanding.count( t ) || expanding.size() > 16 ) {
+			skipArgs();										// __has_include( x ), F( y )
+			return unknown();
+		}
+		expanding.insert( t );
+		std::optional<long long> v = run( d.body );
+		expanding.erase( t );
+		return v ? of( *v ) : unknown();
+	}
+	static V number( const std::string & t ) {
+		std::string digits = t;
+		while ( !digits.empty() && ( digits.back() == 'u' || digits.back() == 'U' || digits.back() == 'l' || digits.back() == 'L' ) ) digits.pop_back();
+		if ( digits.empty() ) return unknown();
+		errno = 0;
+		char * end = nullptr;
+		unsigned long long v = std::strtoull( digits.c_str(), &end, 0 );
+		if ( errno != 0 || !end || *end != '\0' ) return unknown();
+		return of( (long long)v );
+	}
+	static V character( const std::string & t ) {
+		if ( t.size() == 3 && t[1] != '\\' ) return of( (unsigned char)t[1] );
+		if ( t.size() == 4 && t[1] == '\\' ) {
+			switch ( t[2] ) {
+			  case 'n': return of( '\n' );
+			  case 't': return of( '\t' );
+			  case '0': return of( 0 );
+			  case '\\': return of( '\\' );
+			  case '\'': return of( '\'' );
+			}
+		}
+		return unknown();
+	}
+};
+
+Branch evaluate( std::string_view directive, std::string_view rest, const CondEval::Lookup & lookup ) {
+	if ( directive == "ifdef" || directive == "ifndef" ) {
+		size_t b = rest.find_first_not_of( " \t" );
+		if ( b == std::string_view::npos ) return Branch::Unknown;
+		size_t e = b;
+		while ( e < rest.size() && text::isIdentChar( rest[e] ) ) e += 1;
+		MacroDef d = lookup( std::string( rest.substr( b, e - b ) ) );
+		if ( d.state == MacroDef::Unknown ) return Branch::Unknown;
+		return ( d.state == MacroDef::Defined ) == ( directive == "ifdef" ) ? Branch::Live : Branch::Dead;
+	}
+	std::optional<long long> v = CondEval( lookup ).run( rest );
+	if ( !v ) return Branch::Unknown;
+	return *v ? Branch::Live : Branch::Dead;
+}
+
+// What the preprocessed output says about the branches of a file's
+// conditionals, keyed by the line of the #if, #elif or #else that opens the
+// branch. A branch that left any line in the output was kept. One with code
+// of its own (outside nested conditionals and comments) that left none was
+// dropped. A branch with only directives and comments says nothing.
+std::unordered_map<int, Branch> branchEvidence( const FileText & t, const std::vector<int> & present ) {
+	struct Open { int start; bool code; };
+	std::vector<Open> stack;
+	std::unordered_map<int, Branch> out;
+	auto close = [&]( int end ) {
+		const Open & o = stack.back();
+		auto it = std::upper_bound( present.begin(), present.end(), o.start );
+		if ( it != present.end() && *it < end ) out[o.start] = Branch::Live;
+		else if ( o.code ) out[o.start] = Branch::Dead;
+	};
+	bool comment = false, inDirective = false;
+	for ( int n = 0; n < t.lineCount(); n += 1 ) {
+		std::string_view l = t.line( n );
+		int first = firstCode( l, comment );
+		if ( inDirective ) {
+			inDirective = continues( l );
+			continue;
+		}
+		if ( first < 0 ) continue;
+		if ( l[first] != '#' ) {
+			if ( !stack.empty() ) stack.back().code = true;
+			continue;
+		}
+		inDirective = continues( l );
+		std::string_view directive = directiveAt( l, first ).first;
+		if ( directive == "if" || directive == "ifdef" || directive == "ifndef" ) {
+			stack.push_back( { n, false } );
+		} else if ( ( directive == "elif" || directive == "else" ) && !stack.empty() ) {
+			close( n );
+			stack.back() = { n, false };
+		} else if ( directive == "endif" && !stack.empty() ) {
+			close( n );
+			stack.pop_back();
+		}
+	}
+	return out;
+}
+
+// "#define NAME( a ) body" -> its replacement text, for #if.
+MacroDef macroDefinition( const std::string & text, bool function ) {
+	MacroDef d;
+	d.state = MacroDef::Defined;
+	d.function = function;
+	size_t i = text.find( "define" );
+	if ( i == std::string::npos ) return d;
+	i = text.find_first_not_of( " \t", i + 6 );
+	while ( i < text.size() && text::isIdentChar( text[i] ) ) i += 1;
+	if ( i >= text.size() ) return d;
+	std::string body = text.substr( i );
+	for ( size_t k; ( k = body.find( "\\\n" ) ) != std::string::npos; ) body.replace( k, 2, " " );
+	d.body = body;
+	return d;
 }
 
 } // namespace
 
 void Analysis::Impl::loadMacros() const {
 	std::call_once( macrosOnce, [this] {
+		// Libraries first, so their macros are known in the #if conditions
+		// of the project's files.
 		std::vector<int> order( files.size() );
 		for ( size_t i = 0; i < files.size(); i += 1 ) order[i] = int( i );
-		std::stable_sort( order.begin(), order.end(), [this]( int a, int b ) { return files[a].origin < files[b].origin; } );
+		std::stable_sort( order.begin(), order.end(), [this]( int a, int b ) { return files[b].origin < files[a].origin; } );
 		for ( int f : order ) {
 			auto t = text( f );
 			if ( !t ) continue;
-			struct Level { Branch branch; bool taken; };	// taken: an earlier branch of this #if was live
+			std::unordered_map<int, Branch> evidence;
+			if ( files[f].present ) evidence = branchEvidence( *t, *files[f].present );
+			struct Level {
+				Branch branch;
+				bool taken;						// an earlier branch of this #if was live
+				bool unsure;					// an earlier branch was unknown
+			};
 			std::vector<Level> stack;
 			std::unordered_map<std::string, std::vector<size_t>> open;	// name -> macros of this file not yet #undef'd
+			std::unordered_set<std::string> undefined;	// #undef'd in this file and not defined again
 			auto dead = [&] {
 				for ( const Level & l : stack ) if ( l.branch == Branch::Dead ) return true;
 				return false;
 			};
+			CondEval::Lookup lookup = [&]( const std::string & name ) -> MacroDef {
+				auto o = open.find( name );
+				if ( o != open.end() && !o->second.empty() ) {
+					const Macro & m = macros[name][o->second.back()];
+					return macroDefinition( m.text, m.function );
+				}
+				if ( undefined.count( name ) ) return { MacroDef::Undefined, "", false };
+				if ( name == "__cforall" || name == "__CFA__" || name == "__CFORALL__" ) return { MacroDef::Defined, "1", false };
+				if ( name == "__cplusplus" ) return { MacroDef::Undefined, "", false };
+				auto it = macros.find( name );
+				if ( it != macros.end() ) {
+					for ( const Macro & m : it->second ) {
+						if ( m.file != f && m.undefLine < 0 ) return macroDefinition( m.text, m.function );
+					}
+				}
+				return {};
+			};
+			auto evidenceAt = [&]( int n ) -> std::optional<Branch> {
+				auto it = evidence.find( n );
+				if ( it == evidence.end() ) return std::nullopt;
+				return it->second;
+			};
+			bool comment = false, inDirective = false;
 			for ( int n = 0; n < t->lineCount(); n += 1 ) {
 				std::string_view l = t->line( n );
-				size_t i = l.find_first_not_of( " \t" );
-				if ( i == std::string_view::npos || l[i] != '#' ) continue;
-				i = l.find_first_not_of( " \t", i + 1 );
-				if ( i == std::string_view::npos ) continue;
-				size_t de = i;
-				while ( de < l.size() && text::isIdentChar( l[de] ) ) de += 1;
-				std::string_view directive = l.substr( i, de - i ), rest = l.substr( de );
-				if ( directive == "if" || directive == "ifdef" || directive == "ifndef" ) {
-					Branch b = evaluate( directive, rest );
-					stack.push_back( { b, b == Branch::Live } );
+				int first = firstCode( l, comment );
+				if ( inDirective ) {
+					inDirective = continues( l );
 					continue;
 				}
-				if ( directive == "elif" || directive == "else" ) {
+				if ( first < 0 || l[first] != '#' ) continue;
+				inDirective = continues( l );
+				auto [directive, rest] = directiveAt( l, first );
+				if ( directive == "if" || directive == "ifdef" || directive == "ifndef" || directive == "elif" ) {
+					// The condition, with its continuation lines.
+					std::string cond( rest );
+					for ( int k = n; k + 1 < t->lineCount() && continues( t->line( k ) ); k += 1 ) cond += "\n" + std::string( t->line( k + 1 ) );
+					if ( directive != "elif" ) {
+						Branch b = evidenceAt( n ).value_or( evaluate( directive, cond, lookup ) );
+						stack.push_back( { b, b == Branch::Live, b == Branch::Unknown } );
+						continue;
+					}
 					if ( stack.empty() ) continue;
 					Level & top = stack.back();
-					if ( top.taken ) top.branch = Branch::Dead;
-					else if ( directive == "else" ) top.branch = top.branch == Branch::Dead ? Branch::Live : top.branch == Branch::Live ? Branch::Dead : Branch::Unknown;
-					else top.branch = evaluate( directive, rest );
+					if ( auto ev = evidenceAt( n ) ) top.branch = *ev;
+					else if ( top.taken ) top.branch = Branch::Dead;
+					else {
+						top.branch = evaluate( directive, cond, lookup );
+						if ( top.branch == Branch::Live && top.unsure ) top.branch = Branch::Unknown;
+					}
+					top.taken = top.taken || top.branch == Branch::Live;
+					top.unsure = top.unsure || top.branch == Branch::Unknown;
+					continue;
+				}
+				if ( directive == "else" ) {
+					if ( stack.empty() ) continue;
+					Level & top = stack.back();
+					if ( auto ev = evidenceAt( n ) ) top.branch = *ev;
+					else if ( top.taken ) top.branch = Branch::Dead;
+					else top.branch = top.unsure ? Branch::Unknown : Branch::Live;
 					top.taken = top.taken || top.branch == Branch::Live;
 					continue;
 				}
@@ -1411,6 +1820,7 @@ void Analysis::Impl::loadMacros() const {
 				bool define = directive == "define";
 				if ( !define && directive != "undef" ) continue;
 				if ( dead() ) continue;
+				size_t de = rest.data() - l.data();		// end of the directive name
 				size_t b = l.find_first_not_of( " \t", de );
 				if ( b == std::string_view::npos || b == de ) continue;
 				size_t e = b;
@@ -1420,9 +1830,11 @@ void Analysis::Impl::loadMacros() const {
 				if ( !define ) {
 					for ( size_t k : open[name] ) macros[name][k].undefLine = n;
 					open.erase( name );
+					undefined.insert( name );
 					continue;
 				}
-				std::string body( l.substr( l.find( '#' ) ) );
+				undefined.erase( name );
+				std::string body( l.substr( first ) );
 				for ( int k = n; k + 1 < t->lineCount() && !t->line( k ).empty() && t->line( k ).back() == '\\'; k += 1 ) {
 					if ( k - n == 20 ) { body += "\n..."; break; }
 					body += "\n" + std::string( t->line( k + 1 ) );
@@ -1431,6 +1843,12 @@ void Analysis::Impl::loadMacros() const {
 				open[name].push_back( list.size() );
 				list.push_back( { f, { { n, int( b ) }, { n, int( e ) } }, std::move( body ), -1, e < l.size() && l[e] == '(' } );
 			}
+		}
+		// Same file and project macros first: macroNamed() takes the first
+		// one from another file.
+		for ( auto & entry : macros ) {
+			std::stable_sort( entry.second.begin(), entry.second.end(),
+							  [this]( const Macro & a, const Macro & b ) { return files[a.file].origin < files[b.file].origin; } );
 		}
 	} );
 }
@@ -1915,6 +2333,214 @@ std::vector<SemanticToken> Analysis::semanticTokens( const std::string & file ) 
 			if ( p.start.line == t.t.start.line && t.t.start.col < p.start.col + p.length ) continue;
 		}
 		out.push_back( t.t );
+	}
+	return out;
+}
+
+// -- highlights, inlay hints, rename -------------------------------------------
+
+namespace {
+
+bool isHeaderPath( const std::string & path ) {
+	for ( std::string_view ext : { ".hfa", ".h", ".ifa" } ) {
+		if ( path.size() > ext.size() && path.ends_with( ext ) ) return true;
+	}
+	return false;
+}
+
+// The return type in a signature from the dump: "forall( T ) T * biggest( T a, T b )" -> "T *". Empty if it
+// can't be found.
+std::string declaredReturnType( std::string_view sig, const std::string & name ) {
+	size_t b = 0;
+	while ( sig.substr( b ).starts_with( "forall" ) ) {
+		size_t i = sig.find( '(', b );
+		int depth = 0;
+		for ( ; i < sig.size(); i += 1 ) {
+			if ( sig[i] == '(' ) depth += 1;
+			else if ( sig[i] == ')' && --depth == 0 ) break;
+		}
+		if ( i >= sig.size() ) return {};
+		b = i + 1;
+		while ( b < sig.size() && sig[b] == ' ' ) b += 1;
+	}
+	size_t k = sig.find( " " + name + "(", b );
+	if ( k == std::string_view::npos ) return {};
+	return trimmed( sig.substr( b, k - b ) );
+}
+
+// Is `name` an identifier in `text`, outside string literals?
+bool mentions( std::string_view text, const std::string & name ) {
+	for ( const Token & t : lex( text ) ) {
+		if ( t.kind == TokKind::Identifier && t.text == name ) return true;
+	}
+	return false;
+}
+
+} // namespace
+
+std::vector<DocumentHighlight> Analysis::documentHighlights( const std::string & file, Loc pos ) const {
+	const Impl & m = *impl;
+	int fi = m.findFile( file );
+	if ( fi < 0 ) return {};
+	auto t = m.targetAt( fi, pos );
+	if ( t.decl < 0 ) return {};
+	std::vector<DocumentHighlight> out;
+	for ( int d : m.entityMembers[m.entity[t.decl]] ) {
+		const Decl & x = m.decls[d];
+		if ( x.file == fi && x.hasName && !x.generated ) out.push_back( { x.nameRange, 1 } );
+		for ( int r : m.refsOf[d] ) {
+			if ( m.refs[r].file == fi ) out.push_back( { m.refs[r].range, 2 } );
+		}
+	}
+	std::sort( out.begin(), out.end(), []( const DocumentHighlight & a, const DocumentHighlight & b ) {
+		return a.range.start != b.range.start ? a.range.start < b.range.start : a.kind < b.kind;
+	} );
+	out.erase( std::unique( out.begin(), out.end(),
+							[]( const DocumentHighlight & a, const DocumentHighlight & b ) { return a.range == b.range; } ),
+			   out.end() );
+	return out;
+}
+
+std::vector<InlayHint> Analysis::inlayHints( const std::string & file, Range range ) const {
+	const Impl & m = *impl;
+	int fi = m.findFile( file );
+	if ( fi < 0 ) return {};
+	auto ft = m.text( fi );
+	if ( !ft ) return {};
+	const File & f = m.files[fi];
+	auto inside = [&]( Loc p ) { return range.start <= p && p <= range.end; };
+	std::vector<InlayHint> out;
+	std::set<std::pair<Loc, std::string>> seen;
+	auto add = [&]( InlayHint h ) {
+		if ( seen.insert( { h.pos, h.label } ).second ) out.push_back( std::move( h ) );
+	};
+	for ( int r : f.refs ) {
+		const Ref & ref = m.refs[r];
+		if ( range.end < ref.range.start ) break;
+		if ( ref.role != Role::Call || ref.range.end.line + 64 < range.start.line ) continue;
+		const Decl & fn = m.decls[ref.decl];
+		if ( fn.kind != Kind::Function || !text::isIdentifier( fn.name ) || ft->slice( ref.range ) != fn.name ) continue;
+		auto call = text::callArguments( *ft, ref.range.end );
+		if ( !call || call->end < range.start ) continue;
+		Range span{ ref.range.start, call->end };
+
+		for ( size_t i = 0; i < call->args.size() && i < fn.params.size(); i += 1 ) {
+			const std::string & param = fn.params[i];
+			const Range & arg = call->args[i];
+			if ( param.empty() || param.starts_with( "__" ) || arg.start == arg.end || !inside( arg.start ) ) continue;
+			// Not when the argument already says it: f( x ), f( &x ), f( s.x ) for a parameter x.
+			std::string a = ft->slice( arg );
+			size_t k = std::min( a.find_first_not_of( "&* \t" ), a.size() );
+			auto chain = text::identChain( std::string_view( a ).substr( k ) );
+			if ( !chain.empty() && chain.back() == param ) continue;
+			add( { arg.start, param + ":", 2, span } );
+		}
+
+		// What a polymorphic call returns here, when that says more than the declaration.
+		if ( !fn.signature.starts_with( "forall" ) || !inside( call->end ) ) continue;
+		auto it = std::lower_bound( f.exprs.begin(), f.exprs.end(), ref.range.start,
+									[&m]( int e, Loc p ) { return m.exprs[e].range.start < p; } );
+		int best = -1;
+		for ( ; it != f.exprs.end() && m.exprs[*it].range.start == ref.range.start; ++it ) {
+			const Range & er = m.exprs[*it].range;
+			if ( er.end <= ref.range.end || call->end < er.end ) continue;
+			if ( best < 0 || m.exprs[best].range.end < er.end ) best = *it;
+		}
+		if ( best < 0 ) continue;
+		const std::string & type = m.exprs[best].type;
+		if ( type.empty() || type == "void" || stripSpaces( type ) == stripSpaces( declaredReturnType( fn.signature, fn.name ) ) ) continue;
+		add( { call->end, ": " + type, 1, span } );
+	}
+	std::stable_sort( out.begin(), out.end(), []( const InlayHint & a, const InlayHint & b ) { return a.pos < b.pos; } );
+	return out;
+}
+
+std::optional<RenamePlan> Analysis::rename( const std::string & file, Loc pos ) const {
+	const Impl & m = *impl;
+	int fi = m.findFile( file );
+	if ( fi < 0 ) return std::nullopt;
+	auto t = m.targetAt( fi, pos );
+	if ( t.decl < 0 ) return std::nullopt;
+	const Decl & x = m.decls[t.decl];
+	RenamePlan plan;
+	plan.name = x.name;
+	plan.range = t.range;
+	const std::string quoted = "`" + x.name + "`";
+	auto refuse = [&]( const std::string & why ) {
+		plan.error = why;
+		plan.sites.clear();
+		return plan;
+	};
+	if ( !text::isIdentifier( x.name ) ) return refuse( quoted + " is not an identifier; only identifiers can be renamed" );
+	for ( int d : m.entityMembers[m.entity[t.decl]] ) {
+		if ( m.decls[d].generated || m.decls[d].file == fi ) continue;
+		std::string w = m.where( d, file );
+		return refuse( quoted + " is declared in " + ( w.empty() ? std::string( "another file" ) : "`" + w + "`" ) +
+					   "; renaming across files is not supported yet" );
+	}
+	if ( isHeaderPath( file ) && !x.local ) {
+		return refuse( quoted + " is declared in a header, and the files that include it are not known; "
+					   "only local names can be renamed in a header" );
+	}
+	auto ft = m.text( fi );
+	for ( const Location & l : m.entityReferences( t.decl, true ) ) {
+		if ( l.file != file ) return refuse( quoted + " is used in another file; renaming across files is not supported yet" );
+		if ( ft && ft->slice( l.range ) != x.name ) return refuse( "an occurrence of " + quoted + " does not spell its name; rename it by hand" );
+		plan.sites.push_back( l.range );
+	}
+	// Uses inside macro bodies have no refs; don't leave them behind.
+	m.loadMacros();
+	for ( const auto & [name, list] : m.macros ) {
+		for ( const Impl::Macro & mac : list ) {
+			if ( mac.file != fi ) continue;
+			std::string_view body( mac.text );
+			size_t k = body.find( "define" );
+			if ( k != std::string_view::npos ) k = body.find( name, k + 6 );
+			if ( k == std::string_view::npos ) continue;
+			body.remove_prefix( k + name.size() );
+			if ( mac.function ) {
+				// A parameter of the same name is not a use.
+				size_t close = body.find( ')' );
+				if ( close == std::string_view::npos ) continue;
+				if ( mentions( body.substr( 0, close ), x.name ) ) continue;
+				body.remove_prefix( close + 1 );
+			}
+			if ( mentions( body, x.name ) ) {
+				return refuse( quoted + " is used in the macro `" + name + "` on line " + std::to_string( mac.name.start.line + 1 ) +
+							   ", which the translator doesn't see; rename it by hand" );
+			}
+		}
+	}
+	// The dump has no refs in array dimensions, designators, dead #if
+	// branches or functions that failed to resolve. A spelling of the name
+	// that is neither a site nor the ref or name of another declaration may be
+	// one of those, and renaming would leave it behind.
+	std::optional<std::string> source;
+	if ( m.read ) source = m.read( m.files[fi].path );
+	if ( source ) {
+		std::set<Loc> known;
+		for ( const Range & r : plan.sites ) known.insert( r.start );
+		for ( int r : m.files[fi].refs ) known.insert( m.refs[r].range.start );
+		for ( int n : m.files[fi].names ) known.insert( m.decls[n].nameRange.start );
+		for ( const Token & tok : lex( *source ) ) {
+			if ( tok.kind != TokKind::Identifier || tok.text != x.name || known.count( Loc{ tok.line, tok.col } ) ) continue;
+			return refuse( quoted + " appears on line " + std::to_string( tok.line + 1 ) +
+						   " where the translator recorded no use (an array dimension, a designator, dead code "
+						   "or code that failed to resolve); rename it by hand" );
+		}
+	}
+	return plan;
+}
+
+bool Analysis::isKeyword( std::string_view word ) {
+	const auto & words = keywords();
+	return std::find( words.begin(), words.end(), word ) != words.end();
+}
+
+std::vector<std::string> Analysis::projectFiles() const {
+	std::vector<std::string> out;
+	for ( const File & f : impl->files ) {
+		if ( ( f.origin == Origin::Focus || f.origin == Origin::Project ) && !f.names.empty() ) out.push_back( f.path );
 	}
 	return out;
 }

@@ -82,6 +82,39 @@ jobs:
           key: ccache-${{ hashFiles('.gitmodules') }}-${{ github.sha }}
           restore-keys: ccache-
 
+      # Regenerates the bison and flex output, so a grammar change committed
+      # without it fails here instead of building with the old parser.
+      # Ubuntu's flex numbers the #line directives that point into lex.cc
+      # itself one higher than the flex that wrote the committed file; they
+      # only matter when debugging the generated code, so they're ignored.
+      # The committed files are restored afterwards for the last step's check.
+      - name: Check the parser matches the grammar
+        run: |
+          make parser
+          git -C cforall diff --exit-code -I '^#line [0-9][0-9]* "Parser/lex\.cc"$' -- src/Parser
+          git -C cforall checkout -- src/Parser
+
+      # make must regenerate lex.cc after an edit to lex.ll, whether or not the
+      # edit has been committed. The submodule is put back afterwards.
+      - name: Check make regenerates the parser after a grammar edit
+        run: |
+          head=$(git -C cforall rev-parse HEAD)
+          lex=cforall/src/Parser/lex.cc
+          echo '// uncommitted grammar edit' >> cforall/src/Parser/lex.ll
+          touch -d '1 minute ago' "$lex"
+          make "$lex"
+          grep -qF 'uncommitted grammar edit' "$lex"
+          git -C cforall checkout -- src/Parser
+          echo '// committed grammar edit' >> cforall/src/Parser/lex.ll
+          git -C cforall -c user.name=ci -c user.email=ci@localhost commit -qm 'Edit the grammar' src/Parser/lex.ll
+          touch -d '1 minute ago' "$lex"
+          make "$lex"
+          grep -qF 'committed grammar edit' "$lex"
+          git -C cforall reset -q --hard "$head"
+
+      # The build must not need bison or flex when the grammar output only
+      # looks stale, as it can on a fresh clone. Backdating the output and
+      # removing both tools checks that, configure included.
       - name: Build
         env:
           CXX: ccache g++
@@ -89,6 +122,9 @@ jobs:
           CCACHE_MAXSIZE: 2G
           CCACHE_BASEDIR: ${{ github.workspace }}
         run: |
+          sudo apt-get remove -yq bison flex
+          if command -v bison || command -v flex; then echo 'bison or flex is still installed'; exit 1; fi
+          touch -d '1 hour ago' cforall/src/Parser/parser.cc cforall/src/Parser/parser.hh cforall/src/Parser/lex.cc
           ccache -z
           make -j"$(nproc)" TRANSLATOR_JOBS="$(nproc)" server translator
           ccache -s
@@ -99,6 +135,23 @@ jobs:
           CCACHE_DIR: /home/runner/.cache/ccache
           CCACHE_BASEDIR: ${{ github.workspace }}
         run: make -j"$(nproc)" test
+
+      # clangd needs entries for the translator sources too. Check there is
+      # one for each, and that the flags in one compile it.
+      - name: Check compile_commands.json
+        env:
+          CCACHE_DIR: /home/runner/.cache/ccache
+        run: |
+          make compile_commands.json
+          jq -e 'length > 0' compile_commands.json > /dev/null
+          for f in $(git -C cforall ls-files 'src/*.cpp' 'src/**/*.cpp' | sed 's|^|cforall/|'); do
+            jq -e --arg f "$PWD/$f" 'any(.[]; .file == $f)' compile_commands.json > /dev/null \
+              || { echo "no entry for $f"; missing=1; }
+          done
+          [ -z "$missing" ]
+          entry=$(jq -c --arg f "$PWD/cforall/src/LSP/Lsp.cpp" '.[] | select(.file == $f)' compile_commands.json)
+          cd "$(jq -r .directory <<<"$entry")"
+          eval "$(jq -r .command <<<"$entry") -fsyntax-only"
 
       - name: Save ccache
         if: always() && steps.ccache.outcome == 'success'

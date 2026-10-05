@@ -56,6 +56,65 @@ TEST_CASE( "real cfa: preprocessor errors land on the real file" ) {
 	CHECK( fr.diags[0].message.find( "missing.hfa" ) != std::string::npos );
 }
 
+TEST_CASE( "real cfa: the file's directory is searched for quoted includes only" ) {
+	std::string fake = envOr( "CFA_LSP_FAKE_CFA" );
+	if ( findInPath( "cfa" ).empty() || ! executable( fake ) ) {
+		MESSAGE( "needs cfa on PATH and CFA_LSP_FAKE_CFA; skipping" );
+		return;
+	}
+	ToolchainOptions o;
+	o.translator = fake;						// only the cpp stage matters here
+	Checker ch( discoverToolchain( o ) );
+	TempDir proj;
+	std::string main = proj.path() + "/main.cfa";
+	// A project header with the name of a libcfa header.
+	std::ofstream( proj.path() + "/string.hfa" ) << "#error the project's string.hfa\n";
+	fs::create_directories( proj.path() + "/inc" );
+	std::ofstream( proj.path() + "/inc/only_here.hfa" ) << "int only_here;\n";
+	auto cppErrors = [&]( const CheckRequest & req ) {
+		std::string out;
+		for ( const auto & d : ch.front( req, CancelToken() ).diags ) {
+			if ( d.source == "cpp" && d.severity == 1 ) out += d.message + "\n";
+		}
+		return out;
+	};
+
+	// <string.hfa> is libcfa's.
+	CHECK( cppErrors( requestFor( main, "#include <string.hfa>\nint main() {}\n" ) ) == "" );
+	// "string.hfa" is the one next to the file.
+	CHECK( cppErrors( requestFor( main, "#include \"string.hfa\"\nint main() {}\n" ) ).find( "the project's string.hfa" ) != std::string::npos );
+	// -iquote from the flags goes through the cfa driver too.
+	CheckRequest req = requestFor( main, "#include \"only_here.hfa\"\nint main() { return only_here; }\n" );
+	CHECK( cppErrors( req ).find( "only_here.hfa" ) != std::string::npos );
+	req.flags = { "-iquote", "inc" };
+	CHECK( cppErrors( req ) == "" );
+}
+
+TEST_CASE( "real cfa and translator: an error in a system header goes on the header" ) {
+	std::string translator = envOr( "CFA_LSP_TRANSLATOR" );
+	if ( findInPath( "cfa" ).empty() || ! executable( translator ) ) {
+		MESSAGE( "needs cfa and CFA_LSP_TRANSLATOR; skipping" );
+		return;
+	}
+	ToolchainOptions o;
+	o.translator = translator;
+	Checker ch( discoverToolchain( o ) );
+	TempDir proj;
+	std::string main = proj.path() + "/main.cfa";
+	// stdio.h declares `typedef struct _IO_FILE FILE;`, which this breaks.
+	CheckRequest req = requestFor( main, "#define FILE 1\n#include <stdio.h>\nint main() {}\n" );
+	req.backend = false;
+	FrontResult fr = ch.front( req, CancelToken() );
+	bool onHeader = false, summary = false;
+	for ( const auto & d : fr.diags ) {
+		INFO( d.file << ":" << d.range.start.line << ": " << d.message );
+		if ( d.file.starts_with( "/usr/include/" ) && d.severity == 1 ) onHeader = true;
+		if ( d.file == main && d.range.start.line == 1 && d.message.find( "in included file" ) != std::string::npos ) summary = true;
+	}
+	CHECK( onHeader );
+	CHECK( summary );
+}
+
 TEST_CASE( "real cfa without the translator: falls back to compiling" ) {
 	if ( findInPath( "cfa" ).empty() ) {
 		MESSAGE( "needs cfa on PATH; skipping" );

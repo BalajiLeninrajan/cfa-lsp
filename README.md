@@ -21,6 +21,13 @@ Features:
   after `.` and `->`
 - signature help
 - semantic tokens
+- document highlight
+- inlay hints: parameter names at call sites, and the type a call of a
+  `forall` function returns when it differs from the declared return type
+- rename within one file
+- workspace symbols from the open documents and the project headers they
+  include
+- clangd's `textDocument/switchSourceHeader`, between `x.cfa` and `x.hfa`
 
 It runs on Linux and needs an installed CFA 1.0.0 (`cfa` on `PATH`). The
 translator fork is based on the same version (upstream commit `fade1b55`).
@@ -37,7 +44,9 @@ The first `make` configures and builds the translator in `build/cforall`,
 which takes about 13 minutes at `-j8`. Later builds only recompile what
 changed. You need g++ with C++20 support and the usual autotools build
 dependencies of Cforall. bison and flex are only needed if you edit
-`cforall/src/Parser/parser.yy` or `lex.ll`.
+`cforall/src/Parser/parser.yy` or `lex.ll`. The submodule tracks their
+output, and `make` regenerates it in place when git shows the grammar changed
+after it, committed or not. `make parser` regenerates it unconditionally.
 
 `make install` puts the server in `$PREFIX/bin/cfa-lsp` and the translator in
 `$PREFIX/libexec/cfa-lsp/cfa-cpp`, both stripped. `make uninstall` removes
@@ -56,6 +65,20 @@ vim.lsp.config( 'cfa_lsp', {
   root_markers = { 'cfa_flags.txt', '.git' },
 } )
 vim.lsp.enable( 'cfa_lsp' )
+```
+
+Inlay hints are off by default in Neovim; `vim.lsp.inlay_hint.enable()` turns
+them on. Switching between a source file and its header is a clangd extension,
+so it needs a command of its own:
+
+```lua
+vim.api.nvim_create_user_command( 'CfaSwitch', function()
+  local client = vim.lsp.get_clients( { bufnr = 0, name = 'cfa_lsp' } )[1]
+  if not client then return end
+  client:request( 'textDocument/switchSourceHeader', { uri = vim.uri_from_bufnr( 0 ) }, function( _, uri )
+    if uri then vim.cmd.edit( vim.uri_to_fname( uri ) ) end
+  end, 0 )
+end, {} )
 ```
 
 Any client that can start a stdio server for `.cfa` and `.hfa` files works
@@ -81,8 +104,9 @@ The flags are split between the stages the way the `cfa` driver splits them:
 `-D`, `-U`, `-I` and friends go to the preprocessor, `-Wall`, `-Werror`, `-w`
 and CFA's own warning names (`-Wself-assign`, ...) to the translator, and the
 rest of the warnings and `-f`, `-O`, `-std` options to gcc. `-iquote DIR` is
-passed as `-I DIR`, because the `cfa` driver mistakes the directory for an
-input file.
+passed to `cfa -E` as `-Wp,-iquoteDIR`, because the `cfa` driver mistakes the
+directory in `-iquote DIR` for an input file. A directory with a comma in its
+name can't go through `-Wp,`, so it is passed as `-I DIR` instead.
 
 ### initializationOptions
 
@@ -96,10 +120,29 @@ All optional.
 | `flags` | from `cfa_flags.txt` | Flags as an array, or a string in `cfa_flags.txt` format. Overrides the file. |
 | `backend` | `true` | Run gcc `-fsyntax-only` on the generated C for gcc's warnings. |
 | `cc` | `gcc` | The C compiler for the backend check. |
+| `stopAfterResolve` | `false` | Stop the translator after `Resolve`. Checks take 40 to 45% less time, but you lose the warnings and errors of the later passes and gcc's warnings (see below). |
 | `debounceMs` | `500` | Wait after the last edit before checking. |
 | `timeoutMs` | `120000` | Limit for each child process. |
 
-The server reads these once, at startup.
+The same options can be changed while the server runs, through
+`workspace/didChangeConfiguration`. Settings under a `cfa-lsp` key (or the
+whole settings object, if it has no such key) override `initializationOptions`
+one key at a time, and a `null` value goes back to the
+`initializationOptions` value. Clients that use `workspace/configuration`
+are asked for the `cfa-lsp` section at startup and after each change. A
+change re-checks every open file. In Neovim:
+
+```lua
+vim.lsp.config( 'cfa_lsp', { settings = { ['cfa-lsp'] = { backend = false } } } )
+```
+
+With `stopAfterResolve`, the translator skips `Fix Init` and the passes after
+it. Their checks are the ones you lose: the self-assignment warning, jumps
+past an initialization, fields used before they are constructed or never
+constructed, `waitfor` without `monitor.hfa`, a second `main`, bad virtual
+casts, the rvalue to reference conversion warning and unbound type variables
+in `Box`. No C is generated, so `backend` has no effect.
+`docs/dump-format.md` has the details.
 
 ### Logging
 
@@ -113,8 +156,10 @@ the buffer:
 
 1. It writes the buffer to a temporary file that starts with
    `# 1 "/real/path.cfa"`, so every location in the output names the real
-   file, and runs `cfa -E` on it with the user's flags plus `-I` for the real
-   file's directory.
+   file, and runs `cfa -E` on it with the user's flags. The real file's
+   directory is added as a quote directory (`-iquote`, see above), so
+   `#include "x.hfa"` finds the file next to it and a project header named
+   like a libcfa header doesn't hide that one from `#include <x.hfa>`.
 2. It runs the forked translator: `cfa-cpp --lsp out.json --lsp-focus
    /real/path.cfa [--lsp-c-out out.c] ... in.i`. The translator runs its
    passes as usual, records errors instead of stopping at the first one, and
@@ -122,15 +167,41 @@ the buffer:
    expression types and scopes to `out.json`. `docs/dump-format.md` describes
    the format.
 3. The server loads the JSON (`src/analysis`) and publishes diagnostics.
-4. If the translator reported no errors, it runs gcc `-fsyntax-only` on the
-   generated C and adds gcc's warnings, mapped back to source lines through
-   the line markers.
+   An error in an included file goes on that file, and a summary goes on the
+   `#include` line of the main file that leads to it. In libcfa and system
+   headers only errors are published, not warnings.
+4. If the translator wrote C, it runs gcc `-fsyntax-only` on it and adds
+   gcc's warnings, mapped back to source lines through the line markers.
+   Errors that stop translation also stop code generation, so then the
+   warnings of the last gcc run stay, except the ones on lines edited since.
+   When the translator reported errors but still wrote C (errors from the
+   passes that only check the program), gcc's errors are left out: they are
+   about code the translator already rejected.
 
-Requests are answered right away from the last good result. When a check
-fails to parse the file, the previous result stays in use, so completion
-after `x.` keeps working while a line is half typed. Edits made since that
-result are tracked, and positions are mapped through them in both
-directions.
+Requests are answered right away from the last good result, in the order
+they arrive. A request cancelled with `$/cancelRequest` before its turn comes
+gets the `RequestCancelled` error instead of an answer. When a check fails to
+parse the file, the previous result stays in use, so completion after `x.`
+keeps working while a line is half typed. Edits made since that result are
+tracked, and positions are mapped through them in both directions.
+
+Macros never reach the translator, so hover and definition on a macro read
+the `#define` lines of the files in the translation unit. A definition in a
+branch of `#if` that cpp dropped doesn't count. The server tells which branch
+cpp kept from its output: a branch with code that left no line in it was
+dropped. A branch with only directives in it is decided by evaluating the
+condition with the macros defined so far, and counts as kept when the
+condition depends on something the source doesn't show, such as a compiler
+macro or a `-D` flag.
+
+An edit does not cancel the check in flight. It finishes and publishes its
+diagnostics, mapped through the edits made since it started, and the next
+check starts after it. Otherwise, while you type with pauses a little longer
+than `debounceMs`, every check would be cancelled before it finished and the
+diagnostics would never update. The exception is a check that has already
+run more than twice as long as the file's last one, which is likely stuck on
+something the edit may have fixed; an edit cancels that one. Closing the file
+also cancels its check.
 
 ### Columns
 
@@ -139,26 +210,44 @@ translator's columns are offsets into the preprocessed line, not the line in
 your file. Line numbers are right, thanks to the line markers. The server
 tokenizes both lines and aligns the tokens to map each column back. Tokens
 produced by a macro map to the whole macro invocation, and a macro argument
-maps to where it is written. The alignment is a heuristic, and it can pick
-the wrong spot in a few cases:
+maps to where it is written.
 
-- a system-header macro such as `assert` or `isdigit` makes cpp split the line
-  into pieces that share one line number;
-- a header included twice uses the mapping of its first inclusion;
-- a `#line` directive in your source breaks the line correspondence.
+The translator also gives each position's line in the preprocessed text. When
+a system-header macro such as `assert` or `isdigit` makes cpp split a line
+into pieces that share one line number, that line says which piece a column
+is in, and for a header included twice it says which copy. A `#line`
+directive in your file changes the line numbers in the markers; the server
+reads the file's directives to get the real lines back.
+
+To tell an identifier in a macro's body from the same name passed as an
+argument (`tmp` in `SWAP( x, tmp )` when the body declares its own `tmp`),
+the server redoes the expansion from the `#define`. That works for a macro
+defined in the same file or in a header the file includes directly, whose
+arguments and body use no other macros, and whose body has no `#` or `##`.
+For other macros, such an identifier maps to the argument.
 
 ## Limits
 
 - A check takes as long as compiling the file: about 3 seconds for a small
   program that includes `fstream.hfa`, 5 seconds with `string.hfa`. Almost
   all of it is the translator, and half of that is the resolver.
+  `stopAfterResolve` cuts 40 to 45% of it. Most of the rest is re-parsing and
+  re-resolving the prelude and the libcfa headers on every check;
+  `docs/persistent-translator.md` describes how a long-running translator
+  could avoid that.
 - Each file is checked on its own. Open headers are checked as if they were
   the main file. Saving a header re-checks the open files; nothing else
   tracks dependencies between files.
-- Uses inside macro bodies have no references, and code the translator
-  generates (for example the bodies of `corun`) is not walked.
-- Array dimensions in declarations, postfix calls (`` x`f ``) and labels are
-  not references.
+- Uses inside macro bodies have no references. Inside a `cofor` body, uses of
+  the loop variable have none either: they name the copy the translator makes
+  in the function it generates for the body.
+- Rename works within one file. It refuses a name declared in another file
+  (a header, libcfa), a global or a field declared in a header (the files that
+  include it aren't known), operators, and names used in a macro of the file.
+  It also refuses when the name is spelled somewhere the dump has no reference
+  for, such as a designator, an array dimension in a typedef, cast or
+  `sizeof`, an `#if 0` block or a function that failed to resolve. It does not
+  check whether the new name clashes with another one in scope.
 - Completion does not know about type-only contexts, `inline` member
   embedding or qualified enumerators (`Colour.Red`). libcfa names containing
   `$` are hidden unless the prefix has a `$`.
@@ -167,18 +256,17 @@ the wrong spot in a few cases:
 - If the translator fails an internal assertion or crashes, the check reports
   `internal translator error` on line 1, and unless the crash came after
   resolution the previous results stay in use.
-- `workspace/didChangeConfiguration` is not handled. Restart the server to
-  change options.
 
 ## Development
 
 ```
-src/server/      LSP transport, documents, the check pipeline (C++20)
-src/analysis/    dump loading, SourceMap (column mapping), queries
-cforall/         the CFA source, with the LSP dump in cforall/src/LSP
-docs/            the translator's JSON format
-tests/           doctest tests, one binary; fixtures in tests/fixtures
-translator.mk    builds the translator
+src/server/          LSP transport, documents, the check pipeline (C++20)
+src/analysis/        dump loading, SourceMap (column mapping), queries
+cforall/             the CFA source, with the LSP dump in cforall/src/LSP
+docs/                the translator's JSON format, design notes
+tests/               doctest tests, one binary; fixtures in tests/fixtures
+translator.mk        builds the translator
+compile-commands.mk  translator entries for compile_commands.json
 ```
 
 Build and test:
@@ -188,7 +276,14 @@ make -j8                  # server and translator
 make -j8 test             # every test
 make test ARGS='-ts=integration'
 make BUILD=build/mine test   # a separate object directory
+make compile_commands.json   # for clangd
 ```
+
+`compile_commands.json` covers the server, the analysis code and the tests,
+and the translator sources in `cforall/src` once `make translator` has
+configured `build/cforall`. The translator entries use the compile command
+from that configured build. Run it again after the first `make translator`
+to pick them up.
 
 `make test` builds the server and the test binary, then runs everything.
 Tests that need `cfa` or the translator skip themselves when those are

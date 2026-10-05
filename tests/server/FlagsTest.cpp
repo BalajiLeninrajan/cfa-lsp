@@ -39,12 +39,15 @@ TEST_CASE( "flags are split by stage like the cfa driver does" ) {
 								 "-std=gnu17", "-O2", "-fno-common", "-g", "-c", "-o", "out.o", "main.cfa", "-nodebug",
 								 "-m32", "-lm", "-Wl,--as-needed", "-fdiagnostics-color=always" },
 							   "/proj" );
-	CHECK( contains( f.cpp, { "-DX=1", "-D", "Y", "-UZ", "-I", "/proj/inc", "-I", "/abs", "-I", "/proj/q", "-isystem",
+	CHECK( contains( f.cpp, { "-DX=1", "-D", "Y", "-UZ", "-I", "/proj/inc", "-I", "/abs", "-Wp,-iquote/proj/q", "-isystem",
 							  "/proj/sys", "-include", "/proj/pre.h" } ) );
 	CHECK( contains( f.cpp, { "-std=gnu17" } ) );
 	CHECK( contains( f.cpp, { "-nodebug" } ) );
 	CHECK( contains( f.cpp, { "-m32" } ) );
 	CHECK( std::find( f.cpp.begin(), f.cpp.end(), "-iquote" ) == f.cpp.end() );
+	CHECK( classifyFlags( { "-iquoteq" }, "/proj" ).cpp == V{ "-Wp,-iquote/proj/q" } );
+	// -Wp, would split the directory at the comma.
+	CHECK( classifyFlags( { "-iquote", "a,b" }, "/proj" ).cpp == V{ "-I", "/proj/a,b" } );
 	CHECK( std::find( f.cpp.begin(), f.cpp.end(), "main.cfa" ) == f.cpp.end() );
 	CHECK( std::find( f.cpp.begin(), f.cpp.end(), "out.o" ) == f.cpp.end() );
 	CHECK( f.translator == V{ "-Wall", "-Werror", "-Wno-self-assign", "-Wself-assign" } );
@@ -69,8 +72,14 @@ TEST_CASE( "commands passed to each stage" ) {
 	CHECK( cpp.front() == "/opt/cfa/bin/cfa" );
 	CHECK( contains( cpp, { "-E" } ) );
 	CHECK( contains( cpp, { "-DN=3" } ) );
-	CHECK( contains( cpp, { "-I", "/home/u/proj", "/tmp/t/in.cfa" } ) );
+	// The file's directory is a quote directory, ahead of the user's flags.
+	auto quote = std::find( cpp.begin(), cpp.end(), "-Wp,-iquote/home/u/proj" );
+	CHECK( quote < std::find( cpp.begin(), cpp.end(), "-DN=3" ) );
+	CHECK( std::find( cpp.begin(), cpp.end(), "-I" ) == cpp.end() );
 	CHECK( cpp.back() == "/tmp/t/in.cfa" );
+	req.path = "/home/u/a,b/main.cfa";
+	CHECK( contains( ch.cppCommand( req, f, "/tmp/t/in.cfa" ), { "-I", "/home/u/a,b" } ) );
+	req.path = "/home/u/proj/main.cfa";
 
 	V tr = ch.translatorCommand( req, f, "/tmp/t/in.i", "/tmp/t/out.json", "/tmp/t/out.c" );
 	CHECK( tr == V{ "/x/cfa-cpp", "--lsp", "/tmp/t/out.json", "--lsp-focus", "/home/u/proj/main.cfa", "--lsp-c-out",

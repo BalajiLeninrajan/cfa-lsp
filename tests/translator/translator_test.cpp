@@ -101,6 +101,7 @@ const Tools & tools() {
 struct Run {
 	std::string file;									// the fixture, absolute
 	std::vector<std::string> lines;						// its original text, 1-based via line()
+	std::vector<std::string> input;						// the preprocessed text the translator read
 	json dump;
 	int status = -1;
 	std::string c;										// generated C, with --lsp-c-out
@@ -123,15 +124,16 @@ struct Run {
 	}
 };
 
-// Runs each fixture once (per withC). withC adds --lsp-c-out and keeps the generated C in Run::c.
-const Run * run( const std::string & name, bool withC = false ) {
+// Runs each fixture once (per withC and stop). withC adds --lsp-c-out and keeps the generated C in Run::c; stop adds
+// --lsp-stop-after-resolve.
+const Run * run( const std::string & name, bool withC = false, bool stop = false ) {
 	static std::map<std::string, Run> runs;
 	const Tools & t = tools();
 	if ( ! t.skip.empty() ) {
 		MESSAGE( "skipping: " << t.skip );
 		return nullptr;
 	}
-	std::string key = name + ( withC ? ":c" : "" );
+	std::string key = name + ( withC ? ":c" : "" ) + ( stop ? ":stop" : "" );
 	auto found = runs.find( key );
 	if ( found != runs.end() ) return &found->second;
 
@@ -149,17 +151,20 @@ const Run * run( const std::string & name, bool withC = false ) {
 
 	std::string pre = t.cfa + " -E " + quote( r.file ) + " > " + quote( ( work / "in.i" ).string() ) + " 2> " + quote( ( work / "cpp.err" ).string() );
 	REQUIRE_MESSAGE( std::system( pre.c_str() ) == 0, "cfa -E failed: " << readFile( work / "cpp.err" ) );
+	std::stringstream input( readFile( work / "in.i" ) );
+	for ( std::string l; std::getline( input, l ); ) r.input.push_back( l );
 
 	std::string cmd = quote( t.translator ) + " --prelude-dir=" + quote( t.prelude )
 		+ " --lsp " + quote( ( work / "out.json" ).string() ) + " --lsp-focus " + quote( r.file )
 		+ ( withC ? " --lsp-c-out " + quote( ( work / "out.c" ).string() ) : std::string() )
+		+ ( stop ? " --lsp-stop-after-resolve" : "" )
 		+ " " + quote( ( work / "in.i" ).string() ) + " > " + quote( ( work / "translator.err" ).string() ) + " 2>&1";
 	int rc = std::system( cmd.c_str() );
 	r.status = WIFEXITED( rc ) ? WEXITSTATUS( rc ) : -1;
 	INFO( readFile( work / "translator.err" ) );
 	REQUIRE( r.status == 0 );
 	r.dump = json::parse( readFile( work / "out.json" ) );
-	if ( withC ) r.c = readFile( work / "out.c" );
+	if ( withC && fs::exists( work / "out.c" ) ) r.c = readFile( work / "out.c" );
 	fs::remove_all( work );
 	return &runs.emplace( key, std::move( r ) ).first->second;
 }
@@ -193,6 +198,19 @@ const json * declAt( const Run & r, const std::string & name, int line ) {
 	return nullptr;
 }
 
+// The refs on a line of the fixture, with their targets, for failure messages.
+std::string refsOn( const Run & r, int line ) {
+	std::string out;
+	for ( const json & ref : r.dump["refs"] ) {
+		if ( ref["file"] != r.file || ref["line"] != line ) continue;
+		const json * d = declById( r, ref["decl"] );
+		out += "\n  " + std::to_string( ref["col"].get<int>() ) + "-" + std::to_string( ref["endCol"].get<int>() ) + " "
+			+ ref["role"].get<std::string>() + " -> " + ( d ? (*d)["name"].get<std::string>() + " at "
+			+ (*d)["file"].get<std::string>() + ":" + std::to_string( (*d)["nameRange"]["line"].get<int>() ) : "?" );
+	}
+	return out.empty() ? " none" : out;
+}
+
 // The reference at the nth `word` on `line` resolves to the declaration of `word` whose name is on `declLine`
 // (at the nth occurrence of the name there), with the given role.
 void expectRef( const Run & r, int line, const std::string & word, int declLine, const char * role = nullptr,
@@ -200,6 +218,7 @@ void expectRef( const Run & r, int line, const std::string & word, int declLine,
 	std::string name = declName.empty() ? word : declName;
 	int col = r.col( line, word, nth );
 	INFO( "ref " << word << " at " << line << ":" << col << ": " << r.line( line ) );
+	INFO( "refs on the line:" << refsOn( r, line ) );
 	REQUIRE( col >= 0 );
 	const json * ref = refAt( r, line, col );
 	REQUIRE( ref );
@@ -236,6 +255,16 @@ void checkInvariants( const Run & r ) {
 		CHECK( ref["file"] == r.file );
 		std::string role = ref["role"];
 		CHECK( std::set<std::string>{ "read", "call", "member", "type", "with" }.count( role ) );
+		// A ref is a token the translator read, so it has its line in the input, and its columns are on that line.
+		INFO( "ref " << ref.dump() );
+		REQUIRE( ref.contains( "pline" ) );
+		CHECK( ref["endPline"] == ref["pline"] );
+		int pline = ref["pline"];
+		REQUIRE( pline >= 1 );
+		REQUIRE( pline <= (int)r.input.size() );
+		const std::string & text = r.input[pline - 1];
+		CHECK( ( text.empty() || text[0] != '#' ) );
+		CHECK( ref["endCol"].get<int>() <= (int)text.size() );
 	}
 	for ( const json & d : decls ) {
 		for ( const char * link : { "parent", "typeDecl" } ) {
@@ -550,10 +579,21 @@ TEST_CASE( "translator: macros and irregular spacing (lines only)" ) {
 	CHECK( positive );
 	CHECK( declAt( *r, "spaced", 11 ) );
 	CHECK( declAt( *r, "tabbed", 12 ) );
-	// cpp splits line 8 around the expansion of bool; the name is in the second piece.
+	// cpp splits line 8 around the expansion of bool; the name is in the second piece, and pline says which.
 	const json * p = declAt( *r, "positive", 8 );
 	REQUIRE( p );
 	CHECK_FALSE( (*p)["generated"].get<bool>() );
+	const json & name = (*p)["nameRange"];
+	REQUIRE( name.contains( "pline" ) );
+	int pline = name["pline"];
+	REQUIRE( pline >= 1 );
+	REQUIRE( pline <= (int)r->input.size() );
+	CHECK( r->input[pline - 1].substr( name["col"].get<int>(), 8 ) == "positive" );
+	CHECK( name["endPline"] == pline );
+	// The whole declaration starts on the first piece, with bool.
+	REQUIRE( p->contains( "pline" ) );
+	CHECK( (*p)["pline"].get<int>() < pline );
+	CHECK( (*p)["endPline"].get<int>() >= pline );
 }
 
 TEST_CASE( "translator: syntax error" ) {
@@ -832,6 +872,34 @@ TEST_CASE( "translator: an error after Resolve leaves the dump complete" ) {
 	expectRef( *r, 5, "w", 3, "member" );
 }
 
+TEST_CASE( "translator: --lsp-stop-after-resolve drops only the later passes' diagnostics" ) {
+	const Run * r = run( "check_error.cfa", false, true );
+	if ( ! r ) return;
+	checkInvariants( *r );
+	CHECK( r->dump["complete"] == true );
+	// Check Function Returns runs before Resolve; the self-assignment warning comes from Fix Init, after it.
+	CHECK( diagnosticOn( *r, 3, "error" ) );
+	CHECK_FALSE( diagnosticOn( *r, 8, "warning" ) );
+	const Run * full = run( "check_error.cfa" );
+	REQUIRE( full );
+	CHECK( r->dump["refs"] == full->dump["refs"] );
+	CHECK( r->dump["decls"] == full->dump["decls"] );
+
+	// Fix Init's construction check is skipped too, and no C is generated.
+	const Run * post = run( "post_error.cfa", true, true );
+	REQUIRE( post );
+	CHECK( post->dump["complete"] == true );
+	CHECK_FALSE( diagnosticOn( *post, 4, "error" ) );
+	CHECK( post->c.empty() );
+	expectRef( *post, 5, "w", 3, "member" );
+
+	// A Resolve error still ends the run with an incomplete dump.
+	const Run * type = run( "type_error.cfa", false, true );
+	REQUIRE( type );
+	CHECK( type->dump["complete"] == false );
+	CHECK( type->dump["diagnostics"] == run( "type_error.cfa" )->dump["diagnostics"] );
+}
+
 TEST_CASE( "translator: bytes that are not UTF-8 in messages don't break the dump" ) {
 	const Run * nbsp = run( "nbsp.cfa" );					// run() requires exit status 0 and parses the JSON
 	if ( ! nbsp ) return;
@@ -1000,4 +1068,121 @@ TEST_CASE( "translator: truncated and mutated fixtures always give a dump" ) {
 	MESSAGE( jobs.size() << " variants (" << skipped << " not preprocessed, " << failed << " failed) on "
 		<< threads << " threads in " << ms << " ms" );
 	CHECK( failed == 0 );
+}
+
+TEST_CASE( "translator: array parameters and dimensions" ) {
+	const Run * r = run( "coverage.cfa" );
+	if ( ! r ) return;
+	checkInvariants( *r );
+	INFO( "diagnostics: " << r->dump["diagnostics"].dump() );
+	CHECK( r->dump["complete"] == true );
+	// Array parameters show as written, not decayed to pointers.
+	const json * sum = declAt( *r, "sum", 11 );
+	REQUIRE( sum );
+	CHECK( (*sum)["signature"] == "int sum( int n, int a[], int b[N] )" );
+	const json * a = declAt( *r, "a", 11 );
+	REQUIRE( a );
+	CHECK( (*a)["kind"] == "parameter" );
+	CHECK( (*a)["type"] == "int []" );
+	CHECK( (*a)["signature"] == "int a[]" );
+	// Names in array dimensions are refs: globals, fields, locals and parameters.
+	expectRef( *r, 4, "N", 2, "read" );
+	expectRef( *r, 5, "M", 3, "read" );
+	expectRef( *r, 16, "M", 3, "read" );
+	expectRef( *r, 11, "N", 2, "read" );
+}
+
+TEST_CASE( "translator: labels" ) {
+	const Run * r = run( "coverage.cfa" );
+	if ( ! r ) return;
+	const json * done = declAt( *r, "done", 28 );
+	REQUIRE( done );
+	CHECK( (*done)["kind"] == "label" );
+	CHECK( (*done)["local"] == true );
+	CHECK( (*done)["nameRange"]["col"] == 0 );
+	CHECK( (*done)["nameRange"]["endCol"] == 4 );
+	const json * mainFn = declAt( *r, "main", 15 );
+	REQUIRE( mainFn );
+	CHECK( (*done)["parent"] == (*mainFn)["id"] );
+	REQUIRE( declAt( *r, "outer", 25 ) );
+	expectRef( *r, 23, "done", 28, "read" );			// goto before the label
+	expectRef( *r, 26, "outer", 25, "read" );			// break outer
+}
+
+TEST_CASE( "translator: type parameters in assertions and trait arguments" ) {
+	const Run * r = run( "coverage.cfa" );
+	if ( ! r ) return;
+	expectRef( *r, 12, "T", 12, "type", 1 );			// { int ?<?( T, T ); }
+	expectRef( *r, 12, "T", 12, "type", 2 );
+	expectRef( *r, 14, "S", 14, "type", 1 );			// Shape( S )
+	expectRef( *r, 14, "Shape", 13, "type" );
+	// The assertions copied from the trait are located in the trait, and are not refs to twice's S.
+	const json * s = declAt( *r, "S", 14 );
+	REQUIRE( s );
+	for ( const json & ref : r->dump["refs"] ) {
+		if ( ref["decl"] == (*s)["id"] ) CHECK_MESSAGE( ref["line"] == 14, ref.dump() );
+	}
+}
+
+TEST_CASE( "translator: subscript, call and constructor operators, and operators split across lines" ) {
+	const Run * r = run( "coverage.cfa" );
+	if ( ! r ) return;
+	expectRef( *r, 21, "[", 6, "call", 0, 0, "?[?]" );		// v[2]
+	expectRef( *r, 21, "(", 8, "call", 0, 0, "?()" );		// f( 3 )
+	expectRef( *r, 19, "{", 10, "call", 0, 0, "?{}" );		// Pt q = { 1, 2, 3 }
+	expectRef( *r, 20, "{", 10, "call", 0, 0, "?{}" );		// q{ 4, 5, 6 }
+	// The declarations of arrays are not subscripts.
+	CHECK_FALSE( refAt( *r, 16, r->col( 16, "[" ) ) );
+	CHECK_FALSE( refAt( *r, 4, r->col( 4, "[" ) ) );
+	// i = i
+	// + 1;
+	INFO( "refs on line 29:" << refsOn( *r, 29 ) );
+	const json * plus = refAt( *r, 29, 0 );
+	REQUIRE( plus );
+	CHECK( (*plus)["endCol"] == 1 );
+	const json * decl = declById( *r, (*plus)["decl"] );
+	REQUIRE( decl );
+	CHECK( (*decl)["name"] == "?+?" );
+}
+
+TEST_CASE( "translator: with and member access are told apart by the AST" ) {
+	const Run * r = run( "coverage.cfa" );
+	if ( ! r ) return;
+	expectRef( *r, 30, "x", 9, "with" );
+	// q. and y are more than 8 lines apart, so cpp drops the blank lines in between.
+	expectRef( *r, 42, "y", 9, "member" );
+}
+
+TEST_CASE( "translator: code that desugaring moves into a generated function has refs" ) {
+	const Run * r = run( "corun.cfa" );
+	if ( ! r ) return;
+	checkInvariants( *r );
+	INFO( "diagnostics: " << r->dump["diagnostics"].dump() );
+	CHECK( r->dump["complete"] == true );
+	expectRef( *r, 6, "bump", 3, "call" );
+	expectRef( *r, 6, "total", 5, "read" );
+	expectRef( *r, 6, "step", 6, "read", 1 );
+	expectRef( *r, 7, "bump", 3, "call" );
+	expectRef( *r, 7, "total", 5, "read" );
+	const json * step = declAt( *r, "step", 6 );
+	REQUIRE( step );
+	CHECK( (*step)["kind"] == "variable" );
+	CHECK( (*step)["local"] == true );
+	// The braces of corun are a scope holding its declarations.
+	const json * block = scopeAt( *r, 6, r->col( 6, "{" ) );
+	REQUIRE( block );
+	CHECK( scopeHas( *block, *step ) );
+	// The generated function is not dumped, and makes no scope at corun.
+	for ( const json & s : r->dump["scopes"] ) {
+		CHECK_MESSAGE( ! ( s["line"] == 7 ), s.dump() );
+		CHECK_MESSAGE( ! ( s["line"] == 6 && s["col"] == 0 ), s.dump() );
+		CHECK_MESSAGE( ! ( s["line"] == 8 && s["col"] == 0 ), s.dump() );
+	}
+	// cofor ( i; 3 ) { ... }
+	expectRef( *r, 8, "bump", 3, "call" );
+	expectRef( *r, 8, "total", 5, "read" );
+	// A known gap (see the README): in the body, i names the copy that cofor makes in its generated function,
+	// which is a generated declaration.
+	INFO( "refs on line 8:" << refsOn( *r, 8 ) );
+	CHECK_FALSE( refAt( *r, 8, r->col( 8, "i", 1 ) ) );
 }

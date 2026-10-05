@@ -55,15 +55,17 @@ struct CheckRequest {
 	std::vector<std::string> flags;			// the user's flags
 	std::string flagsBase;					// directory relative flag paths resolve against
 	bool backend = true;
+	bool stopAfterResolve = false;			// translator skips the passes after Resolve; no backend
 	std::chrono::milliseconds timeout{ 120000 };	// per child process
 };
 
 struct FrontResult {
 	enum Status { Ok, Cancelled, NoCfa, PreprocessFailed, TranslatorFailed, LoadFailed, Fallback } status = Ok;
-	std::vector<Diag> diags;				// main file and project headers only
+	std::vector<Diag> diags;
 	std::shared_ptr<const Analysis> analysis;
 	bool usable = false;					// analysis has declarations for the main file
-	bool backendReady = false;				// translator wrote C and reported no errors
+	bool backendReady = false;				// translator wrote C
+	bool translatorErrors = false;			// and reported errors, so back() keeps only gcc's warnings
 
 	// Kept for the backend stage.
 	std::shared_ptr<TempDir> tmp;
@@ -81,7 +83,8 @@ class Checker {
 	FrontResult front( const CheckRequest & req, const CancelToken & cancel ) const;
 
 	// gcc -fsyntax-only on the generated C. Only diagnostics in project
-	// files are returned, deduplicated, one whole line each.
+	// files are returned, deduplicated, one whole line each. Errors are
+	// dropped if the translator reported errors of its own.
 	std::vector<Diag> back( const CheckRequest & req, const FrontResult & fr, const CancelToken & cancel ) const;
 
 	// The commands, exposed for tests.

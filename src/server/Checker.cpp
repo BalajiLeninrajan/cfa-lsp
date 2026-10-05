@@ -146,6 +146,41 @@ std::optional<int> includeLineByName( const std::string & text, const std::strin
 	return std::nullopt;
 }
 
+// Where each file was included, with the temp input renamed to the real file.
+IncludeSites includeSites( const std::string & preprocessed, const std::string & tmpInput, const std::string & mainPath ) {
+	IncludeSites sites;
+	for ( auto & [file, site] : findIncludeSites( preprocessed ) ) {
+		std::string parent = normalize( site.first ) == normalize( tmpInput ) ? mainPath : normalize( site.first );
+		sites[normalize( file )] = { parent, site.second };
+	}
+	return sites;
+}
+
+// The main file's diagnostics, then for each other file a summary on the
+// main file's #include line and the file's own diagnostics. In libcfa and
+// system headers only errors are kept; names that aren't paths (<built-in>,
+// prelude.cfa) get only the summary.
+std::vector<Diag> withIncludeSummaries( std::vector<Diag> all, const std::string & mainPath, const IncludeSites & sites,
+										const Toolchain & tc ) {
+	std::vector<Diag> out;
+	std::map<std::string, std::vector<Diag>> elsewhere;
+	for ( auto & d : all ) {
+		if ( d.file == mainPath ) out.push_back( std::move( d ) );
+		else elsewhere[d.file].push_back( std::move( d ) );
+	}
+	for ( auto & [file, list] : elsewhere ) {
+		if ( auto s = includeSummary( file, list, mainPath, includeLineInMain( sites, file, mainPath ) ) ) {
+			out.push_back( std::move( *s ) );
+		}
+		bool system = tc.isSystemPath( file );
+		if ( system && ( file.empty() || file[0] != '/' ) ) continue;
+		for ( auto & d : list ) {
+			if ( ! system || d.severity == 1 ) out.push_back( std::move( d ) );
+		}
+	}
+	return out;
+}
+
 } // namespace
 
 static std::string tempBase() {
@@ -187,9 +222,13 @@ std::vector<Diag> diagsFromOutput( const std::string & output, const std::string
 								   const std::string & tmpInput, const std::string & cwd,
 								   const Toolchain & tc, const std::string & source ) {
 	std::vector<Diag> out;
+	bool lastKept = false;					// notes belong to the diagnostic before them
 	for ( const RawDiag & r : parseCompilerOutput( output ) ) {
 		// An open header is checked as the main file. gcc quotes the pragma: "'#pragma once' in main file".
-		if ( r.message.find( "#pragma once" ) != std::string::npos && r.message.find( "in main file" ) != std::string::npos ) continue;
+		if ( r.message.find( "#pragma once" ) != std::string::npos && r.message.find( "in main file" ) != std::string::npos ) {
+			lastKept = false;
+			continue;
+		}
 		std::string file = r.file;
 		if ( file.empty() ) file = realPath;
 		if ( ! file.empty() && file[0] != '/' && file[0] != '<' && ! cwd.empty() ) {
@@ -200,15 +239,19 @@ std::vector<Diag> diagsFromOutput( const std::string & output, const std::string
 		file = normalize( file );
 		if ( file == normalize( tmpInput ) ) file = realPath;
 		if ( r.severity == "note" ) {
-			if ( ! out.empty() && file[0] == '/' ) {
+			if ( lastKept && file[0] == '/' ) {
 				out.back().related.push_back( { file, { { r.line - 1, 0 }, { r.line - 1, 0 } }, r.message } );
 			}
 			continue;
 		}
-		if ( file != realPath && tc.isSystemPath( file ) ) continue;
+		lastKept = false;
+		int severity = severityOf( r.severity );
+		// In libcfa and system headers only errors are kept, for the header
+		// itself: the warnings there aren't the user's to fix.
+		if ( file != realPath && tc.isSystemPath( file ) && ( severity != 1 || file[0] != '/' ) ) continue;
 		Diag d;
 		d.file = file;
-		d.severity = severityOf( r.severity );
+		d.severity = severity;
 		d.message = r.message;
 		for ( const auto & l : r.detail ) d.message += "\n" + l;
 		d.source = source;
@@ -223,17 +266,20 @@ std::vector<Diag> diagsFromOutput( const std::string & output, const std::string
 			d.range = { { r.line - 1, r.col - 1 }, { r.line - 1, r.col - 1 } };
 		}
 		out.push_back( std::move( d ) );
+		lastKept = true;
 	}
 	return out;
 }
 
 std::vector<std::string> Checker::cppCommand( const CheckRequest & req, const FlagSet & flags, const std::string & in ) const {
 	std::vector<std::string> cmd = { tc.cfa, "-E", "-fdiagnostics-plain-output", "-fdiagnostics-column-unit=byte" };
+	// cpp looks for #include "x" in the directory of the file it reads, which
+	// is our temp directory. The real file's directory stands in for it, as a
+	// quote-only directory searched before the user's: with -I it would also
+	// be searched for <x>, and a project header named like a libcfa header
+	// would hide that one.
+	for ( const auto & f : quoteDirFlags( fs::path( req.path ).parent_path().string() ) ) cmd.push_back( f );
 	cmd.insert( cmd.end(), flags.cpp.begin(), flags.cpp.end() );
-	// Stands in for the quote-include search of the real file's directory
-	// (-iquote can't go through the cfa driver; see Flags.hpp).
-	cmd.push_back( "-I" );
-	cmd.push_back( fs::path( req.path ).parent_path().string() );
 	cmd.push_back( in );
 	return cmd;
 }
@@ -245,6 +291,7 @@ std::vector<std::string> Checker::translatorCommand( const CheckRequest & req, c
 	// variables (-Wall, -Werror, -w, CFA warnings, --prelude-dir, -L), and
 	// cc1.cc adds the input file and --colors.
 	std::vector<std::string> cmd = { tc.translator, "--lsp", json, "--lsp-focus", req.path };
+	if ( req.stopAfterResolve ) cmd.push_back( "--lsp-stop-after-resolve" );
 	if ( ! cOut.empty() ) {
 		cmd.push_back( "--lsp-c-out" );
 		cmd.push_back( cOut );
@@ -291,11 +338,12 @@ FrontResult Checker::fallback( const CheckRequest & req, const FlagSet & flags, 
 	fr.status = FrontResult::Fallback;
 	std::string cwd = fs::path( req.path ).parent_path().string();
 	std::vector<std::string> cmd = { tc.cfa, "-fdiagnostics-plain-output", "-fdiagnostics-column-unit=byte" };
+	for ( const auto & f : quoteDirFlags( cwd ) ) cmd.push_back( f );	// as in cppCommand
 	cmd.insert( cmd.end(), flags.cpp.begin(), flags.cpp.end() );
 	for ( const auto & f : flags.backend ) {
 		if ( f.rfind( "-W", 0 ) != 0 && f.rfind( "-std", 0 ) != 0 && f.rfind( "--std", 0 ) != 0 && f != "-w" ) cmd.push_back( f );
 	}
-	cmd.insert( cmd.end(), { "-I", cwd, "-c", in, "-o", "/dev/null" } );
+	cmd.insert( cmd.end(), { "-c", in, "-o", "/dev/null" } );
 	RunOptions o;
 	o.cwd = cwd;
 	o.stderrPath = tmp.path() + "/cfa.err";
@@ -469,7 +517,9 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 	std::vector<Diag> cppDiags = diagsFromOutput( cppErr, req.path, in, cwd, tc, "cpp" );
 	if ( ! r.ok() ) {
 		fr.status = FrontResult::PreprocessFailed;
-		fr.diags = cppDiags;
+		// cpp writes what it has so far, so the include sites up to the
+		// error are there.
+		fr.diags = withIncludeSummaries( cppDiags, req.path, includeSites( readFile( o.stdoutPath ).value_or( "" ), in, req.path ), tc );
 		bool anyError = false;
 		for ( const auto & d : cppDiags ) anyError = anyError || d.severity == 1;
 		if ( ! anyError ) {
@@ -484,7 +534,8 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 
 	// 2. Translate.
 	const std::string json = dir + "/out.json";
-	const std::string cOut = req.backend ? dir + "/out.c" : "";
+	// Code generation comes after the passes that stopAfterResolve skips.
+	const std::string cOut = req.backend && ! req.stopAfterResolve ? dir + "/out.c" : "";
 	RunOptions t;
 	t.cwd = cwd;
 	t.stdoutPath = dir + "/cfa-cpp.out";
@@ -555,11 +606,10 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 		}
 	}
 
-	// 4. Diagnostics: main file, project headers, and a summary on the
-	// #include line for errors in included files.
-	fr.diags = cppDiags;
+	// 4. Diagnostics: main file, other files, and a summary on the #include
+	// line for errors in included files.
+	std::vector<Diag> all = cppDiags;
 	bool anyError = false;
-	std::map<std::string, std::vector<Diag>> elsewhere;
 	for ( const Diagnostic & d : fr.analysis->diagnostics() ) {
 		Diag x;
 		std::string file = d.loc.file;
@@ -574,29 +624,16 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 		x.message = d.message;
 		x.source = d.source.empty() ? "cfa" : d.source;
 		if ( x.severity == 1 ) anyError = true;
-		if ( x.file == req.path ) {
-			fr.diags.push_back( std::move( x ) );
-		} else {
-			elsewhere[x.file].push_back( std::move( x ) );
-		}
+		all.push_back( std::move( x ) );
 	}
-	IncludeSites sites;
-	for ( auto & [file, site] : findIncludeSites( preprocessed ) ) {
-		std::string parent = normalize( site.first ) == normalize( in ) ? req.path : normalize( site.first );
-		sites[normalize( file )] = { parent, site.second };
-	}
-	for ( auto & [file, list] : elsewhere ) {
-		if ( auto s = includeSummary( file, list, req.path, includeLineInMain( sites, file, req.path ) ) ) {
-			fr.diags.push_back( std::move( *s ) );
-		}
-		if ( ! tc.isSystemPath( file ) ) {
-			for ( auto & d : list ) fr.diags.push_back( std::move( d ) );
-		}
-	}
+	fr.diags = withIncludeSummaries( std::move( all ), req.path, includeSites( preprocessed, in, req.path ), tc );
 
+	// Errors in the passes that only check the program don't stop code
+	// generation, so there can be C even when the translator reported errors.
 	std::error_code ec;
 	fr.cOut = cOut;
-	fr.backendReady = ! cOut.empty() && ! anyError && fs::file_size( cOut, ec ) > 0 && ! ec;
+	fr.translatorErrors = anyError;
+	fr.backendReady = ! cOut.empty() && fs::file_size( cOut, ec ) > 0 && ! ec;
 	fr.status = FrontResult::Ok;
 	return fr;
 }
@@ -654,6 +691,9 @@ std::vector<Diag> Checker::back( const CheckRequest & req, const FrontResult & f
 		lastKept = false;
 		if ( line <= 0 || ( file != req.path && tc.isSystemPath( file ) ) ) continue;
 		int sev = severityOf( raw.severity );
+		// C made despite translator errors: gcc's errors there are about
+		// code the translator already rejected.
+		if ( fr.translatorErrors && sev == 1 ) continue;
 		if ( ! seen.insert( { file, line, sev, raw.message } ).second ) continue;
 		Diag d;
 		d.file = file;
