@@ -133,6 +133,7 @@ class Server {
 	struct Target {
 		std::string name;
 		std::set<Key> keys;
+		int kind = 0;						// LSP SymbolKind
 		bool library = false;
 		bool function = false;
 	};
@@ -147,6 +148,7 @@ class Server {
 		// Modification times of the files the check read, taken before it ran.
 		std::map<std::string, std::filesystem::file_time_type> stamps;
 		bool stale = true;
+		bool complete = false;				// the check gave a usable analysis, so the table has every use
 		uint64_t gen = 0;					// bumped whenever it goes stale
 	};
 
@@ -217,8 +219,6 @@ class Server {
 	json switchSourceHeader( const json & params );
 	json workspaceSymbol( const json & params );
 	json prepareCallHierarchy( const json & params );
-	json incomingCalls( const json & params );
-	json outgoingCalls( const json & params );
 	// The cursor in `params` in d's snapshot; nullopt if it is in text typed since.
 	std::optional<Loc> cursorInSnapshot( const Document & d, const json & params ) const;
 	// The rename at the cursor with its ranges in the current buffer; nullopt
@@ -333,6 +333,8 @@ class Server {
 	std::map<std::string, IndexEntry> index;	// every .cfa under the root, by path
 	std::vector<std::string> projectHeaders;	// .hfa files under the root, focus files for index checks
 	bool indexRescan = false;				// walk the root again and look for changed files
+	bool indexScanning = false;				// a walk is under way
+	bool indexTruncated = false;			// the last walk hit maxScanEntries or maxIndexedFiles
 };
 
 } // namespace cfalsp

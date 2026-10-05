@@ -8,6 +8,7 @@
 #include <functional>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <tuple>
 
 #include "Flags.hpp"
@@ -43,6 +44,18 @@ struct LspError {
 // turn into hours of background checks.
 const size_t maxScanEntries = 50000;
 const size_t maxIndexedFiles = 1000;
+
+// Whether `name` is spelled as a whole identifier anywhere in `text`, in
+// code, comments or strings alike.
+bool spellsName( std::string_view text, const std::string & name ) {
+	auto ident = []( char c ) { return std::isalnum( (unsigned char)c ) || c == '_'; };
+	for ( size_t p = text.find( name ); p != std::string_view::npos; p = text.find( name, p + 1 ) ) {
+		bool before = p > 0 && ident( text[p - 1] );
+		bool after = p + name.size() < text.size() && ident( text[p + name.size()] );
+		if ( ! before && ! after ) return true;
+	}
+	return false;
+}
 
 std::optional<std::string> readFile( const std::string & path ) {
 	std::ifstream in( path, std::ios::binary );
@@ -1437,6 +1450,7 @@ std::optional<Server::Target> Server::targetAt( const Document & d, Loc pos ) {
 		t.name = e.name;
 		t.library = e.library;
 		t.function = e.function;
+		t.kind = e.kind;
 		Snapshot snap = snapOf( d );
 		for ( const Location & l : decls ) {
 			if ( auto m = toClient( snap, l, true ) ) t.keys.insert( { m->loc.file, m->loc.range.start } );
@@ -1637,19 +1651,50 @@ std::optional<RenamePlan> Server::renameAcross( const Document & d, const json &
 	if ( ! pos ) return std::nullopt;
 	auto t = targetAt( d, *pos );
 	if ( ! t ) return std::nullopt;						// a local
-	// Declared only in this .cfa file, nothing elsewhere can name it.
 	bool elsewhere = isHeader( d.path );
 	for ( const Key & k : t->keys ) elsewhere = elsewhere || k.first != d.path;
-	if ( ! elsewhere || ! indexing() ) return std::nullopt;
+	if ( ! indexing() ) return std::nullopt;
+	if ( ! elsewhere ) {
+		// Declared only in this .cfa file, so the single-file rename applies.
+		// But a function or variable declared again in another .cfa file
+		// (`double f( int );` instead of a shared header) may be the same
+		// one, and the index can't tell, since it matches by location.
+		if ( t->kind == 12 || t->kind == 13 ) {
+			for ( const Source & s : sources() ) {
+				for ( const auto & e : s.table->entities ) {
+					if ( e.name != t->name || e.kind != t->kind || e.library ) continue;
+					for ( const Location & l : e.declarations ) {
+						std::string file = fs::path( l.file ).lexically_normal().string();
+						if ( file == d.path || hidden( s, file ) ) continue;
+						throw LspError{ RequestFailed, "`" + t->name + "` is also declared in `" + fs::path( file ).filename().string() +
+														   "`, which may be the same one; rename it by hand" };
+					}
+				}
+			}
+		}
+		return std::nullopt;
+	}
 	auto plan = d.analysis->rename( d.path, *pos, true );
 	if ( ! plan ) return std::nullopt;
 	if ( ! plan->error.empty() ) throw LspError{ RequestFailed, plan->error };
 	// A file nobody has checked yet may use it.
-	bool building = inflight && inflight->index;
+	bool building = indexRescan || indexScanning || ( inflight && inflight->index );
 	for ( const auto & [path, e] : index ) building = building || e.stale;
 	if ( building ) throw LspError{ RequestFailed, "the workspace index is still being built; try again in a moment" };
+	if ( indexTruncated ) {
+		throw LspError{ RequestFailed, "the workspace root has more files than the index checks, so some uses may be missing; "
+									   "rename it by hand" };
+	}
 
 	const std::string quoted = "`" + plan->name + "`";
+	// A file whose check failed has uses the index doesn't know.
+	for ( const auto & [path, e] : index ) {
+		if ( e.complete || hidden( Source{ nullptr, Snapshot(), true }, path ) ) continue;
+		if ( auto text = readFile( path ); text && spellsName( *text, plan->name ) ) {
+			throw LspError{ RequestFailed, quoted + " appears in " + fs::path( path ).filename().string() +
+											   ", which the index could not check; fix its errors or rename it by hand" };
+		}
+	}
 	auto add = [&]( const Snapshot & snap, const Location & l ) {
 		std::string file = fs::path( l.file ).lexically_normal().string();
 		std::string where = fs::path( file ).filename().string() + " line " + std::to_string( l.range.start.line + 1 );
@@ -1985,6 +2030,7 @@ bool Server::indexing() const {
 void Server::scanWorkspace( std::unique_lock<std::mutex> & lk ) {
 	if ( ! indexing() ) return;
 	std::string root = rootPath;
+	indexScanning = true;
 	lk.unlock();
 	std::vector<std::string> units, headers;
 	size_t visited = 0;
@@ -2008,11 +2054,14 @@ void Server::scanWorkspace( std::unique_lock<std::mutex> & lk ) {
 	}
 	std::sort( units.begin(), units.end() );
 	std::sort( headers.begin(), headers.end() );
+	bool truncated = visited > maxScanEntries || units.size() > maxIndexedFiles;
 	if ( units.size() > maxIndexedFiles ) {
 		log::warn( "index: ", units.size(), " .cfa files under ", root, "; indexing the first ", maxIndexedFiles );
 		units.resize( maxIndexedFiles );
 	}
 	lk.lock();
+	indexScanning = false;
+	indexTruncated = truncated;
 	if ( stopping ) return;
 	bool headersChanged = headers != projectHeaders;
 	projectHeaders = std::move( headers );
@@ -2093,7 +2142,10 @@ bool Server::runIndexJob( std::unique_lock<std::mutex> & lk ) {
 	auto it = index.find( path );
 	if ( stopping || cancelled || it == index.end() ) return true;
 	IndexEntry & e = it->second;
-	if ( table && ( usable || ! e.table ) ) e.table = table;
+	// Even a poor table has positions in the text now on disk; an older one
+	// doesn't.
+	e.table = table;
+	e.complete = table && usable;
 	e.stamps = std::move( kept );
 	if ( e.gen == gen ) e.stale = false;
 	return true;
