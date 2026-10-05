@@ -1,4 +1,7 @@
-// A function left open at the end of the file.
+// Braces left open: the lexer closes them at the end of the file.
 int first( int x ) { return x; }
 int main() {
-int y = first( 1 );
+	if ( first( 1 ) ) {
+	int y = first( 2 );
+}
+int after( int z ) { return first( z ); }

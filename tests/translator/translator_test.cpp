@@ -649,16 +649,26 @@ TEST_CASE( "translator: the parser recovers from syntax errors in statements and
 	expectRef( *r, 14, "r", 14, "read", 1 );
 }
 
-TEST_CASE( "translator: a syntax error at the end of the file keeps the definitions before it" ) {
+TEST_CASE( "translator: braces left open are closed at the end of the file" ) {
 	const Run * r = run( "unclosed.cfa" );
 	if ( ! r ) return;
 	checkInvariants( *r );
 	CHECK( r->dump["complete"] == false );
-	bool error = false;
-	for ( const json & d : r->dump["diagnostics"] ) error = error || d["severity"] == "error";
-	CHECK( error );
+	// The `if` takes main's closing brace, so main's own '{' is the one left open, and `after` is parsed as a
+	// function nested in main. The lexer closes main at the end of the file and reports its '{'.
+	REQUIRE( r->dump["diagnostics"].size() == 1 );
+	const json * d = diagnosticOn( *r, 3, "error" );
+	REQUIRE( d );
+	CHECK( (*d)["col"] == r->col( 3, "{" ) );
+	CHECK( (*d)["message"].get<std::string>().find( "no matching" ) != std::string::npos );
 	CHECK( declAt( *r, "first", 2 ) );
-	expectRef( *r, 2, "x", 2, "read", 1 );
+	CHECK( declAt( *r, "main", 3 ) );
+	CHECK( declAt( *r, "y", 5 ) );
+	CHECK( declAt( *r, "after", 7 ) );
+	expectRef( *r, 4, "first", 2, "call" );
+	expectRef( *r, 5, "first", 2, "call" );
+	expectRef( *r, 7, "first", 2, "call" );
+	expectRef( *r, 7, "z", 7, "read", 1 );
 }
 
 TEST_CASE( "translator: a type error keeps the rest of the dump" ) {
