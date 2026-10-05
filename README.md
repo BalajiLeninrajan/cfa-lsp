@@ -199,7 +199,9 @@ missing. The suites are:
 - `tests/server`: transport, position mapping, flags, compiler output parsing
   and LSP sessions against a fake toolchain (`tests/server/fake`);
 - `tests/translator`: the forked translator on small programs, checking the
-  dump;
+  dump, plus a fuzz test that runs it on truncated and mutated fixtures. Set
+  `CFA_LSP_FUZZ=all` to run every variant instead of a sample (about 10
+  minutes on CI);
 - `tests/integration`: the built server, the translator and `cfa` on the
   project in `tests/fixtures/project`, driven over pipes the way an editor
   would.
