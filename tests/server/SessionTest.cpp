@@ -655,15 +655,25 @@ TEST_CASE( "an edit lets the running check finish and publish, mapped through th
 										  { "contentChanges", { { { "range", { { "start", pos( 0, 0 ) }, { "end", pos( 1, 0 ) } } },
 																  { "text", "// edited\n\n" } } } } } );
 	// The second check still publishes, with its warning moved down a line.
-	auto d = s.diagnosticsFor( uri, []( const json & ds ) { return ! ds.empty(); } );
+	// The fake puts the warning on line 3 of whatever text it read, so line 4
+	// can only come from the second check. Each check's first publish also
+	// carries the previous backend warning, mapped to a different line, so
+	// look for the line rather than the next publish.
+	auto onLine = []( int line ) {
+		return [line]( const json & ds ) {
+			for ( const auto & x : ds ) {
+				if ( x["range"]["start"]["line"] == line ) return true;
+			}
+			return false;
+		};
+	};
+	auto d = s.diagnosticsFor( uri, onLine( 4 ) );
 	REQUIRE( d );
 	CHECK( ( *d )["version"] == 3 );
-	CHECK( ( *d )["diagnostics"][0]["range"]["start"]["line"] == 4 );
 	// Then the check of the edited text runs.
-	d = s.diagnosticsFor( uri, []( const json & ds ) { return ! ds.empty(); } );
+	d = s.diagnosticsFor( uri, onLine( 3 ) );
 	REQUIRE( d );
 	CHECK( ( *d )["version"] == 3 );
-	CHECK( ( *d )["diagnostics"][0]["range"]["start"]["line"] == 3 );
 
 	std::string log = readAll( env.scratch.path() + "/log" );
 	size_t runs = 0;
