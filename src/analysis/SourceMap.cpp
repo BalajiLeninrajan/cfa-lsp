@@ -642,30 +642,15 @@ void parseDirective( const std::string & l, int at, Directives & out ) {
 }
 
 // The directives SourceMap uses: #define and #undef to redo macro expansions,
-// #include to find definitions in headers, and #line. Conditionals are not
-// evaluated; a definition that doesn't reproduce an expansion isn't used.
+// #include to find definitions in headers, and #line. The lexer finds them, so
+// a directive inside a comment is skipped. Conditionals are not evaluated; a
+// definition that doesn't reproduce an expansion isn't used.
 Directives scanDirectives( std::string_view text ) {
 	Directives out;
-	int line = 0;
-	for ( size_t pos = 0; pos < text.size(); ) {
-		const int at = line;
-		size_t b = pos;
-		while ( b < text.size() && ( text[b] == ' ' || text[b] == '\t' ) ) ++b;
-		const bool directive = b < text.size() && text[b] == '#';
-		std::string l;
-		for ( ;; ) {								// physical lines joined at backslash-newline
-			size_t nl = text.find( '\n', pos );
-			size_t end = nl == std::string_view::npos ? text.size() : nl;
-			std::string_view piece = text.substr( pos, end - pos );
-			if ( !piece.empty() && piece.back() == '\r' ) piece.remove_suffix( 1 );
-			pos = nl == std::string_view::npos ? text.size() : nl + 1;
-			if ( nl != std::string_view::npos ) ++line;
-			bool more = !piece.empty() && piece.back() == '\\' && nl != std::string_view::npos;
-			if ( more ) piece.remove_suffix( 1 );
-			if ( directive ) l += piece;
-			if ( !more ) break;
-		}
-		if ( directive ) parseDirective( l, at, out );
+	LexOptions opts;
+	opts.directives = true;
+	for ( const Token & t : lex( text, opts ) ) {
+		if ( t.kind == TokKind::Directive ) parseDirective( t.text, t.line, out );
 	}
 	return out;
 }
