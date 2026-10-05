@@ -47,6 +47,11 @@ bool isTranslatorWarning( const std::string & name ) {
 	return false;
 }
 
+std::vector<std::string> quoteDirFlags( const std::string & dir ) {
+	if ( dir.find( ',' ) != std::string::npos ) return { "-I", dir };
+	return { "-Wp,-iquote" + dir };
+}
+
 static bool startsWith( const std::string & s, const std::string & p ) {
 	return s.compare( 0, p.size(), p ) == 0;
 }
@@ -73,23 +78,27 @@ FlagSet classifyFlags( const std::vector<std::string> & flags, const std::string
 			return std::nullopt;
 		};
 
+		auto addPath = [&]( const std::string & flag, const std::string & arg ) {
+			std::string path = absolute( arg, baseDir );
+			if ( flag == "-iquote" ) {
+				for ( const auto & q : quoteDirFlags( path ) ) out.cpp.push_back( q );
+				return;
+			}
+			out.cpp.push_back( flag );
+			out.cpp.push_back( path );
+		};
+
 		bool handled = false;
 		for ( const auto & pf : pathFlags ) {
 			if ( f == pf || ( startsWith( f, pf ) && pf.size() == 2 ) ) {
 				std::optional<std::string> arg = f == pf ? next() : std::optional<std::string>( f.substr( pf.size() ) );
-				if ( arg ) {
-					std::string name = pf == "-iquote" ? "-I" : pf;
-					out.cpp.push_back( name );
-					out.cpp.push_back( absolute( *arg, baseDir ) );
-				}
+				if ( arg ) addPath( pf, *arg );
 				handled = true;
 				break;
 			}
 			if ( startsWith( f, pf ) && pf.size() > 2 && f.size() > pf.size() ) {
 				// -isystem/foo style
-				std::string name = pf == "-iquote" ? "-I" : pf;
-				out.cpp.push_back( name );
-				out.cpp.push_back( absolute( f.substr( pf.size() ), baseDir ) );
+				addPath( pf, f.substr( pf.size() ) );
 				handled = true;
 				break;
 			}

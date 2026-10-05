@@ -373,7 +373,7 @@ TEST_CASE( "checks publish translator, preprocessor and backend diagnostics" ) {
 		CHECK( log.find( "--lsp " ) != std::string::npos );
 		CHECK( log.find( "--lsp-focus " + path ) != std::string::npos );
 		CHECK( log.find( "--prelude-dir=/nonexistent-prelude" ) != std::string::npos );
-		CHECK( log.find( "-I " + fs::path( path ).parent_path().string() ) != std::string::npos );
+		CHECK( log.find( "-Wp,-iquote" + fs::path( path ).parent_path().string() + " " ) != std::string::npos );
 		CHECK( log.find( "-fsyntax-only" ) != std::string::npos );
 
 		if ( realAnalysis() ) {

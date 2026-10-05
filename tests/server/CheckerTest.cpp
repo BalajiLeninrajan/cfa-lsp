@@ -56,6 +56,40 @@ TEST_CASE( "real cfa: preprocessor errors land on the real file" ) {
 	CHECK( fr.diags[0].message.find( "missing.hfa" ) != std::string::npos );
 }
 
+TEST_CASE( "real cfa: the file's directory is searched for quoted includes only" ) {
+	std::string fake = envOr( "CFA_LSP_FAKE_CFA" );
+	if ( findInPath( "cfa" ).empty() || ! executable( fake ) ) {
+		MESSAGE( "needs cfa on PATH and CFA_LSP_FAKE_CFA; skipping" );
+		return;
+	}
+	ToolchainOptions o;
+	o.translator = fake;						// only the cpp stage matters here
+	Checker ch( discoverToolchain( o ) );
+	TempDir proj;
+	std::string main = proj.path() + "/main.cfa";
+	// A project header with the name of a libcfa header.
+	std::ofstream( proj.path() + "/string.hfa" ) << "#error the project's string.hfa\n";
+	fs::create_directories( proj.path() + "/inc" );
+	std::ofstream( proj.path() + "/inc/only_here.hfa" ) << "int only_here;\n";
+	auto cppErrors = [&]( const CheckRequest & req ) {
+		std::string out;
+		for ( const auto & d : ch.front( req, CancelToken() ).diags ) {
+			if ( d.source == "cpp" && d.severity == 1 ) out += d.message + "\n";
+		}
+		return out;
+	};
+
+	// <string.hfa> is libcfa's.
+	CHECK( cppErrors( requestFor( main, "#include <string.hfa>\nint main() {}\n" ) ) == "" );
+	// "string.hfa" is the one next to the file.
+	CHECK( cppErrors( requestFor( main, "#include \"string.hfa\"\nint main() {}\n" ) ).find( "the project's string.hfa" ) != std::string::npos );
+	// -iquote from the flags goes through the cfa driver too.
+	CheckRequest req = requestFor( main, "#include \"only_here.hfa\"\nint main() { return only_here; }\n" );
+	CHECK( cppErrors( req ).find( "only_here.hfa" ) != std::string::npos );
+	req.flags = { "-iquote", "inc" };
+	CHECK( cppErrors( req ) == "" );
+}
+
 TEST_CASE( "real cfa without the translator: falls back to compiling" ) {
 	if ( findInPath( "cfa" ).empty() ) {
 		MESSAGE( "needs cfa on PATH; skipping" );
