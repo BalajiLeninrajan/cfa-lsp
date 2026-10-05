@@ -198,7 +198,10 @@ An edit does not cancel the check in flight. It finishes and publishes its
 diagnostics, mapped through the edits made since it started, and the next
 check starts after it. Otherwise, while you type with pauses a little longer
 than `debounceMs`, every check would be cancelled before it finished and the
-diagnostics would never update. Closing the file does cancel its check.
+diagnostics would never update. The exception is a check that has already
+run more than twice as long as the file's last one, which is likely stuck on
+something the edit may have fixed; an edit cancels that one. Closing the file
+also cancels its check.
 
 ### Columns
 

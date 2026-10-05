@@ -27,8 +27,9 @@ namespace cfalsp {
 // The language server: reads JSON-RPC from one fd, writes to another.
 // Requests are answered on the calling thread from the last good analysis;
 // one worker thread runs checks and publishes diagnostics. An edit does not
-// cancel the check in flight: it finishes and publishes, mapped through the
-// edits made since, and the next check starts after it.
+// cancel the check in flight unless it has run more than twice as long as the
+// document's last check: it finishes and publishes, mapped through the edits
+// made since, and the next check starts after it.
 class Server {
   public:
 	Server( int inFd, int outFd, std::string exeDir );
@@ -75,6 +76,9 @@ class Server {
 		// on lines edited since.
 		std::vector<Diag> backDiags;
 		uint64_t backSeq = 0;
+		// How long the last check that finished took, or how long one that an
+		// edit cancelled had run. Zero until a check finishes.
+		Clock::duration lastCheck{};
 
 		EditList editsSince( uint64_t s ) const;
 		EditList editsBetween( uint64_t from, uint64_t to ) const;	// took seq `from` to seq `to`
@@ -84,6 +88,7 @@ class Server {
 		std::string path;
 		uint64_t seq = 0;
 		std::shared_ptr<CancelToken> token;
+		Clock::time_point started;
 	};
 
 	struct Options {
