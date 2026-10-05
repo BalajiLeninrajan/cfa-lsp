@@ -909,7 +909,9 @@ static std::pair<size_t, size_t> firstName( const std::string & line ) {
 // A half-typed file reaches the passes before Resolve with ASTs the normal compiler never sees, because it stops at
 // the first error. Each fixture cut after each of its lines, and a sample of mutations (a line left out, doubled,
 // swapped with the next, or with its first name replaced by an undeclared one), must give a well-formed dump with no
-// internal errors. CFA_LSP_FUZZ=all applies every mutation to every line, which takes several times as long.
+// internal errors. The project and demo fixtures include fstream.hfa, which makes each run several times slower, so
+// they are cut after every third line only. CFA_LSP_FUZZ=all cuts after every line and applies every mutation to
+// every line, which takes about five times as long.
 TEST_CASE( "translator: truncated and mutated fixtures always give a dump" ) {
 	if ( ! run( "overload.cfa" ) ) return;
 	struct Job {
@@ -920,7 +922,8 @@ TEST_CASE( "translator: truncated and mutated fixtures always give a dump" ) {
 	const int sample = 6;								// otherwise one mutation every this many lines
 	int counter = 0;
 	std::vector<Job> jobs;
-	for ( const char * dir : { "translator", "project", "demo" } ) {
+	for ( const std::string dir : { "translator", "project", "demo" } ) {
+		const int stride = all || dir == "translator" ? 1 : 3;
 		std::vector<std::string> files;
 		for ( const auto & e : fs::directory_iterator( fs::path( tools().fixtures ) / dir ) ) {
 			if ( e.path().extension() == ".cfa" ) files.push_back( fs::absolute( e.path() ).lexically_normal().string() );
@@ -942,7 +945,9 @@ TEST_CASE( "translator: truncated and mutated fixtures always give a dump" ) {
 			for ( int k = 0; k < (int)lines.size(); k += 1 ) {
 				std::string at = std::to_string( k + 1 );
 				// The whole file is covered by the other tests.
-				jobs.push_back( { path, edit( k, (int)lines.size(), "" ), name + " cut after line " + std::to_string( k ), {} } );
+				if ( k % stride == 0 ) {
+					jobs.push_back( { path, edit( k, (int)lines.size(), "" ), name + " cut after line " + std::to_string( k ), {} } );
+				}
 				for ( int kind = 0; kind < 4; kind += 1 ) {
 					if ( ! all && ( counter % sample != 0 || counter / sample % 4 != kind ) ) continue;
 					auto [from, to] = firstName( lines[k] );
