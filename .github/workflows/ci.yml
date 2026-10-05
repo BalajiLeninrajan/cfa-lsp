@@ -82,6 +82,16 @@ jobs:
           key: ccache-${{ hashFiles('.gitmodules') }}-${{ github.sha }}
           restore-keys: ccache-
 
+      # Regenerates the bison and flex output, so a grammar change committed
+      # without it fails here instead of building with the old parser.
+      - name: Check the parser matches the grammar
+        run: |
+          make parser
+          git -C cforall diff --exit-code -- src/Parser
+
+      # The build must not run bison or flex when the grammar output only looks
+      # stale, as it can on a fresh clone. Backdating the output and replacing
+      # both tools with failing stubs checks that.
       - name: Build
         env:
           CXX: ccache g++
@@ -89,8 +99,15 @@ jobs:
           CCACHE_MAXSIZE: 2G
           CCACHE_BASEDIR: ${{ github.workspace }}
         run: |
+          touch -d '1 hour ago' cforall/src/Parser/parser.cc cforall/src/Parser/parser.hh cforall/src/Parser/lex.cc
+          stubs="$RUNNER_TEMP/no-bison-flex"
+          mkdir -p "$stubs"
+          for tool in bison flex; do
+            printf '#!/bin/sh\necho "%s ran during the build" >&2\nexit 1\n' "$tool" > "$stubs/$tool"
+            chmod +x "$stubs/$tool"
+          done
           ccache -z
-          make -j"$(nproc)" TRANSLATOR_JOBS="$(nproc)" server translator
+          PATH="$stubs:$PATH" make -j"$(nproc)" TRANSLATOR_JOBS="$(nproc)" server translator
           ccache -s
 
       - name: Test

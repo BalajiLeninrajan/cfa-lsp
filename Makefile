@@ -3,6 +3,7 @@
 #   make              server + forked translator
 #   make server       just build/cfa-lsp
 #   make translator   just the forked cfa-cpp (translator.mk)
+#   make parser       regenerate the translator's bison and flex output
 #   make test         unit and integration tests
 #   make install      PREFIX=~/.local (uninstall removes it again)
 #   make compile_commands.json
@@ -85,7 +86,7 @@ compile_commands.json: Makefile $(MAIN_SRC) $(SERVER_SRCS) $(ANALYSIS_SRCS) $(TE
 clean:
 	rm -rf $(BUILD)/obj $(SERVER_BIN) $(TEST_BIN) $(FAKE_CFA)
 
-# Defines `translator` and TRANSLATOR_BIN (the forked cfa-cpp).
+# Defines `translator`, `parser` and TRANSLATOR_BIN (the forked cfa-cpp).
 include translator.mk
 
 -include $(ANALYSIS_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_OBJS:.o=.d)

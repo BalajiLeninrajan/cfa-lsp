@@ -37,7 +37,9 @@ The first `make` configures and builds the translator in `build/cforall`,
 which takes about 13 minutes at `-j8`. Later builds only recompile what
 changed. You need g++ with C++20 support and the usual autotools build
 dependencies of Cforall. bison and flex are only needed if you edit
-`cforall/src/Parser/parser.yy` or `lex.ll`.
+`cforall/src/Parser/parser.yy` or `lex.ll`. The submodule tracks their
+output, and `make` regenerates it in place when the grammar has changed since
+the submodule's commit. `make parser` regenerates it unconditionally.
 
 `make install` puts the server in `$PREFIX/bin/cfa-lsp` and the translator in
 `$PREFIX/libexec/cfa-lsp/cfa-cpp`, both stripped. `make uninstall` removes
