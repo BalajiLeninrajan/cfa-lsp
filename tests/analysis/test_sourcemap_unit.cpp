@@ -218,6 +218,9 @@ TEST_CASE( "sourcemap: #line in the source" ) {
 	CHECK( m.map( F, { 4, 4, 7 } ) == L( 5, 5 ) );
 	CHECK( m.map( F, { 4, 4, 9 } ) == L( 7, 5 ) );
 	CHECK( m.map( F, { 4, 6, 9 }, true ) == L( 7, 7 ) );
+	// The lines that left text are the real ones, not the numbers the
+	// markers give.
+	CHECK( m.outputLines( F ) == ( std::vector<int>{ 0, 2, 3, 5, 7 } ) );
 }
 
 // cpp ignores a #line inside a comment, so the lines after it keep their numbers.

@@ -1117,15 +1117,12 @@ std::vector<std::string> SourceMap::files() const {
 
 std::optional<std::vector<int>> SourceMap::outputLines( const std::string & file ) const {
 	if ( !impl ) return std::nullopt;
-	std::lock_guard<std::mutex> lock( impl->mu );
-	if ( !impl->indexed ) {
-		impl->index();
-		impl->indexed = true;
-	}
-	auto it = impl->files.find( file );
-	if ( it == impl->files.end() ) return std::nullopt;
+	// Building the table moves the lines after a #line back to their real
+	// numbers; index() alone leaves the numbers the markers give.
+	const FileTable * ft = impl->table( file );
+	if ( !ft ) return std::nullopt;
 	std::vector<int> out;
-	for ( const PrepLine & p : it->second->prep ) out.push_back( p.line );
+	for ( const PrepLine & p : ft->prep ) out.push_back( p.line );
 	std::sort( out.begin(), out.end() );
 	out.erase( std::unique( out.begin(), out.end() ), out.end() );
 	return out;
