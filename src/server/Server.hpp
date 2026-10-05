@@ -88,6 +88,7 @@ class Server {
 		int debounceMs = 500;
 		bool backend = true;
 		int timeoutMs = 120000;
+		bool stopAfterResolve = false;
 		std::optional<std::vector<std::string>> flags;
 	};
 

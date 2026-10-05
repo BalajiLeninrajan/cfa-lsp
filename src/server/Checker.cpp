@@ -291,6 +291,7 @@ std::vector<std::string> Checker::translatorCommand( const CheckRequest & req, c
 	// variables (-Wall, -Werror, -w, CFA warnings, --prelude-dir, -L), and
 	// cc1.cc adds the input file and --colors.
 	std::vector<std::string> cmd = { tc.translator, "--lsp", json, "--lsp-focus", req.path };
+	if ( req.stopAfterResolve ) cmd.push_back( "--lsp-stop-after-resolve" );
 	if ( ! cOut.empty() ) {
 		cmd.push_back( "--lsp-c-out" );
 		cmd.push_back( cOut );
@@ -533,7 +534,8 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 
 	// 2. Translate.
 	const std::string json = dir + "/out.json";
-	const std::string cOut = req.backend ? dir + "/out.c" : "";
+	// Code generation comes after the passes that stopAfterResolve skips.
+	const std::string cOut = req.backend && ! req.stopAfterResolve ? dir + "/out.c" : "";
 	RunOptions t;
 	t.cwd = cwd;
 	t.stdoutPath = dir + "/cfa-cpp.out";

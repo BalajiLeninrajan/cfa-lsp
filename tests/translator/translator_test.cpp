@@ -118,15 +118,16 @@ struct Run {
 	}
 };
 
-// Runs each fixture once (per withC). withC adds --lsp-c-out and keeps the generated C in Run::c.
-const Run * run( const std::string & name, bool withC = false ) {
+// Runs each fixture once (per withC and stop). withC adds --lsp-c-out and keeps the generated C in Run::c; stop adds
+// --lsp-stop-after-resolve.
+const Run * run( const std::string & name, bool withC = false, bool stop = false ) {
 	static std::map<std::string, Run> runs;
 	const Tools & t = tools();
 	if ( ! t.skip.empty() ) {
 		MESSAGE( "skipping: " << t.skip );
 		return nullptr;
 	}
-	std::string key = name + ( withC ? ":c" : "" );
+	std::string key = name + ( withC ? ":c" : "" ) + ( stop ? ":stop" : "" );
 	auto found = runs.find( key );
 	if ( found != runs.end() ) return &found->second;
 
@@ -148,13 +149,14 @@ const Run * run( const std::string & name, bool withC = false ) {
 	std::string cmd = quote( t.translator ) + " --prelude-dir=" + quote( t.prelude )
 		+ " --lsp " + quote( ( work / "out.json" ).string() ) + " --lsp-focus " + quote( r.file )
 		+ ( withC ? " --lsp-c-out " + quote( ( work / "out.c" ).string() ) : std::string() )
+		+ ( stop ? " --lsp-stop-after-resolve" : "" )
 		+ " " + quote( ( work / "in.i" ).string() ) + " > " + quote( ( work / "translator.err" ).string() ) + " 2>&1";
 	int rc = std::system( cmd.c_str() );
 	r.status = WIFEXITED( rc ) ? WEXITSTATUS( rc ) : -1;
 	INFO( readFile( work / "translator.err" ) );
 	REQUIRE( r.status == 0 );
 	r.dump = json::parse( readFile( work / "out.json" ) );
-	if ( withC ) r.c = readFile( work / "out.c" );
+	if ( withC && fs::exists( work / "out.c" ) ) r.c = readFile( work / "out.c" );
 	fs::remove_all( work );
 	return &runs.emplace( key, std::move( r ) ).first->second;
 }
@@ -757,6 +759,34 @@ TEST_CASE( "translator: an error after Resolve leaves the dump complete" ) {
 	REQUIRE( d );
 	CHECK( (*d)["message"].get<std::string>().find( "used before being constructed" ) != std::string::npos );
 	expectRef( *r, 5, "w", 3, "member" );
+}
+
+TEST_CASE( "translator: --lsp-stop-after-resolve drops only the later passes' diagnostics" ) {
+	const Run * r = run( "check_error.cfa", false, true );
+	if ( ! r ) return;
+	checkInvariants( *r );
+	CHECK( r->dump["complete"] == true );
+	// Check Function Returns runs before Resolve; the self-assignment warning comes from Fix Init, after it.
+	CHECK( diagnosticOn( *r, 3, "error" ) );
+	CHECK_FALSE( diagnosticOn( *r, 8, "warning" ) );
+	const Run * full = run( "check_error.cfa" );
+	REQUIRE( full );
+	CHECK( r->dump["refs"] == full->dump["refs"] );
+	CHECK( r->dump["decls"] == full->dump["decls"] );
+
+	// Fix Init's construction check is skipped too, and no C is generated.
+	const Run * post = run( "post_error.cfa", true, true );
+	REQUIRE( post );
+	CHECK( post->dump["complete"] == true );
+	CHECK_FALSE( diagnosticOn( *post, 4, "error" ) );
+	CHECK( post->c.empty() );
+	expectRef( *post, 5, "w", 3, "member" );
+
+	// A Resolve error still ends the run with an incomplete dump.
+	const Run * type = run( "type_error.cfa", false, true );
+	REQUIRE( type );
+	CHECK( type->dump["complete"] == false );
+	CHECK( type->dump["diagnostics"] == run( "type_error.cfa" )->dump["diagnostics"] );
 }
 
 TEST_CASE( "translator: bytes that are not UTF-8 in messages don't break the dump" ) {

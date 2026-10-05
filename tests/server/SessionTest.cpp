@@ -571,6 +571,31 @@ TEST_CASE( "a newer edit cancels the running check and kills its processes" ) {
 	CHECK( env.tempDirsLeft() == 0 );
 }
 
+TEST_CASE( "stopAfterResolve passes the flag and skips the backend" ) {
+	if ( fakeCfa().empty() ) {
+		MESSAGE( "CFA_LSP_FAKE_CFA not set; skipping (run through make test)" );
+		return;
+	}
+	FakeEnv env;
+	std::string path = fs::canonical( fixtures() + "/server/hello.cfa" ).string();
+	std::string uri = pathToUri( path );
+	Session s;
+	s.initialize( fakeOptions( { { "stopAfterResolve", true } } ) );
+	s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 },
+															{ "text", readAll( path ) } } } } );
+	// No backend, so no gcc warning.
+	auto d = s.diagnosticsFor( uri, []( const json & ) { return true; } );
+	REQUIRE( d );
+	CHECK( ( *d )["diagnostics"] == json::array() );
+	s.request( "shutdown" );
+	s.notify( "exit", nullptr );
+	CHECK( s.finish() == 0 );
+	std::string log = readAll( env.scratch.path() + "/log" );
+	CHECK( log.find( "--lsp-stop-after-resolve" ) != std::string::npos );
+	CHECK( log.find( "--lsp-c-out" ) == std::string::npos );
+	CHECK( log.find( "-fsyntax-only" ) == std::string::npos );
+}
+
 TEST_CASE( "UTF-16 positions in edits" ) {
 	if ( fakeCfa().empty() ) {
 		MESSAGE( "CFA_LSP_FAKE_CFA not set; skipping (run through make test)" );

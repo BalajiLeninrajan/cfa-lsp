@@ -55,6 +55,7 @@ struct CheckRequest {
 	std::vector<std::string> flags;			// the user's flags
 	std::string flagsBase;					// directory relative flag paths resolve against
 	bool backend = true;
+	bool stopAfterResolve = false;			// translator skips the passes after Resolve; no backend
 	std::chrono::milliseconds timeout{ 120000 };	// per child process
 };
 

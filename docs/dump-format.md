@@ -8,7 +8,8 @@ here first, then on both sides.
 ## Invocation
 
 ```
-cfa-cpp --lsp OUT.json [--lsp-focus PATH]... [--lsp-c-out OUT.c] [usual cfa-cpp flags] INPUT.i
+cfa-cpp --lsp OUT.json [--lsp-focus PATH]... [--lsp-c-out OUT.c] [--lsp-stop-after-resolve]
+        [usual cfa-cpp flags] INPUT.i
 ```
 
 - `INPUT.i` is the output of `cfa -E` (preprocessed, with `# N "file"` line
@@ -30,10 +31,28 @@ cfa-cpp --lsp OUT.json [--lsp-focus PATH]... [--lsp-c-out OUT.c] [usual cfa-cpp 
   there, so the server can run the C compiler on it for backend warnings.
   Without it, the translator stops before code generation: every pass that can
   report a user error (the last one is `Box`) still runs.
+- `--lsp-stop-after-resolve` ends the run right after the snapshot (see
+  below), skipping the passes after `Resolve` and code generation. That saves
+  40 to 45% of the time, but those passes' diagnostics are lost (listed
+  below). `--lsp-c-out` writes nothing then. `complete` is unaffected.
 
 The AST snapshot is taken right after the `Resolve` pass. Passes after it
 still run (to report their errors) but don't change the dump. If `Resolve`
 reports errors, translation stops after the snapshot (see `complete`).
+
+The diagnostics that only the passes after `Resolve` report, and so
+`--lsp-stop-after-resolve` drops:
+
+- `Fix Init`: the self-assignment warning (`x = x`), "jump to label crosses
+  initialization", and in constructors and destructors "field used before
+  being constructed" and "field not explicitly constructed and no default
+  constructor found";
+- `Gen Waitfor`: `waitfor` without `monitor.hfa`;
+- `Fix Main Linkage`: more than one `main`;
+- `Virtual Expand Casts`: errors in virtual casts;
+- `Convert L-Value`: the rvalue to reference conversion warning;
+- `Box`: unbound type variables;
+- and, since there is no generated C, the backend's gcc warnings.
 
 ## Coordinates
 
