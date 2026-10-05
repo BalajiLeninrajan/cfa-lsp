@@ -2,6 +2,7 @@
 // (tests/server/fake/fake_cfa.cpp) standing in for the toolchain.
 #include <doctest/doctest.h>
 
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -11,7 +12,9 @@
 #include <fstream>
 #include <functional>
 #include <poll.h>
+#include <future>
 #include <sstream>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 
@@ -56,8 +59,10 @@ class Session {
 		REQUIRE( pipe2( toServer, O_CLOEXEC ) == 0 );
 		REQUIRE( pipe2( fromServer, O_CLOEXEC ) == 0 );
 		server = std::make_unique<Server>( toServer[0], fromServer[1], "" );
-		if ( start ) thread = std::thread( [this] { exitCode = server->run(); } );
+		if ( start ) run();
 	}
+	void run() { thread = std::thread( [this] { exitCode = server->run(); } ); }
+	Server & srv() { return *server; }
 	~Session() {
 		if ( toServer[1] >= 0 ) close( toServer[1] );
 		if ( thread.joinable() ) thread.join();
@@ -67,9 +72,15 @@ class Session {
 		close( fromServer[1] );
 	}
 
-	void send( const json & msg ) {
-		std::string body = msg.dump();
-		std::string f = "Content-Length: " + std::to_string( body.size() ) + "\r\n\r\n" + body;
+	void send( const json & msg ) { sendAll( { msg } ); }
+
+	// In one write, so the server reads them all at once.
+	void sendAll( const std::vector<json> & msgs ) {
+		std::string f;
+		for ( const json & msg : msgs ) {
+			std::string body = msg.dump();
+			f += "Content-Length: " + std::to_string( body.size() ) + "\r\n\r\n" + body;
+		}
 		REQUIRE( write( toServer[1], f.data(), f.size() ) == (ssize_t)f.size() );
 	}
 
@@ -82,10 +93,41 @@ class Session {
 	json request( const std::string & method, json params = json::object() ) {
 		int id = nextId++;
 		send( { { "jsonrpc", "2.0" }, { "id", id }, { "method", method }, { "params", std::move( params ) } } );
+		return response( id );
+	}
+
+	// Waits for the response to request `id`.
+	json response( const json & id ) {
+		for ( auto it = queue.begin(); it != queue.end(); ++it ) {
+			if ( it->contains( "id" ) && ( *it )["id"] == id && ! it->contains( "method" ) ) {
+				json m = *it;
+				queue.erase( it );
+				return m;
+			}
+		}
 		for ( ;; ) {
 			auto m = readMessage( std::chrono::seconds( 10 ) );
-			REQUIRE_MESSAGE( m, "no response to " << method );
+			REQUIRE_MESSAGE( m, "no response to request " << id );
 			if ( m->contains( "id" ) && ( *m )["id"] == id && ! m->contains( "method" ) ) return *m;
+			queue.push_back( *m );
+		}
+	}
+
+	// Waits for a request from the server.
+	std::optional<json> serverRequest( const std::string & method, std::chrono::milliseconds timeout = std::chrono::seconds( 10 ) ) {
+		auto deadline = std::chrono::steady_clock::now() + timeout;
+		for ( ;; ) {
+			for ( auto it = queue.begin(); it != queue.end(); ++it ) {
+				if ( it->value( "method", "" ) == method && it->contains( "id" ) ) {
+					json m = *it;
+					queue.erase( it );
+					return m;
+				}
+			}
+			auto left = std::chrono::duration_cast<std::chrono::milliseconds>( deadline - std::chrono::steady_clock::now() );
+			if ( left.count() <= 0 ) return std::nullopt;
+			auto m = readMessage( left );
+			if ( ! m ) return std::nullopt;
 			queue.push_back( *m );
 		}
 	}
@@ -393,7 +435,9 @@ TEST_CASE( "checks publish translator, preprocessor and backend diagnostics" ) {
 		}
 
 		// Errors in an included project header: published on the header,
-		// and summarised on the #include line of the main file.
+		// and summarised on the #include line of the main file. The errors
+		// stop translation before code generation, so the backend can't run;
+		// its warning from the last check stays.
 		std::string headerErr = text + "// FAKE_HEADER_ERROR\n";
 		s.notify( "textDocument/didChange", { { "textDocument", { { "uri", uri }, { "version", 2 } } },
 											  { "contentChanges", { { { "text", headerErr } } } } } );
@@ -401,17 +445,27 @@ TEST_CASE( "checks publish translator, preprocessor and backend diagnostics" ) {
 			auto h = s.diagnosticsFor( pathToUri( header ), []( const json & ds ) { return ds.size() == 1; } );
 			REQUIRE( h );
 			CHECK( ( *h )["diagnostics"][0]["message"] == "fake error in header" );
-			d = s.diagnosticsFor( uri, []( const json & ds ) { return ds.size() == 2; } );
+			// An error in a system header goes on that header too; its warning doesn't.
+			auto sys = s.diagnosticsFor( "file:///nonexistent-prelude/sys.hfa", []( const json & ds ) { return ! ds.empty(); } );
+			REQUIRE( sys );
+			REQUIRE( ( *sys )["diagnostics"].size() == 1 );
+			CHECK( ( *sys )["diagnostics"][0]["message"] == "fake error in a system header" );
+			d = s.diagnosticsFor( uri, []( const json & ds ) { return ds.size() == 3; } );
 			REQUIRE( d );
-			bool summary = false;
+			bool summary = false, carried = false;
 			for ( const auto & x : ( *d )["diagnostics"] ) {
 				if ( x["message"].get<std::string>().find( "1 error in included file hello.hfa" ) != std::string::npos ) {
 					summary = true;
 					CHECK( x["range"]["start"]["line"] == 0 );
 					CHECK( x["relatedInformation"][0]["location"]["uri"] == pathToUri( header ) );
 				}
+				if ( x["source"] == "gcc" ) {
+					carried = true;
+					CHECK( x["range"]["start"] == pos( 3, 1 ) );
+				}
 			}
 			CHECK( summary );
+			CHECK( carried );
 			// That check came back incomplete with no declarations, so the
 			// previous analysis still answers queries.
 			json hv = s.request( "textDocument/hover", { { "textDocument", { { "uri", uri } } }, { "position", pos( 8, 10 ) } } )["result"];
@@ -436,16 +490,22 @@ TEST_CASE( "checks publish translator, preprocessor and backend diagnostics" ) {
 		// A preprocessor failure is reported on its line, and the old
 		// analysis survives. With the real analysis the text is now
 		// "// new\n" + text + "// FAKE_HEADER_ERROR\n"; without it, text + the comment.
+		// The backend warning moved down with its line.
 		int endLine = realAnalysis() ? 13 : 12;
 		s.notify( "textDocument/didChange", { { "textDocument", { { "uri", uri }, { "version", 4 } } },
 				  { "contentChanges", { { { "range", { { "start", pos( endLine, 0 ) }, { "end", pos( endLine, 0 ) } } }, { "text", "FAKE_CPP_ERROR\n" } } } } } );
 		d = s.diagnosticsFor( uri, []( const json & ds ) {
-			return ds.size() == 1 && ds[0]["message"].get<std::string>().find( "FAKE_CPP_ERROR" ) != std::string::npos;
+			return ! ds.empty() && ds[0]["message"].get<std::string>().find( "FAKE_CPP_ERROR" ) != std::string::npos;
 		} );
 		REQUIRE( d );
 		CHECK( ( *d )["diagnostics"][0]["range"]["start"]["line"] == endLine );
 		CHECK( ( *d )["diagnostics"][0]["severity"] == 1 );
 		CHECK( ( *d )["version"] == 4 );
+		if ( realAnalysis() ) {
+			REQUIRE( ( *d )["diagnostics"].size() == 2 );
+			CHECK( ( *d )["diagnostics"][1]["source"] == "gcc" );
+			CHECK( ( *d )["diagnostics"][1]["range"]["start"] == pos( 4, 1 ) );
+		}
 		if ( realAnalysis() ) {
 			// the call to twice, one line lower than in the snapshot
 			json hv = s.request( "textDocument/hover", { { "textDocument", { { "uri", uri } } }, { "position", pos( 9, 10 ) } } )["result"];
@@ -544,7 +604,7 @@ TEST_CASE( "UTF-16 positions in edits" ) {
 	s.finish();
 }
 
-TEST_CASE( "after didClose, the last publish for the file is empty" ) {
+TEST_CASE( "a publish built before didClose goes out before the close's empty one" ) {
 	if ( fakeCfa().empty() ) {
 		MESSAGE( "CFA_LSP_FAKE_CFA not set; skipping (run through make test)" );
 		return;
@@ -553,22 +613,173 @@ TEST_CASE( "after didClose, the last publish for the file is empty" ) {
 	std::string path = fs::canonical( fixtures() + "/server/hello.cfa" ).string();
 	std::string uri = pathToUri( path );
 	std::string text = readAll( path ) + "// FAKE_HEADER_ERROR\n";	// a check with diagnostics
-	Session s;
+	// Hold the worker between building its publish and sending it, and close
+	// the document meanwhile. The close's empty publish must still go last:
+	// it waits for the worker's. If it didn't, it would be sent while the
+	// worker waits here, and the worker's would follow it.
+	std::promise<void> paused, closed;
+	std::atomic<bool> firstPublish{ true }, firstClose{ true };
+	std::shared_future<void> closedSent = closed.get_future().share();
+	Session s( false );
+	s.srv().setTestHook( [&]( const char * point ) {
+		std::string_view p( point );
+		if ( p == "publish" && firstPublish.exchange( false ) ) {
+			paused.set_value();
+			closedSent.wait_for( std::chrono::milliseconds( 500 ) );
+		} else if ( p == "closed" && firstClose.exchange( false ) ) {
+			closed.set_value();
+		}
+	} );
+	s.run();
 	s.initialize( fakeOptions( { { "debounceMs", 0 }, { "backend", false } } ) );
-	// Close while the check may be publishing: whatever the timing, nothing
-	// may arrive after the close's empty publish.
-	for ( int i = 0; i < 20; i += 1 ) {
-		s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", i + 1 }, { "text", text } } } } );
-		std::this_thread::sleep_for( std::chrono::milliseconds( i % 5 ) );
-		s.notify( "textDocument/didClose", { { "textDocument", { { "uri", uri } } } } );
-	}
+	s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 }, { "text", text } } } } );
+	REQUIRE( paused.get_future().wait_for( std::chrono::seconds( 10 ) ) == std::future_status::ready );
+	s.notify( "textDocument/didClose", { { "textDocument", { { "uri", uri } } } } );
 	s.request( "shutdown" );
-	std::optional<json> last;
+	std::vector<json> publishes;
 	for ( const json & m : s.queue ) {
-		if ( m.value( "method", "" ) == "textDocument/publishDiagnostics" && m["params"]["uri"] == uri ) last = m["params"];
+		if ( m.value( "method", "" ) == "textDocument/publishDiagnostics" && m["params"]["uri"] == uri ) publishes.push_back( m["params"] );
 	}
-	REQUIRE( last );
-	CHECK( ( *last )["diagnostics"] == json::array() );
+	REQUIRE( publishes.size() == 2 );
+	CHECK( ! publishes[0]["diagnostics"].empty() );
+	CHECK( publishes[1]["diagnostics"] == json::array() );
 	s.notify( "exit", nullptr );
 	CHECK( s.finish() == 0 );
+}
+
+TEST_CASE( "a request cancelled before it is handled gets RequestCancelled" ) {
+	Session s;
+	s.initialize( { { "cfa", "/nonexistent/cfa" } } );
+	json params = { { "textDocument", { { "uri", "file:///nowhere/x.cfa" } } }, { "position", pos( 0, 0 ) } };
+	// All three arrive in one read, so the cancel is there before the
+	// hover is answered.
+	s.sendAll( { { { "jsonrpc", "2.0" }, { "id", 100 }, { "method", "textDocument/hover" }, { "params", params } },
+				 { { "jsonrpc", "2.0" }, { "method", "$/cancelRequest" }, { "params", { { "id", 100 } } } },
+				 { { "jsonrpc", "2.0" }, { "id", 101 }, { "method", "textDocument/hover" }, { "params", params } } } );
+	json r = s.response( 100 );
+	CHECK( r["error"]["code"] == -32800 );
+	CHECK( ! r.contains( "result" ) );
+	r = s.response( 101 );
+	CHECK( r.contains( "result" ) );
+	CHECK( r["result"].is_null() );
+	// Cancelling something already answered changes nothing.
+	s.notify( "$/cancelRequest", { { "id", 101 } } );
+	CHECK( s.request( "textDocument/hover", params )["result"].is_null() );
+	s.request( "shutdown" );
+	s.notify( "exit", nullptr );
+	CHECK( s.finish() == 0 );
+}
+
+TEST_CASE( "backend warnings with translator errors" ) {
+	if ( fakeCfa().empty() ) {
+		MESSAGE( "CFA_LSP_FAKE_CFA not set; skipping (run through make test)" );
+		return;
+	}
+	FakeEnv env;
+	std::string path = fs::canonical( fixtures() + "/server/hello.cfa" ).string();
+	std::string uri = pathToUri( path );
+	std::string text = readAll( path );
+	Session s;
+	s.initialize( fakeOptions() );
+
+	// Errors from a pass that only checks: there is C, and gcc runs on it.
+	// Its warnings are shown, its errors (about code the translator
+	// rejected) are not.
+	s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 },
+															{ "text", text + "// FAKE_CHECK_ERROR\n" } } } } );
+	auto hasGcc = []( const json & ds ) {
+		for ( const auto & d : ds ) if ( d["source"] == "gcc" ) return true;
+		return false;
+	};
+	auto d = s.diagnosticsFor( uri, hasGcc );
+	REQUIRE( d );
+	bool translatorError = false;
+	for ( const auto & x : ( *d )["diagnostics"] ) {
+		if ( x["message"] == "fake error in main" ) translatorError = true;
+		CHECK( x["message"] != "fake gcc error" );
+		if ( x["source"] == "gcc" ) {
+			CHECK( x["severity"] == 2 );
+			CHECK( x["range"]["start"] == pos( 3, 1 ) );
+		}
+	}
+	CHECK( translatorError );
+
+	// Errors that stop translation: no C. The warning stays until the line
+	// it is on is edited.
+	s.notify( "textDocument/didChange", { { "textDocument", { { "uri", uri }, { "version", 2 } } },
+										  { "contentChanges", { { { "text", text + "// FAKE_HEADER_ERROR\n" } } } } } );
+	auto version = [&]( int v ) {
+		return s.waitFor( "textDocument/publishDiagnostics", [&]( const json & p ) { return p["uri"] == uri && p["version"] == v; } );
+	};
+	d = version( 2 );
+	REQUIRE( d );
+	CHECK( hasGcc( ( *d )["diagnostics"] ) );
+	s.notify( "textDocument/didChange", { { "textDocument", { { "uri", uri }, { "version", 3 } } },
+										  { "contentChanges", { { { "range", { { "start", pos( 3, 5 ) }, { "end", pos( 3, 11 ) } } }, { "text", "spare" } } } } } );
+	d = version( 3 );
+	REQUIRE( d );
+	CHECK( ! ( *d )["diagnostics"].empty() );
+	CHECK( ! hasGcc( ( *d )["diagnostics"] ) );
+	s.request( "shutdown" );
+	s.notify( "exit", nullptr );
+	CHECK( s.finish() == 0 );
+}
+
+TEST_CASE( "workspace/didChangeConfiguration applies without a restart" ) {
+	if ( fakeCfa().empty() ) {
+		MESSAGE( "CFA_LSP_FAKE_CFA not set; skipping (run through make test)" );
+		return;
+	}
+	FakeEnv env;
+	std::string path = fs::canonical( fixtures() + "/server/hello.cfa" ).string();
+	std::string uri = pathToUri( path );
+	std::string text = readAll( path );
+	auto hasGcc = []( const json & ds ) {
+		for ( const auto & d : ds ) if ( d["source"] == "gcc" ) return true;
+		return false;
+	};
+
+	SUBCASE( "pushed settings" ) {
+		Session s;
+		s.initialize( fakeOptions() );
+		s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 }, { "text", text } } } } );
+		REQUIRE( s.diagnosticsFor( uri, hasGcc ) );
+		s.queue.clear();					// the check's first, empty, publish
+		// Unrelated settings change nothing; ours turn the backend off and
+		// re-check, and removing them brings back initializationOptions.
+		s.notify( "workspace/didChangeConfiguration", { { "settings", { { "other-server", { { "backend", false } } } } } } );
+		s.notify( "workspace/didChangeConfiguration", { { "settings", { { "cfa-lsp", { { "backend", false } } } } } } );
+		REQUIRE( s.diagnosticsFor( uri, []( const json & ds ) { return ds.empty(); } ) );
+		s.notify( "workspace/didChangeConfiguration", { { "settings", { { "cfa-lsp", { { "backend", nullptr } } } } } } );
+		REQUIRE( s.diagnosticsFor( uri, hasGcc ) );
+		s.request( "shutdown" );
+		s.notify( "exit", nullptr );
+		CHECK( s.finish() == 0 );
+	}
+
+	SUBCASE( "pulled with workspace/configuration" ) {
+		Session s;
+		s.initialize( fakeOptions(), { { "workspace", { { "configuration", true }, { "didChangeConfiguration", { { "dynamicRegistration", true } } } } } } );
+		auto reg = s.serverRequest( "client/registerCapability" );
+		REQUIRE( reg );
+		CHECK( ( *reg )["params"]["registrations"][0]["method"] == "workspace/didChangeConfiguration" );
+		s.send( { { "jsonrpc", "2.0" }, { "id", ( *reg )["id"] }, { "result", nullptr } } );
+		// Asked once at startup; nothing configured yet.
+		auto ask = s.serverRequest( "workspace/configuration" );
+		REQUIRE( ask );
+		CHECK( ( *ask )["params"]["items"][0]["section"] == "cfa-lsp" );
+		s.send( { { "jsonrpc", "2.0" }, { "id", ( *ask )["id"] }, { "result", json::array( { nullptr } ) } } );
+		s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 }, { "text", text } } } } );
+		REQUIRE( s.diagnosticsFor( uri, hasGcc ) );
+		s.queue.clear();
+		// A pull client's change notification has no settings: ask again.
+		s.notify( "workspace/didChangeConfiguration", { { "settings", nullptr } } );
+		ask = s.serverRequest( "workspace/configuration" );
+		REQUIRE( ask );
+		s.send( { { "jsonrpc", "2.0" }, { "id", ( *ask )["id"] }, { "result", json::array( { json{ { "backend", false } } } ) } } );
+		REQUIRE( s.diagnosticsFor( uri, []( const json & ds ) { return ds.empty(); } ) );
+		s.request( "shutdown" );
+		s.notify( "exit", nullptr );
+		CHECK( s.finish() == 0 );
+	}
 }

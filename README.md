@@ -123,7 +123,17 @@ All optional.
 | `debounceMs` | `500` | Wait after the last edit before checking. |
 | `timeoutMs` | `120000` | Limit for each child process. |
 
-The server reads these once, at startup.
+The same options can be changed while the server runs, through
+`workspace/didChangeConfiguration`. Settings under a `cfa-lsp` key (or the
+whole settings object, if it has no such key) override `initializationOptions`
+one key at a time, and a `null` value goes back to the
+`initializationOptions` value. Clients that use `workspace/configuration`
+are asked for the `cfa-lsp` section at startup and after each change. A
+change re-checks every open file. In Neovim:
+
+```lua
+vim.lsp.config( 'cfa_lsp', { settings = { ['cfa-lsp'] = { backend = false } } } )
+```
 
 ### Logging
 
@@ -148,15 +158,32 @@ the buffer:
    expression types and scopes to `out.json`. `docs/dump-format.md` describes
    the format.
 3. The server loads the JSON (`src/analysis`) and publishes diagnostics.
-4. If the translator reported no errors, it runs gcc `-fsyntax-only` on the
-   generated C and adds gcc's warnings, mapped back to source lines through
-   the line markers.
+   An error in an included file goes on that file, and a summary goes on the
+   `#include` line of the main file that leads to it. In libcfa and system
+   headers only errors are published, not warnings.
+4. If the translator wrote C, it runs gcc `-fsyntax-only` on it and adds
+   gcc's warnings, mapped back to source lines through the line markers.
+   Errors that stop translation also stop code generation, so then the
+   warnings of the last gcc run stay, except the ones on lines edited since.
+   When the translator reported errors but still wrote C (errors from the
+   passes that only check the program), gcc's errors are left out: they are
+   about code the translator already rejected.
 
-Requests are answered right away from the last good result. When a check
-fails to parse the file, the previous result stays in use, so completion
-after `x.` keeps working while a line is half typed. Edits made since that
-result are tracked, and positions are mapped through them in both
-directions.
+Requests are answered right away from the last good result, in the order
+they arrive. A request cancelled with `$/cancelRequest` before its turn comes
+gets the `RequestCancelled` error instead of an answer. When a check fails to
+parse the file, the previous result stays in use, so completion after `x.`
+keeps working while a line is half typed. Edits made since that result are
+tracked, and positions are mapped through them in both directions.
+
+Macros never reach the translator, so hover and definition on a macro read
+the `#define` lines of the files in the translation unit. A definition in a
+branch of `#if` that cpp dropped doesn't count. The server tells which branch
+cpp kept from its output: a branch with code that left no line in it was
+dropped. A branch with only directives in it is decided by evaluating the
+condition with the macros defined so far, and counts as kept when the
+condition depends on something the source doesn't show, such as a compiler
+macro or a `-D` flag.
 
 ### Columns
 
@@ -199,8 +226,6 @@ the wrong spot in a few cases:
   can differ from what you wrote (`Fib &f`, assertions left out).
 - If the translator crashes on an internal assertion there are no results for
   that check; the error is reported on the file.
-- `workspace/didChangeConfiguration` is not handled. Restart the server to
-  change options.
 
 ## Development
 

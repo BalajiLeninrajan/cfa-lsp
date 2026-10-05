@@ -104,21 +104,27 @@ TEST_CASE( "compiler output to diagnostics" ) {
 		"/tmp/t/in.cfa:2:3: error: in the temp copy\n"
 		"/p/main.cfa:4:1: warning: #pragma once in main file\n"
 		"/opt/cfa/include/cfa/fstream.hfa:9:1: error: in libcfa\n"
+		"/opt/cfa/include/cfa/fstream.hfa:12:1: warning: not the user's problem\n"
+		"/opt/cfa/include/cfa/fstream.hfa:12:1: note: nor is this\n"
 		"/p/inc.hfa:5:2: error: in a project header\n"
 		"/p/inc.hfa:5:2: note: see here\n"
 		"cc1: fatal error: no position\n"
 		"/p/main.cfa:7:1 error: resolver says no\n";
 	auto d = diagsFromOutput( out, "/p/main.cfa", "/tmp/t/in.cfa", "/p", tc, "cpp" );
-	REQUIRE( d.size() == 4 );
+	REQUIRE( d.size() == 5 );
 	CHECK( d[0].file == "/p/main.cfa" );
 	CHECK( d[0].range.start == Loc{ 1, 2 } );
 	CHECK( ! d[0].wholeLine );
-	CHECK( d[1].file == "/p/inc.hfa" );
-	CHECK( d[1].related.size() == 1 );
-	CHECK( d[2].file == "/p/main.cfa" );
-	CHECK( d[2].wholeLine );
-	CHECK( d[2].range.start.line == 0 );
+	// Errors in libcfa are kept, for the header; its warnings, and their notes, are not.
+	CHECK( d[1].file == "/opt/cfa/include/cfa/fstream.hfa" );
+	CHECK( d[1].range.start == Loc{ 8, 0 } );
+	CHECK( d[1].related.empty() );
+	CHECK( d[2].file == "/p/inc.hfa" );
+	CHECK( d[2].related.size() == 1 );
+	CHECK( d[3].file == "/p/main.cfa" );
 	CHECK( d[3].wholeLine );
-	CHECK( d[3].range.start.line == 6 );
-	CHECK( d[3].source == "cpp" );
+	CHECK( d[3].range.start.line == 0 );
+	CHECK( d[4].wholeLine );
+	CHECK( d[4].range.start.line == 6 );
+	CHECK( d[4].source == "cpp" );
 }
