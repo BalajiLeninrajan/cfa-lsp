@@ -37,7 +37,7 @@ translator: $(CFA_PARSER)/parser.cc $(CFA_PARSER)/parser.hh $(CFA_PARSER)/lex.cc
 	    $(CFORALL_SRC)/configure --quiet --disable-gprofiler >configure.log 2>&1 \
 	      || { cat configure.log >&2; exit 1; }; \
 	  fi; \
-	  $(MAKE) --no-print-directory -s -C $(TRANSLATOR_DIR)/src -j$(TRANSLATOR_JOBS) ../driver/cfa-cpp'
+	  $(MAKE) --no-print-directory -s -C $(CURDIR)/$(TRANSLATOR_DIR)/src -j$(TRANSLATOR_JOBS) ../driver/cfa-cpp'
 
 $(CFA_PARSER)/parser.cc $(CFA_PARSER)/parser.hh &: $(CFA_PARSER)/parser.yy
 	cd cforall/src && $(SHELL) ../automake/ylwrap Parser/parser.yy y.tab.c Parser/parser.cc \

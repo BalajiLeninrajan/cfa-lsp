@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
 
@@ -34,7 +34,7 @@ jobs:
 
       - name: Restore CFA toolchain
         id: toolchain
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.CFA_PREFIX }}
           key: cfa-toolchain-${{ env.CFA_COMMIT }}-gcc11-v1
@@ -58,13 +58,22 @@ jobs:
           make -s -j"$(nproc)"
           make -s install
 
+      # Saved right away, so a failing build or test later doesn't throw it away.
+      - name: Save CFA toolchain
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CFA_PREFIX }}
+          key: ${{ steps.toolchain.outputs.cache-primary-key }}
+
       - name: Add cfa to PATH
         run: |
           echo "$CFA_PREFIX/bin" >> "$GITHUB_PATH"
           "$CFA_PREFIX/bin/cfa" --version 2>&1 | head -1 || true
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        id: ccache
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cache/ccache
           key: ccache-${{ hashFiles('.gitmodules') }}-${{ github.sha }}
@@ -87,6 +96,13 @@ jobs:
           CCACHE_DIR: /home/runner/.cache/ccache
           CCACHE_BASEDIR: ${{ github.workspace }}
         run: make -j"$(nproc)" test
+
+      - name: Save ccache
+        if: always() && steps.ccache.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
 
       - name: Check generated files are unchanged
         run: |
