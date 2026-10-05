@@ -51,8 +51,11 @@ bool isKeyword( const Token & t, std::initializer_list<const char *> words ) {
 struct Open {
 	char c;							// '{', '(', '[', or 'R' for file scope
 	bool caseBody = false;			// after a case label, statements are one level in
-	int bodies = 0;					// bodies without braces pending: if ( x ) / else / do
-	bool header = false;			// the '(' of an if, while, for or with header
+	std::string bodies;				// bodies without braces pending, innermost last: 'i' for
+									// an if, 'o' for while, for, with, else and do
+	char header = 0;				// the '(' of an if ('i') or a while, for or with ('o') header
+	char owner = 0;					// a '{' that is a body: the kind of the body
+	bool stmt = false;				// a '{' that starts a statement
 };
 
 // What the last token (comments and directives aside) did.
@@ -89,6 +92,7 @@ class Formatter {
 	Prev prev = Prev::Terminator;
 	bool bodyStart = false;			// the last token ended a header, or was else or do
 	bool caseLabel = false;			// in a case label, before its ':'
+	std::string popped;				// the bodies the last token completed, for an else after it
 	size_t caseDepth = 0;
 	const Token * prevTok = nullptr;
 
@@ -105,7 +109,7 @@ class Formatter {
 		for ( size_t i = 0; i <= upto; i += 1 ) {
 			const Open & o = stack[i];
 			if ( o.c == '{' ) lv += 1;
-			if ( braceLike( o ) ) lv += ( o.caseBody ? 1 : 0 ) + o.bodies;
+			if ( braceLike( o ) ) lv += ( o.caseBody ? 1 : 0 ) + int( o.bodies.size() );
 		}
 		return lv;
 	}
@@ -140,39 +144,57 @@ void Formatter::process( const Token & t ) {
 	bool wasBodyStart = bodyStart;
 	bool elseBefore = prevTok && isKeyword( *prevTok, { "else" } ) && prevTok->endLine == t.line;
 	bodyStart = false;
+	std::string done = std::move( popped );		// what the token before completed
+	popped.clear();
 	Prev next = Prev::Other;
 
 	if ( punct && s == "{" ) {
-		if ( wasBodyStart && stack.back().bodies > 0 ) stack.back().bodies -= 1;	// the body has braces
-		stack.push_back( { '{' } );
+		Open o{ '{' };
+		o.stmt = atStatement;
+		if ( wasBodyStart && !stack.back().bodies.empty() ) {	// the body has braces
+			o.owner = stack.back().bodies.back();
+			stack.back().bodies.pop_back();
+		}
+		stack.push_back( o );
 		next = Prev::Terminator;
 	} else if ( punct && s == "}" ) {
 		size_t j = nearestBrace();
 		if ( j > 0 ) {
+			Open closed = stack[j];
 			stack.resize( j );
-			stack[nearestBrace()].bodies = 0;
+			if ( closed.owner || closed.stmt ) {
+				// The block ends its statement, and so the bodies around it,
+				// unless an else follows.
+				Open & up = stack[nearestBrace()];
+				popped = up.bodies;
+				if ( closed.owner ) popped += closed.owner;
+				up.bodies.clear();
+			}
 		}
 		next = Prev::Terminator;
 	} else if ( punct && ( s == "(" || s == "[" || s == "@[" ) ) {
 		Open o{ s == "(" ? '(' : '[' };
-		o.header = s == "(" && braceLike( stack.back() ) && prevTok && isKeyword( *prevTok, { "if", "while", "for", "with" } );
+		if ( s == "(" && braceLike( stack.back() ) && prevTok && isKeyword( *prevTok, { "if", "while", "for", "with" } ) ) {
+			o.header = prevTok->text == "if" ? 'i' : 'o';
+		}
 		stack.push_back( o );
 	} else if ( punct && ( s == ")" || s == "]" ) ) {
 		char want = s == ")" ? '(' : '[';
 		size_t j = stack.size() - 1;
 		while ( j > 0 && stack[j].c != want && !braceLike( stack[j] ) ) j -= 1;
 		if ( stack[j].c == want ) {
-			bool header = stack[j].header;
+			char header = stack[j].header;
 			stack.resize( j );
 			if ( header && braceLike( stack.back() ) ) {
-				stack.back().bodies += 1;
+				stack.back().bodies += header;
 				bodyStart = true;
 				next = Prev::HeaderEnd;
 			}
 		}
 	} else if ( punct && s == ";" ) {
 		if ( braceLike( stack.back() ) ) {
-			stack.back().bodies = 0;
+			popped = std::move( stack.back().bodies );
+			stack.back().bodies.clear();
 			next = Prev::Terminator;
 		}
 	} else if ( punct && s == ":" && caseLabel && stack.size() == caseDepth ) {
@@ -183,11 +205,15 @@ void Formatter::process( const Token & t ) {
 		caseLabel = true;
 		caseDepth = stack.size();
 	} else if ( braceLike( stack.back() ) && isKeyword( t, { "else", "do" } ) ) {
-		stack.back().bodies += 1;
+		// An else belongs to the innermost if the last statement completed
+		// that has no else yet; the bodies around that if are still open.
+		size_t k = s == "else" ? done.rfind( 'i' ) : std::string::npos;
+		if ( k != std::string::npos ) stack.back().bodies = done.substr( 0, k );
+		stack.back().bodies += 'o';
 		bodyStart = true;
 		next = Prev::HeaderEnd;
-	} else if ( elseBefore && wasBodyStart && isKeyword( t, { "if" } ) && stack.back().bodies > 0 ) {
-		stack.back().bodies -= 1;	// else if on one line: the if's body takes the else's place
+	} else if ( elseBefore && wasBodyStart && isKeyword( t, { "if" } ) && !stack.back().bodies.empty() ) {
+		stack.back().bodies.pop_back();	// else if on one line: the if's body takes the else's place
 	}
 	prev = next;
 	prevTok = &t;
@@ -245,7 +271,11 @@ std::string Formatter::run() {
 				const Open & top = stack.back();
 				lv = level( stack.size() - 1 );
 				if ( top.caseBody && isKeyword( t, { "case", "default" } ) ) lv -= 1;
-				if ( t.kind == TokKind::Punct && t.text == "{" && bodyStart && top.bodies > 0 ) lv -= 1;
+				if ( t.kind == TokKind::Punct && t.text == "{" && bodyStart && !top.bodies.empty() ) lv -= 1;
+				if ( isKeyword( t, { "else" } ) ) {		// at its if, inside the bodies still open around it
+					size_t k = popped.rfind( 'i' );
+					if ( k != std::string::npos ) lv += int( k );
+				}
 			}
 			if ( anchor ) {
 				newWidth = lv * opts.tabSize;
