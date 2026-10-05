@@ -10,7 +10,10 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "LspClient.hpp"
 #include "server/Checker.hpp"
@@ -207,11 +210,20 @@ TEST_CASE( "index: rename across files" ) {
 	CHECK( prep["placeholder"] == "area" );
 	CHECK( prep["range"]["start"] == w.pos( "main.cfa", "area( r )" ) );
 
-	// Bad names and library declarations are refused.
+	// Bad names are refused, and there is nothing to rename on punctuation.
 	json bad = at( w.uri( "main.cfa" ), p );
 	bad["newName"] = "2much";
 	CHECK( w.client->request( "textDocument/rename", bad ).contains( "error" ) );
 	CHECK( w.client->result( "textDocument/prepareRename", at( w.uri( "main.cfa" ), w.pos( "main.cfa", "{ 2" ) ) ).is_null() );
+
+	// twiceArea is declared in main.cfa and again in util.cfa, with no shared
+	// header. The index can't link the two, so renaming only main.cfa's would
+	// break the program: refused.
+	json twice = at( w.uri( "main.cfa" ), w.pos( "main.cfa", "twiceArea( r )" ) );
+	twice["newName"] = "doubleArea";
+	json err = w.client->request( "textDocument/rename", twice )["error"];
+	CHECK( err["code"] == -32803 );
+	CHECK( contains( err.value( "message", "" ), "util.cfa" ) );
 }
 
 TEST_CASE( "index: call hierarchy" ) {
@@ -286,6 +298,46 @@ TEST_CASE( "index: files changed on disk are checked again" ) {
 	w.client->notify( "workspace/didChangeWatchedFiles", { { "changes", { { { "uri", w.uri( "extra.cfa" ) }, { "type", 3 } } } } } );
 	CHECK( eventually( [&] {
 		return ! spots( w.references( "main.cfa", w.pos( "main.cfa", "area( r )" ), false ) ).count( extra );
+	} ) );
+}
+
+TEST_CASE( "index: rename refuses uses the index can't see" ) {
+	if ( ! ready() ) return;
+	Workspace & w = workspace();
+	json params = at( w.uri( "main.cfa" ), w.pos( "main.cfa", "area( r )", 1 ) );
+	params["newName"] = "surface";
+	auto refusal = [&]( const std::string & part ) {
+		json err;
+		bool ok = eventually( [&] {
+			err = w.client->request( "textDocument/rename", params )["error"];
+			return err.is_object() && contains( err.value( "message", "" ), part );
+		} );
+		if ( ! ok ) MESSAGE( "last answer: " << err.dump() );
+		return ok;
+	};
+	auto changed = [&]( const std::vector<std::pair<std::string, int>> & files ) {
+		json list = json::array();
+		for ( const auto & [name, type] : files ) list.push_back( { { "uri", w.uri( name ) }, { "type", type } } );
+		w.client->notify( "workspace/didChangeWatchedFiles", { { "changes", list } } );
+	};
+
+	// A file that fails to preprocess leaves no table, but it calls area.
+	std::ofstream( w.path( "broken.cfa" ) ) << "#include \"missing.hfa\"\n#include \"shapes.hfa\"\n\ndouble b( Rect r ) { return area( r ); }\n";
+	changed( { { "broken.cfa", 1 } } );
+	CHECK( refusal( "broken.cfa" ) );
+
+	// A macro body in a file that isn't open names area.
+	fs::remove( w.path( "broken.cfa" ) );
+	std::ofstream( w.path( "macro.cfa" ) ) << "#include \"shapes.hfa\"\n\n#define AREA2( r ) ( 2 * area( r ) )\ndouble width( Rect r ) { return r.w; }\n";
+	changed( { { "broken.cfa", 3 }, { "macro.cfa", 1 } } );
+	CHECK( refusal( "macro on line 3 of macro.cfa" ) );
+
+	// Without them the rename goes through again.
+	fs::remove( w.path( "macro.cfa" ) );
+	changed( { { "macro.cfa", 3 } } );
+	CHECK( eventually( [&] {
+		json r = w.client->request( "textDocument/rename", params );
+		return r.contains( "result" ) && r["result"].is_object();
 	} ) );
 }
 

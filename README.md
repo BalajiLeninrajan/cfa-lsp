@@ -295,7 +295,9 @@ lines inside a block comment move with the line the comment starts on.
 - Each file is checked on its own. Open headers are checked as if they were
   the main file.
 - The index matches declarations by location. A function declared separately
-  in two `.cfa` files, without a shared header, is two functions to it.
+  in two `.cfa` files, without a shared header, is two functions to it, so
+  references and call hierarchy show only one side. Rename refuses such a
+  name.
 - The index reads files from disk, so a file changed outside the editor is
   only picked up on the next save or watched-file notification.
 - An unsaved header is found through the include path. A header on disk that
@@ -305,8 +307,10 @@ lines inside a block comment move with the line the comment starts on.
   the loop variable have none either: they name the copy the translator makes
   in the function it generates for the body.
 - Rename of a name declared in a header or used in other files needs the
-  index, and waits until it has checked every file. Without it, rename works
-  within one file and refuses such names. It always refuses names declared
+  index, and is refused until the index has checked every file, while the
+  walk was cut short by the limits above, and when the name appears in a file
+  whose check failed. Without the index, rename works within one file and
+  refuses such names. It always refuses names declared
   in libcfa or the prelude, operators, names used in a macro body, and names
   spelled somewhere the dump has no reference for, such as a designator, an
   array dimension in a typedef, cast or `sizeof`, an `#if 0` block or a
