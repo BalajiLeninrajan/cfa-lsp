@@ -1031,13 +1031,13 @@ TEST_CASE( "code actions: did you mean" ) {
 	std::string path = fs::canonical( fixtures() + "/server/hello.cfa" ).string();
 	std::string uri = pathToUri( path );
 	std::string text = readAll( path );
-	text.replace( text.find( "twice( 21 )" ), 5, "twcie" );		// line 9: int y = twcie( 21 );
+	text.replace( text.find( "twice( 21 )" ), 5, "twcie" );		// line 9: \tint y = twcie( 21 );
 	Session s;
 	s.initialize( fakeOptions( { { "backend", false } } ) );
 	s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 }, { "text", text } } } } );
 	REQUIRE( s.diagnosticsFor( uri, []( const json & ) { return true; } ) );
 
-	json diag = { { "range", { { "start", pos( 8, 12 ) }, { "end", pos( 8, 17 ) } } }, { "severity", 1 }, { "source", "cfa" },
+	json diag = { { "range", { { "start", pos( 8, 9 ) }, { "end", pos( 8, 14 ) } } }, { "severity", 1 }, { "source", "cfa" },
 				  { "message", "use of undeclared identifier `twcie`" } };
 	json params = { { "textDocument", { { "uri", uri } } }, { "range", diag["range"] }, { "context", { { "diagnostics", json::array( { diag } ) } } } };
 	json actions = s.request( "textDocument/codeAction", params )["result"];
