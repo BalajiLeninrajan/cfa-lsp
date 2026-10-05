@@ -220,6 +220,29 @@ TEST_CASE( "sourcemap: #line in the source" ) {
 	CHECK( m.map( F, { 4, 6, 9 }, true ) == L( 7, 7 ) );
 }
 
+// cpp ignores a #line inside a comment, so the lines after it keep their numbers.
+TEST_CASE( "sourcemap: #line in a comment" ) {
+	Files f;
+	f.text["/r/c.cfa"] =
+		"/*\n"
+		"#line 2\n"
+		"*/\n"
+		"int   b;\n"
+		"\n"
+		"int  c;\n";
+	std::string prep =
+		"# 1 \"/r/c.cfa\"\n"
+		"\n"
+		"\n"
+		"\n"
+		"int b;\n"
+		"\n"
+		"int c;\n";
+	SourceMap m( prep, f.reader() );
+	CHECK( m.map( "/r/c.cfa", 4, 4 ) == L( 3, 6 ) );
+	CHECK( m.map( "/r/c.cfa", 6, 4 ) == L( 5, 5 ) );
+}
+
 // An identifier in a macro's body that is also an argument: the expansion is
 // redone from the #define, so the body's tmp maps to the whole invocation and
 // the argument's to the argument.
