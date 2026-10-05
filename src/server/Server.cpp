@@ -558,6 +558,7 @@ void Server::applyOptions( const json & io ) {
 	std::lock_guard<std::mutex> lock( mtx );
 	opts = o;
 	checker = chk;
+	headers.reset();						// cfa may have moved
 	effective = io;
 }
 
