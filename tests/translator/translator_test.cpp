@@ -876,5 +876,13 @@ TEST_CASE( "translator: code that desugaring moves into a generated function has
 	for ( const json & s : r->dump["scopes"] ) {
 		CHECK_MESSAGE( ! ( s["line"] == 7 ), s.dump() );
 		CHECK_MESSAGE( ! ( s["line"] == 6 && s["col"] == 0 ), s.dump() );
+		CHECK_MESSAGE( ! ( s["line"] == 8 && s["col"] == 0 ), s.dump() );
 	}
+	// cofor ( i; 3 ) { ... }
+	expectRef( *r, 8, "bump", 3, "call" );
+	expectRef( *r, 8, "total", 5, "read" );
+	// A known gap (see the README): in the body, i names the copy that cofor makes in its generated function,
+	// which is a generated declaration.
+	INFO( "refs on line 8:" << refsOn( *r, 8 ) );
+	CHECK_FALSE( refAt( *r, 8, r->col( 8, "i", 1 ) ) );
 }

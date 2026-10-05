@@ -208,7 +208,9 @@ the wrong spot in a few cases:
 - Each file is checked on its own. Open headers are checked as if they were
   the main file. Saving a header re-checks the open files; nothing else
   tracks dependencies between files.
-- Uses inside macro bodies have no references.
+- Uses inside macro bodies have no references. Inside a `cofor` body, uses of
+  the loop variable have none either: they name the copy the translator makes
+  in the function it generates for the body.
 - Rename works within one file. It refuses a name declared in another file
   (a header, libcfa), a global or a field declared in a header (the files that
   include it aren't known), operators, and names used in a macro of the file.
