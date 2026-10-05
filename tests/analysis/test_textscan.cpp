@@ -190,4 +190,37 @@ TEST_CASE( "completion contexts" ) {
 	CHECK( completionContext( "\t) ." ).kind == CompletionContext::None );
 }
 
+TEST_CASE( "declarations found in text" ) {
+	std::string text = "void f( Pair( int ) & p, Node ** q ) {\n\tstruct S s = { 0 };\n\tif ( c ) s = t;\n\treturn s;\n}\n";
+	auto typeOf = [&]( const TextDeclaration & d ) { return text.substr( d.typeStart, d.typeEnd - d.typeStart ); };
+	auto nameOf = [&]( const TextDeclaration & d ) { return text.substr( d.nameStart, d.nameEnd - d.nameStart ); };
+
+	auto ds = declarationsOf( text, "p" );
+	REQUIRE( ds.size() == 1 );
+	CHECK( ds[0].typeName == "Pair" );
+	CHECK( typeOf( ds[0] ) == "Pair( int ) &" );
+	CHECK( nameOf( ds[0] ) == "p" );
+	CHECK( ds[0].pointers == 0 );
+	ds = declarationsOf( text, "q" );
+	REQUIRE( ds.size() == 1 );
+	CHECK( ds[0].typeName == "Node" );
+	CHECK( ds[0].pointers == 2 );
+	// `if ( c ) s = t;` and `return s;` are not declarations.
+	ds = declarationsOf( text, "s" );
+	REQUIRE( ds.size() == 1 );
+	CHECK( typeOf( ds[0] ) == "struct S" );
+	// Only before `end`.
+	CHECK( declarationsOf( text, "s", text.find( "s =" ) ).empty() );
+
+	auto n = declarationsAt( text, text.find( "return s" ) + 8 );
+	REQUIRE( n );
+	CHECK( n->name == "s" );
+	CHECK( n->start == text.find( "return s" ) + 7 );
+	REQUIRE( n->declarations.size() == 1 );
+	CHECK( n->declarations[0].nameStart == text.find( "s =" ) );
+	CHECK_FALSE( declarationsAt( text, text.find( "0 }" ) ) );			// a number
+	CHECK_FALSE( declarationsAt( "// Rect r;\n", 8 ) );					// a comment
+	CHECK_FALSE( declarationsAt( "f( \"r\" );", 4 ) );					// a string
+}
+
 } // TEST_SUITE

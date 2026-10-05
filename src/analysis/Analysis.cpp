@@ -418,6 +418,13 @@ struct Analysis::Impl {
 						 std::string_view textBefore ) const;
 	int aggregateNamed( const std::string & name ) const;
 	std::optional<std::pair<int, int>> declaredInText( std::string_view text, const std::string & name ) const;
+	bool namesType( const std::string & name ) const;
+	struct TextDecl {
+		std::string name, type;				// type as written, whitespace collapsed
+		Range nameRange;					// the declared name, in the scanned text
+		Range useRange;						// the name at the cursor, in the scanned text
+	};
+	std::optional<TextDecl> textDeclarationAt( const std::string & text, size_t offset ) const;
 	std::vector<int> unresolvedAt( int fi, Loc pos, Range & range ) const;
 	std::vector<int> functionsNamed( const std::string & name ) const;
 	CompletionItem item( int d, char rank, const std::string & detailSuffix, bool withDoc ) const;
@@ -1189,34 +1196,53 @@ int Analysis::Impl::aggregateNamed( const std::string & name ) const {
 // A declaration of `name` in text the translator hasn't seen (`Circle & c = w;`, `Rect r;`): the aggregate
 // of its type and its pointer levels. The nearest declaration before the end of `text` wins.
 std::optional<std::pair<int, int>> Analysis::Impl::declaredInText( std::string_view text, const std::string & name ) const {
-	if ( text.size() > 32768 ) {
-		size_t cut = text.find( '\n', text.size() - 32768 );
-		text = text.substr( cut == std::string_view::npos ? text.size() - 32768 : cut + 1 );
+	for ( const text::TextDeclaration & d : text::declarationsOf( text, name ) ) {
+		int agg = aggregateNamed( d.typeName );
+		if ( agg >= 0 ) return std::pair( agg, d.pointers );
 	}
-	std::vector<Token> toks = lex( text );
-	static const std::set<std::string_view> follows = { ";", "=", ",", ")", "[", "{", ":" };
-	static const std::set<std::string_view> qualifiers = { "const", "volatile", "restrict", "mutex", "&", "&&" };
-	for ( size_t i = toks.size(); i-- > 1; ) {
-		if ( toks[i].kind != TokKind::Identifier || toks[i].text != name ) continue;
-		if ( i + 1 < toks.size() && !follows.count( toks[i + 1].text ) ) continue;
-		size_t k = i;
-		int stars = 0;
-		while ( k > 0 && ( toks[k - 1].text == "*" || qualifiers.count( toks[k - 1].text ) ) ) {
-			if ( toks[k - 1].text == "*" ) stars += 1;
-			k -= 1;
+	return std::nullopt;
+}
+
+// Is `name` a type: a basic type keyword, or an aggregate, typedef or type parameter in the dump?
+bool Analysis::Impl::namesType( const std::string & name ) const {
+	static const std::set<std::string_view> basic = {
+		"void", "char", "short", "int", "long", "float", "double", "signed", "unsigned", "bool", "_Bool",
+		"_Complex", "zero_t", "one_t",
+	};
+	if ( basic.count( name ) ) return true;
+	auto it = byName.find( name );
+	if ( it == byName.end() ) return false;
+	for ( int d : it->second ) {
+		Kind k = decls[d].kind;
+		if ( ( isAggregate( k ) && k != Kind::Trait ) || k == Kind::Typedef || k == Kind::TypeParam ) return true;
+	}
+	return false;
+}
+
+// The declaration of the name at `offset` in `text`, by scanning the text: the nearest one before it whose type
+// is a type.
+std::optional<Analysis::Impl::TextDecl> Analysis::Impl::textDeclarationAt( const std::string & text, size_t offset ) const {
+	auto found = text::declarationsAt( text, offset );
+	if ( !found ) return std::nullopt;
+	for ( const text::TextDeclaration & d : found->declarations ) {
+		if ( !namesType( d.typeName ) ) continue;
+		auto locOf = [&]( size_t off ) {
+			size_t nl = off == 0 ? std::string::npos : text.rfind( '\n', off - 1 );
+			return Loc{ int( std::count( text.begin(), text.begin() + off, '\n' ) ),
+						int( nl == std::string::npos ? off : off - nl - 1 ) };
+		};
+		TextDecl out;
+		out.name = found->name;
+		std::string type;
+		for ( char c : std::string_view( text ).substr( d.typeStart, d.typeEnd - d.typeStart ) ) {
+			bool space = c == ' ' || c == '\t' || c == '\n' || c == '\r';
+			if ( !space ) type += c;
+			else if ( !type.empty() && type.back() != ' ' ) type += ' ';
 		}
-		if ( k > 0 && toks[k - 1].text == ")" ) {			// generic arguments: Pair( int ) p
-			int depth = 0;
-			while ( k > 0 ) {
-				k -= 1;
-				if ( toks[k].text == ")" ) depth += 1;
-				else if ( toks[k].text == "(" && --depth == 0 ) break;
-			}
-			if ( depth != 0 ) continue;
-		}
-		if ( k == 0 || toks[k - 1].kind != TokKind::Identifier ) continue;
-		int agg = aggregateNamed( toks[k - 1].text );
-		if ( agg >= 0 ) return std::pair( agg, stars );
+		out.type = type;
+		out.nameRange = { locOf( d.nameStart ), locOf( d.nameEnd ) };
+		out.useRange = { locOf( found->start ), locOf( found->end ) };
+		return out;
 	}
 	return std::nullopt;
 }
@@ -2040,6 +2066,21 @@ std::vector<Location> Analysis::definition( const std::string & file, Loc pos ) 
 		if ( m.decls[d].hasLoc && seen.insert( m.entity[d] ).second ) out.push_back( m.location( d ) );
 	}
 	return out;
+}
+
+std::optional<HoverResult> Analysis::hoverInText( const std::string & text, size_t offset ) const {
+	auto d = impl->textDeclarationAt( text, offset );
+	if ( !d ) return std::nullopt;
+	std::string md = "```cfa\n" + d->type + " " + d->name + "\n```\n\nline " +
+					 std::to_string( d->nameRange.start.line + 1 ) +
+					 " · *from the text: the translator has not checked this declaration*";
+	return HoverResult{ md, d->useRange };
+}
+
+std::optional<Range> Analysis::declarationInText( const std::string & text, size_t offset ) const {
+	auto d = impl->textDeclarationAt( text, offset );
+	if ( !d ) return std::nullopt;
+	return d->nameRange;
 }
 
 std::vector<Location> Analysis::Impl::entityReferences( int decl, bool includeDeclaration ) const {

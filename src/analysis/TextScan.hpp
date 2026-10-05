@@ -74,6 +74,31 @@ struct CallArguments {
 };
 std::optional<CallArguments> callArguments( const FileText & f, Loc from );
 
+// A declaration found in code the translator has not seen (`Rect r;`, `const Circle & c = w;`, a parameter
+// `Pair( int ) p`), by the shape of its tokens alone: `a * b;` counts as a declaration of `b`, so callers check
+// that `typeName` names a type. Offsets are into the scanned text.
+struct TextDeclaration {
+	std::string typeName;					// the identifier naming the type ("Pair")
+	size_t typeStart = 0, typeEnd = 0;		// the type as written, with qualifiers and `*`s ("const Circle &")
+	size_t nameStart = 0, nameEnd = 0;		// the declared name
+	int pointers = 0;						// `*`s between the type and the name
+};
+
+// Declarations of `name` in `text` whose name starts before offset `end`, nearest first. Only the 32 KB of
+// text before `end` are scanned.
+std::vector<TextDeclaration> declarationsOf( std::string_view text, std::string_view name,
+											 size_t end = std::string_view::npos );
+
+// The identifier at `offset` in `text` (offset inside it or right after it) and the declarations of that name
+// before it, the identifier itself included if it is being declared. nullopt if there is no identifier at
+// `offset` or it is in a comment or a literal.
+struct NameInText {
+	std::string name;
+	size_t start = 0, end = 0;
+	std::vector<TextDeclaration> declarations;	// nearest first
+};
+std::optional<NameInText> declarationsAt( std::string_view text, size_t offset );
+
 // What completion should offer, worked out from the text before the cursor on
 // the cursor's line.
 struct CompletionContext {

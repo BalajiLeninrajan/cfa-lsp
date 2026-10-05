@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <set>
+
+#include "Lexer.hpp"
 
 namespace cfalsp::text {
 
@@ -477,6 +480,105 @@ std::optional<CallArguments> callArguments( const FileText & f, Loc from ) {
 			continue;
 		}
 		mark( i, i + 1 );
+	}
+	return std::nullopt;
+}
+
+namespace {
+
+// The part of `text` that the declaration scans read: from a line start about 32 KB before `end` to 1 KB past it,
+// which holds the token after a name that ends at `end`.
+std::pair<size_t, size_t> scanWindow( std::string_view text, size_t end ) {
+	end = std::min( end, text.size() );
+	size_t begin = 0;
+	if ( end > 32768 ) {
+		size_t cut = text.find( '\n', end - 32768 );
+		begin = cut == std::string_view::npos || cut >= end ? end - 32768 : cut + 1;
+	}
+	return { begin, std::min( text.size(), end + 1024 ) };
+}
+
+// Declarations of `name` among `toks` (lexed from text starting at offset `base`) at token indices below `limit`.
+std::vector<TextDeclaration> declarationsIn( const std::vector<Token> & toks, size_t limit, std::string_view name,
+											 size_t base ) {
+	// The tokens that can follow a declared name, and those that can sit between the type and the name.
+	static const std::set<std::string_view> follows = { ";", "=", ",", ")", "[", "{", ":" };
+	static const std::set<std::string_view> qualifiers = { "const", "volatile", "restrict", "mutex", "&", "&&" };
+	// Keywords that can't be the last word of a type, so `return x;` and `if ( c ) x = 1;` are not declarations.
+	static const std::set<std::string_view> notTypes = {
+		"return", "else", "goto", "case", "default", "do", "if", "while", "for", "switch", "choose", "with", "when",
+		"waitfor", "waituntil", "sizeof", "typeof", "alignof", "_Alignof", "throw", "throwResume", "resume",
+		"suspend", "catch", "catchResume", "fixup", "recover", "finally", "try", "break", "continue",
+		"fallthrough", "fallthru", "struct", "union", "enum", "typedef", "extern", "static", "auto", "register",
+		"inline", "const", "volatile", "restrict", "mutex", "forall", "trait", "coroutine", "monitor", "thread",
+		"generator", "exception", "otype", "dtype", "ftype", "ttype", "sized", "asm", "true", "false",
+	};
+	// Words before the type name that are part of the type: `const struct S`, `unsigned long`.
+	static const std::set<std::string_view> leading = {
+		"const", "volatile", "restrict", "_Atomic", "struct", "union", "enum", "signed", "unsigned", "short",
+		"long", "int", "char", "double", "float", "_Complex",
+	};
+	std::vector<TextDeclaration> out;
+	for ( size_t i = std::min( limit, toks.size() ); i-- > 1; ) {
+		if ( toks[i].kind != TokKind::Identifier || toks[i].text != name ) continue;
+		if ( i + 1 < toks.size() && !follows.count( toks[i + 1].text ) ) continue;
+		size_t k = i;
+		int stars = 0;
+		while ( k > 0 && ( toks[k - 1].text == "*" || qualifiers.count( toks[k - 1].text ) ) ) {
+			if ( toks[k - 1].text == "*" ) stars += 1;
+			k -= 1;
+		}
+		if ( k > 0 && toks[k - 1].text == ")" ) {			// generic arguments: Pair( int ) p
+			int depth = 0;
+			while ( k > 0 ) {
+				k -= 1;
+				if ( toks[k].text == ")" ) depth += 1;
+				else if ( toks[k].text == "(" && --depth == 0 ) break;
+			}
+			if ( depth != 0 ) continue;
+		}
+		if ( k == 0 || toks[k - 1].kind != TokKind::Identifier || notTypes.count( toks[k - 1].text ) ) continue;
+		TextDeclaration d;
+		d.typeName = toks[k - 1].text;
+		size_t first = k - 1;
+		while ( first > 0 && toks[first - 1].kind == TokKind::Identifier && leading.count( toks[first - 1].text ) ) first -= 1;
+		d.typeStart = base + toks[first].offset;
+		d.typeEnd = base + toks[i - 1].endOffset;
+		d.nameStart = base + toks[i].offset;
+		d.nameEnd = base + toks[i].endOffset;
+		d.pointers = stars;
+		out.push_back( std::move( d ) );
+	}
+	return out;
+}
+
+} // namespace
+
+std::vector<TextDeclaration> declarationsOf( std::string_view text, std::string_view name, size_t end ) {
+	auto [begin, stop] = scanWindow( text, end );
+	end = std::min( end, text.size() );
+	std::vector<Token> toks = lex( text.substr( begin, stop - begin ) );
+	size_t limit = 0;
+	while ( limit < toks.size() && begin + toks[limit].offset < end ) limit += 1;
+	return declarationsIn( toks, limit, name, begin );
+}
+
+std::optional<NameInText> declarationsAt( std::string_view text, size_t offset ) {
+	if ( offset > text.size() ) return std::nullopt;
+	auto [begin, stop] = scanWindow( text, offset );
+	std::vector<Token> toks = lex( text.substr( begin, stop - begin ) );
+	for ( size_t i = 0; i < toks.size(); i += 1 ) {
+		size_t b = begin + toks[i].offset, e = begin + toks[i].endOffset;
+		if ( offset < b ) break;
+		if ( offset > e || ( offset == e && i + 1 < toks.size() && begin + toks[i + 1].offset == e &&
+							 toks[i + 1].kind == TokKind::Identifier ) ) continue;
+		if ( toks[i].kind != TokKind::Identifier || !isIdentStart( toks[i].text[0] ) ) return std::nullopt;
+		NameInText n;
+		n.name = toks[i].text;
+		n.start = b;
+		n.end = e;
+		n.declarations = declarationsIn( toks, i + 1, n.name, begin );
+		return n;
 	}
 	return std::nullopt;
 }
