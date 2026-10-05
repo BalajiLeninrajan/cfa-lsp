@@ -3,10 +3,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -37,6 +40,12 @@ class Server {
 	// processes and removing its temp directory) and stops the worker.
 	void terminate();
 
+	// For tests: called at points where a race could happen, so a test can
+	// hold one thread there. "publish": the worker has built a
+	// publishDiagnostics batch and released the document lock, but not sent
+	// it. "closed": didClose has sent its empty publish. Set before run().
+	void setTestHook( std::function<void( const char * point )> hook ) { testHook = std::move( hook ); }
+
   private:
 	using json = nlohmann::json;
 	using Clock = std::chrono::steady_clock;
@@ -59,8 +68,14 @@ class Server {
 		// The seq at which the buffer had the contents on disk (when opened or
 		// saved), which is what other documents' checks read; unset if unknown.
 		std::optional<uint64_t> diskSeq;
+		// The last backend run's diagnostics, at backSeq for the main file.
+		// Shown again while later checks can't run the backend, minus those
+		// on lines edited since.
+		std::vector<Diag> backDiags;
+		uint64_t backSeq = 0;
 
 		EditList editsSince( uint64_t s ) const;
+		EditList editsBetween( uint64_t from, uint64_t to ) const;	// took seq `from` to seq `to`
 	};
 
 	struct InFlight {
@@ -76,8 +91,19 @@ class Server {
 		std::optional<std::vector<std::string>> flags;
 	};
 
+	struct Incoming {
+		json msg;
+		std::string error;					// set if the body isn't JSON
+	};
+
 	// protocol
+	static Incoming parse( const std::string & body );
+	// Reads the messages that have already arrived, so a $/cancelRequest
+	// for `current` or for a queued request is seen before it is answered.
+	void readAhead( const json & current );
 	void handle( const json & msg );
+	void response( const json & msg );
+	int sendRequest( const std::string & method, json params );
 	json request( const std::string & method, const json & params );
 	void notification( const std::string & method, const json & params );
 	void send( const json & msg );
@@ -87,6 +113,13 @@ class Server {
 	json initialize( const json & params );
 	void startWorker();
 	void stopWorker();
+
+	// configuration
+	void applyOptions( const json & io );	// initializationOptions merged with settings
+	void didChangeConfiguration( const json & params );
+	void applySettings( const json & settings );
+	void requestConfiguration();
+	void warnMissing();
 
 	// documents
 	void didOpen( const json & params );
@@ -141,6 +174,7 @@ class Server {
 	// checking
 	void workerLoop();
 	CheckRequest makeRequest( const Document & doc ) const;
+	void rebaseBackend( Document & doc, uint64_t seq );	// caller holds mtx
 
 	MessageReader reader;
 	MessageWriter writer;
@@ -152,15 +186,27 @@ class Server {
 	bool prepareRenameSupport = false;
 	bool inlayHintRefresh = false;			// the client takes workspace/inlayHint/refresh
 	std::string rootPath;
-	Options opts;
-	std::unique_ptr<Checker> checker;
-	bool warnedMissing = false;
+	bool configurationPull = false;			// client answers workspace/configuration
+	bool configurationRegistration = false;	// client takes dynamic registration of didChangeConfiguration
+	json initOptions = json::object();
+	json settings = json::object();			// from the client's configuration, our section only
+	json effective;							// what opts and checker were made from
+	std::string warnedMissing;				// the last missing-tool warning shown
+	std::deque<Incoming> inbox;				// read ahead, not handled yet
+	std::set<std::string> cancelled;		// ids (dumped) of requests to answer with RequestCancelled
+	int nextRequestId = 1;
+	std::set<int> configRequests;			// our workspace/configuration requests awaiting a response
+	std::function<void( const char * )> testHook;
 
 	// Held from building a publishDiagnostics notification until it is sent,
 	// so publishes for one file go out in the order they were built. Taken
 	// while holding mtx, never the other way round.
 	std::mutex publishMtx;
 	std::mutex mtx;							// guards everything below
+	// opts and checker change only on the reader thread, which can read
+	// them without the lock.
+	Options opts;
+	std::shared_ptr<const Checker> checker;
 	std::map<std::string, Document> docs;	// by path
 	// target file -> source document (the check that produced them) -> diagnostics
 	std::map<std::string, std::map<std::string, DiagSet>> diagStore;

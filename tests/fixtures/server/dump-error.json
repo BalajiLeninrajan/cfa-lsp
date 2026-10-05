@@ -5,7 +5,11 @@
     { "file": "@DIR@/hello.hfa", "line": 2, "col": 4, "endLine": 2, "endCol": 9, "severity": "error",
       "message": "fake error in header" },
     { "file": "@FILE@", "line": 9, "col": 9, "endLine": 9, "endCol": 14, "severity": "error",
-      "message": "fake error in main" }
+      "message": "fake error in main" },
+    { "file": "/nonexistent-prelude/sys.hfa", "line": 3, "col": 0, "endLine": 3, "endCol": 4, "severity": "error",
+      "message": "fake error in a system header" },
+    { "file": "/nonexistent-prelude/sys.hfa", "line": 4, "col": 0, "endLine": 4, "endCol": 4, "severity": "warning",
+      "message": "fake warning in a system header" }
   ],
   "decls": [],
   "refs": [],

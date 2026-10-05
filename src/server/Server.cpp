@@ -8,6 +8,7 @@
 #include <functional>
 #include <set>
 #include <sstream>
+#include <tuple>
 
 #include "Flags.hpp"
 #include "Log.hpp"
@@ -28,6 +29,7 @@ enum ErrorCode {
 	InternalError = -32603,
 	ServerNotInitialized = -32002,
 	RequestFailed = -32803,
+	RequestCancelled = -32800,
 };
 
 struct LspError {
@@ -59,6 +61,20 @@ const nlohmann::json & member( const nlohmann::json & j, const char * key ) {
 }
 
 int intOr( const nlohmann::json & j, int dflt ) { return j.is_number_integer() ? j.get<int>() : dflt; }
+
+std::string methodOf( const nlohmann::json & msg ) {
+	const nlohmann::json & m = member( msg, "method" );
+	return m.is_string() ? m.get<std::string>() : std::string();
+}
+
+// Adds the diagnostics in `more` that `into` doesn't have on the same line.
+void mergeDiags( std::vector<Diag> & into, const std::vector<Diag> & more ) {
+	std::set<std::tuple<std::string, int, std::string>> seen;
+	for ( const auto & d : into ) seen.insert( { d.file, d.range.start.line, d.message } );
+	for ( const auto & d : more ) {
+		if ( seen.insert( { d.file, d.range.start.line, d.message } ).second ) into.push_back( d );
+	}
+}
 
 // A full-text change as a few small edits, so the snapshot mapping stays
 // useful for clients that only send whole buffers: one edit per changed run
@@ -156,28 +172,78 @@ EditList Server::Document::editsSince( uint64_t s ) const {
 	return out;
 }
 
+EditList Server::Document::editsBetween( uint64_t from, uint64_t to ) const {
+	EditList out;
+	for ( const auto & [seq, e] : log ) {
+		if ( seq > from && seq <= to ) out.push_back( e );
+	}
+	return out;
+}
+
+Server::Incoming Server::parse( const std::string & body ) {
+	Incoming in;
+	try {
+		in.msg = json::parse( body );
+	} catch ( const std::exception & e ) {
+		in.error = e.what();
+	}
+	return in;
+}
+
 int Server::run() {
 	for ( ;; ) {
-		auto body = reader.read();
-		if ( ! body ) {
-			log::info( "end of input" );
-			stopWorker();
-			return phase == Phase::ShuttingDown ? 0 : 1;
+		if ( inbox.empty() ) {
+			auto body = reader.read();
+			if ( ! body ) {
+				log::info( "end of input" );
+				stopWorker();
+				return phase == Phase::ShuttingDown ? 0 : 1;
+			}
+			inbox.push_back( parse( *body ) );
 		}
-		json msg;
-		try {
-			msg = json::parse( *body );
-		} catch ( const std::exception & e ) {
+		Incoming in = std::move( inbox.front() );
+		inbox.pop_front();
+		if ( ! in.error.empty() ) {
 			send( { { "jsonrpc", "2.0" }, { "id", nullptr },
-					{ "error", { { "code", ParseError }, { "message", e.what() } } } } );
+					{ "error", { { "code", ParseError }, { "message", in.error } } } } );
 			continue;
 		}
-		if ( msg.is_object() && msg.value( "method", "" ) == "exit" ) {
+		const json & msg = in.msg;
+		if ( methodOf( msg ) == "exit" ) {
 			log::info( "exit" );
 			stopWorker();
 			return phase == Phase::ShuttingDown ? 0 : 1;
 		}
+		// Requests are answered in order, so a request can wait behind a slow
+		// one. Its cancel may have arrived meanwhile.
+		if ( msg.is_object() && msg.contains( "id" ) && msg.contains( "method" ) ) {
+			readAhead( msg["id"] );
+			auto c = cancelled.find( msg["id"].dump() );
+			if ( c != cancelled.end() ) {
+				cancelled.erase( c );
+				send( { { "jsonrpc", "2.0" }, { "id", msg["id"] },
+						{ "error", { { "code", RequestCancelled }, { "message", "request cancelled" } } } } );
+				continue;
+			}
+		}
 		handle( msg );
+	}
+}
+
+void Server::readAhead( const json & current ) {
+	while ( auto body = reader.tryRead() ) {
+		Incoming in = parse( *body );
+		if ( in.error.empty() && methodOf( in.msg ) == "$/cancelRequest" ) {
+			const json & id = member( member( in.msg, "params" ), "id" );
+			bool known = id == current;
+			for ( const Incoming & q : inbox ) {
+				known = known || ( q.msg.is_object() && q.msg.contains( "method" ) && member( q.msg, "id" ) == id );
+			}
+			// A cancel for a request already answered needs nothing.
+			if ( known && ! id.is_null() ) cancelled.insert( id.dump() );
+			continue;
+		}
+		inbox.push_back( std::move( in ) );
 	}
 }
 
@@ -203,8 +269,10 @@ void Server::handle( const json & msg ) {
 		if ( ! hasId ) {
 			send( { { "jsonrpc", "2.0" }, { "id", nullptr },
 					{ "error", { { "code", InvalidRequest }, { "message", "missing method" } } } } );
+		} else {
+			response( msg );						// to something we sent
 		}
-		return;										// a response to something we sent
+		return;
 	}
 	const std::string method = *mit;
 	const json & params = member( msg, "params" );
@@ -266,14 +334,12 @@ nlohmann::json Server::request( const std::string & method, const json & params 
 void Server::notification( const std::string & method, const json & params ) {
 	if ( phase == Phase::Uninitialized ) return;		// dropped, per spec
 	if ( method == "initialized" ) {
-		const Toolchain & tc = checker->toolchain();
-		std::string missing;
-		if ( tc.cfa.empty() ) missing = "the cfa compiler (not on PATH; set initializationOptions.cfa)";
-		else if ( tc.translator.empty() ) missing = "the cfa-lsp translator (set initializationOptions.translator or CFA_LSP_TRANSLATOR); only compiler errors will be shown";
-		if ( ! missing.empty() && ! warnedMissing ) {
-			warnedMissing = true;
-			notify( "window/showMessage", { { "type", 2 }, { "message", "cfa-lsp: cannot find " + missing + "." } } );
+		warnMissing();
+		if ( configurationRegistration ) {
+			sendRequest( "client/registerCapability",
+						 { { "registrations", { { { "id", "cfa-lsp-configuration" }, { "method", "workspace/didChangeConfiguration" } } } } } );
 		}
+		if ( configurationPull ) requestConfiguration();
 		return;
 	}
 	if ( phase == Phase::ShuttingDown ) return;
@@ -281,8 +347,22 @@ void Server::notification( const std::string & method, const json & params ) {
 	else if ( method == "textDocument/didChange" ) didChange( params );
 	else if ( method == "textDocument/didClose" ) didClose( params );
 	else if ( method == "textDocument/didSave" ) didSave( params );
-	// $/cancelRequest: requests are answered in order as they arrive, so by
-	// the time a cancel is read its request has been answered.
+	else if ( method == "workspace/didChangeConfiguration" ) didChangeConfiguration( params );
+	// $/cancelRequest is handled when reading ahead (see run()); by the time
+	// one gets here, its request has been answered.
+}
+
+int Server::sendRequest( const std::string & method, json params ) {
+	int id = nextRequestId++;
+	send( { { "jsonrpc", "2.0" }, { "id", id }, { "method", method }, { "params", std::move( params ) } } );
+	return id;
+}
+
+void Server::response( const json & msg ) {
+	const json & id = member( msg, "id" );
+	if ( ! id.is_number_integer() || configRequests.erase( id.get<int>() ) == 0 ) return;
+	const json & result = member( msg, "result" );
+	if ( result.is_array() && ! result.empty() ) applySettings( result[0] );
 }
 
 nlohmann::json Server::initialize( const json & params ) {
@@ -297,6 +377,9 @@ nlohmann::json Server::initialize( const json & params ) {
 	hierarchicalSymbols = member( member( member( caps, "textDocument" ), "documentSymbol" ), "hierarchicalDocumentSymbolSupport" ) == true;
 	prepareRenameSupport = member( member( member( caps, "textDocument" ), "rename" ), "prepareSupport" ) == true;
 	inlayHintRefresh = member( member( member( caps, "workspace" ), "inlayHint" ), "refreshSupport" ) == true;
+	const json & ws = member( caps, "workspace" );
+	configurationPull = member( ws, "configuration" ) == true;
+	configurationRegistration = member( member( ws, "didChangeConfiguration" ), "dynamicRegistration" ) == true;
 
 	const json & root = member( params, "rootUri" );
 	if ( root.is_string() ) {
@@ -306,31 +389,9 @@ nlohmann::json Server::initialize( const json & params ) {
 	}
 
 	const json & io = member( params, "initializationOptions" );
-	ToolchainOptions to;
-	to.exeDir = exeDir;
-	auto str = [&]( const char * k ) { return member( io, k ).is_string() ? member( io, k ).get<std::string>() : std::string(); };
-	to.cfa = str( "cfa" );
-	to.translator = str( "translator" );
-	to.preludeDir = str( "preludeDir" );
-	to.cc = str( "cc" );
-	opts.debounceMs = std::max( 0, intOr( member( io, "debounceMs" ), 500 ) );
-	opts.timeoutMs = std::max( 1, intOr( member( io, "timeoutMs" ), 120000 ) );
-	if ( member( io, "backend" ).is_boolean() ) opts.backend = member( io, "backend" ).get<bool>();
-	const json & fl = member( io, "flags" );
-	if ( fl.is_array() ) {
-		std::vector<std::string> v;
-		for ( const auto & f : fl ) {
-			if ( f.is_string() ) v.push_back( f );
-		}
-		opts.flags = v;
-	} else if ( fl.is_string() ) {
-		opts.flags = parseFlagsFile( fl.get<std::string>() );
-	}
-
-	Toolchain tc = discoverToolchain( to );
-	log::info( "cfa: ", tc.cfa.empty() ? "(none)" : tc.cfa, "; translator: ", tc.translator.empty() ? "(none)" : tc.translator,
-			   "; encoding: ", enc == Encoding::Utf8 ? "utf-8" : "utf-16" );
-	checker = std::make_unique<Checker>( tc );
+	initOptions = io.is_object() ? io : json::object();
+	log::info( "encoding: ", enc == Encoding::Utf8 ? "utf-8" : "utf-16" );
+	applyOptions( initOptions );
 	phase = Phase::Running;
 	startWorker();
 
@@ -354,6 +415,91 @@ nlohmann::json Server::initialize( const json & params ) {
 		{ "workspaceSymbolProvider", true },
 	};
 	return { { "capabilities", capabilities }, { "serverInfo", { { "name", "cfa-lsp" }, { "version", "0.1.0" } } } };
+}
+
+// ---------------------------------------------------------------- configuration
+
+void Server::applyOptions( const json & io ) {
+	ToolchainOptions to;
+	to.exeDir = exeDir;
+	auto str = [&]( const char * k ) { return member( io, k ).is_string() ? member( io, k ).get<std::string>() : std::string(); };
+	to.cfa = str( "cfa" );
+	to.translator = str( "translator" );
+	to.preludeDir = str( "preludeDir" );
+	to.cc = str( "cc" );
+	Options o;
+	o.debounceMs = std::max( 0, intOr( member( io, "debounceMs" ), 500 ) );
+	o.timeoutMs = std::max( 1, intOr( member( io, "timeoutMs" ), 120000 ) );
+	if ( member( io, "backend" ).is_boolean() ) o.backend = member( io, "backend" ).get<bool>();
+	const json & fl = member( io, "flags" );
+	if ( fl.is_array() ) {
+		std::vector<std::string> v;
+		for ( const auto & f : fl ) {
+			if ( f.is_string() ) v.push_back( f );
+		}
+		o.flags = v;
+	} else if ( fl.is_string() ) {
+		o.flags = parseFlagsFile( fl.get<std::string>() );
+	}
+
+	Toolchain tc = discoverToolchain( to );
+	log::info( "cfa: ", tc.cfa.empty() ? "(none)" : tc.cfa, "; translator: ", tc.translator.empty() ? "(none)" : tc.translator );
+	auto chk = std::make_shared<const Checker>( tc );
+	std::lock_guard<std::mutex> lock( mtx );
+	opts = o;
+	checker = chk;
+	effective = io;
+}
+
+void Server::didChangeConfiguration( const json & params ) {
+	const json & s = member( params, "settings" );
+	if ( s.is_object() && ! s.empty() ) applySettings( s );
+	else if ( configurationPull ) requestConfiguration();	// the pull model sends no settings
+}
+
+void Server::requestConfiguration() {
+	configRequests.insert( sendRequest( "workspace/configuration", { { "items", { { { "section", "cfa-lsp" } } } } } ) );
+}
+
+void Server::applySettings( const json & s ) {
+	// Settings pushed by the client are usually keyed by server name; a
+	// workspace/configuration answer is our section already.
+	const json * section = &s;
+	for ( const char * k : { "cfa-lsp" } ) {
+		if ( member( s, k ).is_object() ) {
+			section = &member( s, k );
+			break;
+		}
+	}
+	settings = section->is_object() ? *section : json::object();
+	// Our settings override initializationOptions key by key; null removes
+	// one. Other keys are someone else's.
+	json eff = initOptions;
+	for ( const char * k : { "cfa", "translator", "preludeDir", "flags", "backend", "cc", "debounceMs", "timeoutMs" } ) {
+		auto it = settings.find( k );
+		if ( it == settings.end() ) continue;
+		if ( it->is_null() ) eff.erase( k );
+		else eff[k] = *it;
+	}
+	if ( eff == effective ) return;
+	log::info( "configuration changed: ", eff.dump() );
+	applyOptions( eff );
+	{
+		std::lock_guard<std::mutex> lock( mtx );
+		if ( inflight ) inflight->token->cancel();
+		for ( auto & [path, doc] : docs ) schedule( path, 0 );
+	}
+	warnMissing();
+}
+
+void Server::warnMissing() {
+	const Toolchain & tc = checker->toolchain();
+	std::string missing;
+	if ( tc.cfa.empty() ) missing = "the cfa compiler (not on PATH; set initializationOptions.cfa)";
+	else if ( tc.translator.empty() ) missing = "the cfa-lsp translator (set initializationOptions.translator or CFA_LSP_TRANSLATOR); only compiler errors will be shown";
+	if ( missing == warnedMissing ) return;
+	warnedMissing = missing;
+	if ( ! missing.empty() ) notify( "window/showMessage", { { "type", 2 }, { "message", "cfa-lsp: cannot find " + missing + "." } } );
 }
 
 // ---------------------------------------------------------------- documents
@@ -424,6 +570,7 @@ void Server::didClose( const json & params ) {
 	std::lock_guard<std::mutex> pub( publishMtx );
 	lock.unlock();
 	for ( auto & p : out ) notify( "textDocument/publishDiagnostics", std::move( p ) );
+	if ( testHook ) testHook( "closed" );
 }
 
 void Server::didSave( const json & params ) {
@@ -461,6 +608,7 @@ void Server::trimLog( Document & doc ) {
 	}
 	if ( inflight && inflight->path == doc.path ) keep = std::min( keep, inflight->seq );
 	if ( doc.diskSeq ) keep = std::min( keep, *doc.diskSeq );
+	if ( ! doc.backDiags.empty() ) keep = std::min( keep, doc.backSeq );
 	auto it = std::find_if( doc.log.begin(), doc.log.end(), [&]( const auto & e ) { return e.first > keep; } );
 	doc.log.erase( doc.log.begin(), it );
 }
@@ -1001,6 +1149,26 @@ void Server::stopWorker() {
 	if ( worker.joinable() ) worker.join();
 }
 
+void Server::rebaseBackend( Document & doc, uint64_t seq ) {
+	if ( ! doc.backDiags.empty() && doc.backSeq != seq ) {
+		EditList edits = doc.editsBetween( doc.backSeq, seq );
+		std::vector<Diag> kept;
+		for ( Diag & d : doc.backDiags ) {
+			if ( d.file == doc.path ) {
+				// Backend diagnostics cover whole lines; drop the ones whose
+				// line has been edited.
+				int l = d.range.start.line;
+				auto m = toCurrentExact( edits, Range{ { l, 0 }, { l + 1, 0 } } );
+				if ( ! m || m->start.col != 0 || m->end != Loc{ m->start.line + 1, 0 } ) continue;
+				d.range = { m->start, m->start };
+			}
+			kept.push_back( std::move( d ) );
+		}
+		doc.backDiags = std::move( kept );
+	}
+	doc.backSeq = seq;
+}
+
 void Server::workerLoop() {
 	std::unique_lock<std::mutex> lk( mtx );
 	for ( ;; ) {
@@ -1021,13 +1189,14 @@ void Server::workerLoop() {
 		if ( dit == docs.end() ) continue;
 		CheckRequest req = makeRequest( dit->second );
 		uint64_t seq = dit->second.seq;
+		std::shared_ptr<const Checker> chk = checker;
 		auto token = std::make_shared<CancelToken>();
 		inflight = InFlight{ path, seq, token };
 		lk.unlock();
 
 		log::info( "checking ", path );
 		auto t0 = Clock::now();
-		FrontResult fr = checker->front( req, *token );
+		FrontResult fr = chk->front( req, *token );
 		auto ms = []( auto d ) { return std::chrono::duration_cast<std::chrono::milliseconds>( d ).count(); };
 		log::info( "front end for ", path, ": status ", (int)fr.status, ", ", fr.diags.size(), " diagnostics, ", ms( Clock::now() - t0 ), " ms" );
 
@@ -1050,33 +1219,47 @@ void Server::workerLoop() {
 								{ "method", "workspace/inlayHint/refresh" } };
 			}
 		}
+		// The last backend warnings stay until the backend runs again, which
+		// it can't while the translator reports errors that stop it before
+		// code generation.
+		bool runBack = fr.backendReady && req.backend;
+		bool carry = req.backend && fr.status != FrontResult::Fallback && fr.status != FrontResult::NoCfa;
+		std::vector<Diag> diags = fr.diags;
+		if ( carry ) {
+			rebaseBackend( doc, seq );
+			mergeDiags( diags, doc.backDiags );
+		} else {
+			doc.backDiags.clear();
+		}
+		bool carried = ! doc.backDiags.empty();
 		diskCache.clear();
-		storeDiags( path, seq, fr.diags, out );
+		storeDiags( path, seq, diags, out );
 		trimLog( doc );
-		bool runBack = fr.backendReady && opts.backend;
 		{
 			std::lock_guard<std::mutex> pub( publishMtx );
 			lk.unlock();
 			if ( refresh ) send( *refresh );
+			if ( testHook ) testHook( "publish" );
 			for ( auto & p : out ) notify( "textDocument/publishDiagnostics", std::move( p ) );
 		}
 		out.clear();
 
 		if ( runBack ) {
 			auto t1 = Clock::now();
-			std::vector<Diag> back = checker->back( req, fr, *token );
+			std::vector<Diag> back = chk->back( req, fr, *token );
 			log::info( "backend for ", path, ": ", back.size(), " diagnostics, ", ms( Clock::now() - t1 ), " ms" );
 			lk.lock();
 			dit = docs.find( path );
-			if ( ! token->cancelled() && dit != docs.end() && ! stopping && ! back.empty() ) {
-				std::vector<Diag> merged = fr.diags;
-				std::set<std::tuple<std::string, int, std::string>> seen;
-				for ( const auto & d : merged ) seen.insert( { d.file, d.range.start.line, d.message } );
-				for ( auto & d : back ) {
-					if ( seen.insert( { d.file, d.range.start.line, d.message } ).second ) merged.push_back( std::move( d ) );
+			if ( ! token->cancelled() && dit != docs.end() && ! stopping ) {
+				dit->second.backDiags = back;
+				dit->second.backSeq = seq;
+				// The first publish had the carried warnings; replace them.
+				if ( ! back.empty() || carried ) {
+					std::vector<Diag> merged = fr.diags;
+					mergeDiags( merged, back );
+					diskCache.clear();
+					storeDiags( path, seq, merged, out );
 				}
-				diskCache.clear();
-				storeDiags( path, seq, merged, out );
 			}
 			{
 				std::lock_guard<std::mutex> pub( publishMtx );

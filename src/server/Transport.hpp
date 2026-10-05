@@ -35,10 +35,14 @@ class MessageReader {
 	explicit MessageReader( int fd ) : fd( fd ) {}
 	// Blocks until a message arrives. nullopt on EOF or a read error.
 	std::optional<std::string> read();
+	// A message that has already arrived, without blocking; nullopt if none
+	// has (or on EOF, which the next read() then reports).
+	std::optional<std::string> tryRead();
 
   private:
 	int fd;
 	FrameParser parser;
+	bool eof = false;
 };
 
 // Writes framed messages; safe to call from several threads.

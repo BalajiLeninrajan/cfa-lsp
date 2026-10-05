@@ -7,13 +7,18 @@
 //                        it fail with a gcc-style error on that line.
 //   --lsp OUT ...        translate: copy $FAKE_CFA_DIR/dump.json (or
 //                        dump-error.json if the input contains
-//                        FAKE_HEADER_ERROR) to OUT and $FAKE_CFA_DIR/out.c to
-//                        the --lsp-c-out file, with @FILE@ replaced by the
-//                        --lsp-focus path and @DIR@ by its directory. If the input
-//                        contains FAKE_SLOW it first forks a grandchild, writes
-//                        both pids to $FAKE_CFA_PIDS and sleeps.
+//                        FAKE_HEADER_ERROR or FAKE_CHECK_ERROR) to OUT and
+//                        $FAKE_CFA_DIR/out.c to the --lsp-c-out file, with
+//                        @FILE@ replaced by the --lsp-focus path and @DIR@ by
+//                        its directory. Like the real translator, it writes no
+//                        C after errors, except with FAKE_CHECK_ERROR (errors
+//                        from a pass that only checks), where the C also gets a
+//                        FAKE_GCC_ERROR line. If the input contains FAKE_SLOW
+//                        it first forks a grandchild, writes both pids to
+//                        $FAKE_CFA_PIDS and sleeps.
 //   -fsyntax-only ... C  backend: print $FAKE_CFA_DIR/gcc.err to stderr with
-//                        @CFILE@ replaced by C.
+//                        @CFILE@ replaced by C, and an error on line 6 if C
+//                        contains FAKE_GCC_ERROR.
 //
 // Every invocation appends its argv to $FAKE_CFA_LOG if set.
 #include <cstdio>
@@ -126,16 +131,23 @@ int main( int argc, char * argv[] ) {
 			sleep( 60 );
 		}
 		std::string focusDir = focus.substr( 0, focus.rfind( '/' ) );
-		std::string dumpName = readFile( in ).find( "FAKE_HEADER_ERROR" ) != std::string::npos ? "/dump-error.json" : "/dump.json";
+		bool headerError = readFile( in ).find( "FAKE_HEADER_ERROR" ) != std::string::npos;
+		bool checkError = readFile( in ).find( "FAKE_CHECK_ERROR" ) != std::string::npos;
+		std::string dumpName = headerError || checkError ? "/dump-error.json" : "/dump.json";
 		std::string dump = replaceAll( readFile( dir + dumpName ), "@FILE@", focus );
 		std::ofstream( after( "--lsp" ) ) << replaceAll( dump, "@DIR@", focusDir );
 		std::string cOut = after( "--lsp-c-out" );
-		if ( ! cOut.empty() ) std::ofstream( cOut ) << replaceAll( readFile( dir + "/out.c" ), "@FILE@", focus );
+		if ( ! cOut.empty() && ! headerError ) {
+			std::ofstream c( cOut );
+			c << replaceAll( readFile( dir + "/out.c" ), "@FILE@", focus );
+			if ( checkError ) c << "/* FAKE_GCC_ERROR */\n";
+		}
 		return 0;
 	}
 
 	if ( has( "-fsyntax-only" ) ) {
 		std::string err = replaceAll( readFile( dir + "/gcc.err" ), "@CFILE@", args.back() );
+		if ( readFile( args.back() ).find( "FAKE_GCC_ERROR" ) != std::string::npos ) err += args.back() + ":6:1: error: fake gcc error\n";
 		std::fwrite( err.data(), 1, err.size(), stderr );
 		return 0;
 	}
