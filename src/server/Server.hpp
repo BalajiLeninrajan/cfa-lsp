@@ -105,6 +105,17 @@ class Server {
 	json completion( const json & params );
 	json signatureHelp( const json & params );
 	json semanticTokens( const json & params );
+	json documentHighlight( const json & params );
+	json inlayHint( const json & params );
+	json prepareRename( const json & params );
+	json rename( const json & params );
+	json switchSourceHeader( const json & params );
+	json workspaceSymbol( const json & params );
+	// The cursor in `params` in d's snapshot; nullopt if it is in text typed since.
+	std::optional<Loc> cursorInSnapshot( const Document & d, const json & params ) const;
+	// The rename at the cursor with its ranges in the current buffer; nullopt
+	// if there is nothing to rename. Throws if the rename is refused.
+	std::optional<RenamePlan> renameAt( const Document & d, const json & params );
 
 	// conversions (caller holds mtx)
 	json lspPos( const Text & text, Loc l ) const;
@@ -138,6 +149,7 @@ class Server {
 	enum class Phase { Uninitialized, Running, ShuttingDown } phase = Phase::Uninitialized;
 	Encoding enc = Encoding::Utf16;
 	bool hierarchicalSymbols = false;
+	bool prepareRenameSupport = false;
 	std::string rootPath;
 	Options opts;
 	std::unique_ptr<Checker> checker;

@@ -221,6 +221,10 @@ TEST_CASE( "lifecycle" ) {
 	CHECK( caps["signatureHelpProvider"]["triggerCharacters"] == json{ "(", "," } );
 	CHECK( caps["semanticTokensProvider"]["legend"]["tokenTypes"] == json( Analysis::tokenTypes() ) );
 	CHECK( caps["semanticTokensProvider"]["full"] == true );
+	CHECK( caps["documentHighlightProvider"] == true );
+	CHECK( caps["inlayHintProvider"] == true );
+	CHECK( caps["renameProvider"] == true );				// the client didn't announce prepareSupport
+	CHECK( caps["workspaceSymbolProvider"] == true );
 
 	auto msg = s.waitFor( "window/showMessage", []( const json & ) { return true; } );
 	REQUIRE( msg );
@@ -238,11 +242,40 @@ TEST_CASE( "lifecycle" ) {
 	CHECK( s.request( "textDocument/documentSymbol", { { "textDocument", td } } )["result"] == json::array() );
 	CHECK( s.request( "textDocument/semanticTokens/full", { { "textDocument", td } } )["result"]["data"] == json::array() );
 	CHECK( s.request( "textDocument/completion", { { "textDocument", td }, { "position", pos( 0, 0 ) } } )["result"]["items"] == json::array() );
+	CHECK( s.request( "textDocument/documentHighlight", { { "textDocument", td }, { "position", pos( 0, 0 ) } } )["result"] == json::array() );
+	CHECK( s.request( "textDocument/inlayHint", { { "textDocument", td }, { "range", { { "start", pos( 0, 0 ) }, { "end", pos( 9, 0 ) } } } } )["result"] == json::array() );
+	CHECK( s.request( "textDocument/prepareRename", { { "textDocument", td }, { "position", pos( 0, 0 ) } } )["result"].is_null() );
+	CHECK( s.request( "textDocument/rename", { { "textDocument", td }, { "position", pos( 0, 0 ) }, { "newName", "y" } } )["error"]["code"] == -32803 );
+	CHECK( s.request( "textDocument/rename", { { "textDocument", td }, { "position", pos( 0, 0 ) }, { "newName", "for" } } )["error"]["code"] == -32602 );
+	CHECK( s.request( "textDocument/rename", { { "textDocument", td }, { "position", pos( 0, 0 ) }, { "newName", "1x" } } )["error"]["code"] == -32602 );
+	CHECK( s.request( "workspace/symbol", { { "query", "" } } )["result"] == json::array() );
+	CHECK( s.request( "textDocument/switchSourceHeader", td )["result"].is_null() );
 
 	CHECK( s.request( "shutdown" )["result"].is_null() );
 	CHECK( s.request( "textDocument/hover", json::object() )["error"]["code"] == -32600 );
 	s.notify( "exit", nullptr );
 	CHECK( s.finish() == 0 );
+}
+
+TEST_CASE( "switchSourceHeader pairs .cfa and .hfa files with the same stem" ) {
+	Session s;
+	s.initialize( { { "cfa", "/nonexistent/cfa" } } );
+	std::string dir = fs::canonical( fixtures() + "/server" ).string();
+	auto other = [&]( const std::string & path ) {
+		return s.request( "textDocument/switchSourceHeader", { { "uri", pathToUri( path ) } } )["result"];
+	};
+	CHECK( other( dir + "/hello.cfa" ) == pathToUri( dir + "/hello.hfa" ) );
+	CHECK( other( dir + "/hello.hfa" ) == pathToUri( dir + "/hello.cfa" ) );
+	CHECK( other( dir + "/gcc.err" ).is_null() );
+	CHECK( other( dir + "/missing.cfa" ).is_null() );
+	// A header in another directory counts when it is open.
+	fs::path tmp = fs::temp_directory_path() / ( "cfa-lsp-switch-" + std::to_string( getpid() ) );
+	fs::create_directories( tmp / "include" );
+	std::string header = ( tmp / "include" / "lone.hfa" ).string();
+	s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", pathToUri( header ) }, { "languageId", "cfa" }, { "version", 1 }, { "text", "int x;\n" } } } } );
+	CHECK( other( ( tmp / "lone.cfa" ).string() ) == pathToUri( header ) );
+	fs::remove_all( tmp );
+	CHECK( s.request( "shutdown" )["result"].is_null() );
 }
 
 TEST_CASE( "exit without shutdown, and garbage input" ) {
