@@ -322,6 +322,74 @@ TEST_CASE( "references" ) {
 	CHECK( a->references( "/nowhere.cfa", { 0, 0 }, true ).empty() );
 }
 
+TEST_CASE( "unit index: entities, uses and symbols for other files" ) {
+	auto a = fixture::load( "shapes" );
+	UnitIndex u = a->unitIndex();
+	auto entity = [&]( const std::string & name, const Location & decl ) {
+		for ( int i = 0; i < int( u.entities.size() ); i += 1 ) {
+			const auto & ds = u.entities[i].declarations;
+			if ( u.entities[i].name == name && std::find( ds.begin(), ds.end(), decl ) != ds.end() ) return i;
+		}
+		return -1;
+	};
+	auto refAt = [&]( Range r ) -> const UnitIndex::Ref * {
+		for ( const auto & x : u.refs ) {
+			if ( x.loc == Location{ cfa, r } ) return &x;
+		}
+		return nullptr;
+	};
+
+	// The prototype and the definition are one entity, with the body.
+	int box = entity( "area", { hfa, rng( 16, 4, 16, 8 ) } );
+	REQUIRE( box >= 0 );
+	CHECK( entity( "area", { cfa, rng( 3, 4, 3, 8 ) } ) == box );
+	CHECK( u.entities[box].declarations.size() == 2 );
+	REQUIRE( u.entities[box].definition );
+	CHECK( *u.entities[box].definition == Location{ cfa, rng( 3, 4, 3, 8 ) } );
+	CHECK( u.entities[box].definitionRange.start <= Loc{ 3, 4 } );
+	CHECK( u.entities[box].function );
+	CHECK( ! u.entities[box].library );
+	CHECK( u.entities[box].kind == 12 );
+	CHECK( u.entities[box].detail == "int area( Box & b )" );
+	int mainFn = entity( "main", { cfa, rng( 29, 4, 29, 8 ) } );
+	int twice = entity( "twice", { cfa, rng( 25, 4, 25, 9 ) } );
+	REQUIRE( mainFn >= 0 );
+	REQUIRE( twice >= 0 );
+
+	// Calls know the function they are in.
+	const UnitIndex::Ref * call = refAt( rng( 32, 15, 32, 19 ) );
+	REQUIRE( call );
+	CHECK( call->entity == box );
+	CHECK( call->call );
+	CHECK( call->caller == mainFn );
+	call = refAt( rng( 26, 8, 26, 12 ) );			// the trait's area, inside twice
+	REQUIRE( call );
+	CHECK( call->caller == twice );
+	CHECK( u.entities[call->entity].name == "area" );
+	CHECK( call->entity != box );
+
+	// sout is used here but declared only in libcfa.
+	const UnitIndex::Ref * sout = refAt( rng( 35, 2, 35, 6 ) );
+	REQUIRE( sout );
+	CHECK( u.entities[sout->entity].library );
+	CHECK( ! sout->call );
+
+	// Locals are left out.
+	CHECK( ! refAt( rng( 32, 21, 32, 22 ) ) );		// b
+	CHECK( ! refAt( rng( 34, 14, 34, 15 ) ) );		// n
+	CHECK( entity( "inner", { cfa, rng( 34, 6, 34, 11 ) } ) < 0 );
+
+	// Symbols come from the project files, not libcfa.
+	bool sawTwice = false, sawField = false;
+	for ( const auto & s : u.symbols ) {
+		CHECK( s.loc.file != fixture::libcfa );
+		if ( s.name == "twice" && s.loc == Location{ cfa, rng( 25, 4, 25, 9 ) } ) sawTwice = true;
+		if ( s.name == "x" && s.container == "Point" && s.loc == Location{ hfa, rng( 4, 5, 4, 6 ) } ) sawField = true;
+	}
+	CHECK( sawTwice );
+	CHECK( sawField );
+}
+
 TEST_CASE( "document symbols" ) {
 	auto a = fixture::load( "shapes" );
 	auto syms = a->documentSymbols( hfa );
