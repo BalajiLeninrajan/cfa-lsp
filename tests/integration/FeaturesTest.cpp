@@ -254,13 +254,16 @@ TEST_CASE( "rename refuses names used in macros or where the dump has no ref, an
 	json r = o.c.result( "textDocument/rename", renameParams( o.uri, o.pos( "m = TWICE" ), "k" ) );
 	CHECK( r["changes"][o.uri].size() == 2 );
 
-	// Spellings the translator has no ref for: dead code, an array dimension.
+	// A spelling the translator has no ref for, here in dead code.
 	err = o.c.request( "textDocument/rename", renameParams( o.uri, o.pos( "hidden = SIZE" ), "shown" ) )["error"];
 	CHECK( err["code"] == -32803 );
 	CHECK( contains( err["message"], "line 10" ) );
-	err = o.c.request( "textDocument/prepareRename", at( o.uri, o.pos( "SIZE;" ) ) )["error"];
-	CHECK( err["code"] == -32803 );
-	CHECK( contains( err["message"], "line 7" ) );
+	// The name in an array dimension is a ref, so SIZE renames there too.
+	r = o.c.result( "textDocument/rename", renameParams( o.uri, o.pos( "SIZE;" ), "COUNT" ) );
+	REQUIRE( r["changes"][o.uri].size() == 3 );
+	bool dimension = false;
+	for ( const auto & e : r["changes"][o.uri] ) dimension = dimension || e["range"]["start"] == o.pos( "SIZE]" );
+	CHECK( dimension );
 
 	// In a header, only local names.
 	std::string header = projectDir() + "/geometry.hfa";
