@@ -49,6 +49,7 @@ bool isKeyword( const Token & t, std::initializer_list<const char *> words ) {
 // An open bracket. Braces (and file scope) also hold the state of the
 // statements directly inside them.
 struct Open {
+	Open( char c = 0 ) : c( c ) {}		// resize needs a default
 	char c;							// '{', '(', '[', or 'R' for file scope
 	bool caseBody = false;			// after a case label, statements are one level in
 	std::string bodies;				// bodies without braces pending, innermost last: 'i' for
