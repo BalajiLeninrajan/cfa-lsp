@@ -1,6 +1,8 @@
 #include "Server.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <climits>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -25,6 +27,7 @@ enum ErrorCode {
 	InvalidParams = -32602,
 	InternalError = -32603,
 	ServerNotInitialized = -32002,
+	RequestFailed = -32803,
 };
 
 struct LspError {
@@ -68,6 +71,15 @@ bool wholeName( const Text & text, Range r ) {
 	bool left = r.start.col == 0 || ! text::isIdentChar( line[r.start.col - 1] );
 	bool right = r.end.col >= (int)line.size() || ! text::isIdentChar( line[r.end.col] );
 	return left && right;
+}
+
+// Does `name` have the characters of `query` in order, ignoring case?
+bool fuzzyMatch( std::string_view name, std::string_view query ) {
+	size_t k = 0;
+	for ( char c : name ) {
+		if ( k < query.size() && std::tolower( (unsigned char)c ) == std::tolower( (unsigned char)query[k] ) ) k += 1;
+	}
+	return k == query.size();
 }
 
 std::vector<std::pair<Range, std::string>> diffEdits( const Text & oldText, const std::string & newText ) {
@@ -242,6 +254,12 @@ nlohmann::json Server::request( const std::string & method, const json & params 
 	if ( method == "textDocument/completion" ) return completion( params );
 	if ( method == "textDocument/signatureHelp" ) return signatureHelp( params );
 	if ( method == "textDocument/semanticTokens/full" ) return semanticTokens( params );
+	if ( method == "textDocument/documentHighlight" ) return documentHighlight( params );
+	if ( method == "textDocument/inlayHint" ) return inlayHint( params );
+	if ( method == "textDocument/prepareRename" ) return prepareRename( params );
+	if ( method == "textDocument/rename" ) return rename( params );
+	if ( method == "textDocument/switchSourceHeader" ) return switchSourceHeader( params );
+	if ( method == "workspace/symbol" ) return workspaceSymbol( params );
 	throw LspError{ MethodNotFound, "unhandled method " + method };
 }
 
@@ -277,6 +295,7 @@ nlohmann::json Server::initialize( const json & params ) {
 		}
 	}
 	hierarchicalSymbols = member( member( member( caps, "textDocument" ), "documentSymbol" ), "hierarchicalDocumentSymbolSupport" ) == true;
+	prepareRenameSupport = member( member( member( caps, "textDocument" ), "rename" ), "prepareSupport" ) == true;
 
 	const json & root = member( params, "rootUri" );
 	if ( root.is_string() ) {
@@ -328,6 +347,10 @@ nlohmann::json Server::initialize( const json & params ) {
 		{ "signatureHelpProvider", { { "triggerCharacters", { "(", "," } } } },
 		{ "semanticTokensProvider", { { "legend", { { "tokenTypes", tokenTypes }, { "tokenModifiers", tokenModifiers } } },
 									  { "full", true } } },
+		{ "documentHighlightProvider", true },
+		{ "inlayHintProvider", true },
+		{ "renameProvider", prepareRenameSupport ? json{ { "prepareProvider", true } } : json( true ) },
+		{ "workspaceSymbolProvider", true },
 	};
 	return { { "capabilities", capabilities }, { "serverInfo", { { "name", "cfa-lsp" }, { "version", "0.1.0" } } } };
 }
@@ -708,6 +731,160 @@ nlohmann::json Server::semanticTokens( const json & params ) {
 		lastEnd = t.col + t.len;
 	}
 	return { { "data", data } };
+}
+
+std::optional<Loc> Server::cursorInSnapshot( const Document & d, const json & params ) const {
+	const json & p = member( params, "position" );
+	Loc cur = d.text.fromLsp( intOr( member( p, "line" ), 0 ), intOr( member( p, "character" ), 0 ), enc );
+	EditList edits = d.editsSince( d.analysisSeq );
+	MappedLoc m = toSnapshot( edits, cur );
+	if ( ! m.exact || ! sameIdentifier( d, cur, edits ) ) return std::nullopt;
+	return m.loc;
+}
+
+nlohmann::json Server::documentHighlight( const json & params ) {
+	Document * d = docFor( params );
+	if ( ! d || ! d->analysis ) return json::array();
+	auto pos = cursorInSnapshot( *d, params );
+	if ( ! pos ) return json::array();
+	json out = json::array();
+	for ( const DocumentHighlight & h : d->analysis->documentHighlights( d->path, *pos ) ) {
+		if ( auto j = lspLocation( *d, Location{ d->path, h.range }, true ) ) {
+			out.push_back( { { "range", ( *j )["range"] }, { "kind", h.kind } } );
+		}
+	}
+	return out;
+}
+
+nlohmann::json Server::inlayHint( const json & params ) {
+	Document * d = docFor( params );
+	if ( ! d || ! d->analysis ) return json::array();
+	const json & r = member( params, "range" );
+	const json & s = member( r, "start" ), & e = member( r, "end" );
+	Loc a = d->text.fromLsp( intOr( member( s, "line" ), 0 ), intOr( member( s, "character" ), 0 ), enc );
+	Loc b = d->text.fromLsp( intOr( member( e, "line" ), INT_MAX ), intOr( member( e, "character" ), 0 ), enc );
+	EditList edits = d->editsSince( d->analysisSeq );
+	Range snap{ toSnapshot( edits, a ).loc, toSnapshot( edits, b ).loc };
+	json out = json::array();
+	for ( const InlayHint & h : d->analysis->inlayHints( d->path, snap ) ) {
+		Loc p = h.pos;
+		if ( ! edits.empty() ) {
+			// The hints of a call edited since the check may be wrong.
+			if ( ! toCurrentExact( edits, h.span ) ) continue;
+			auto m = toCurrentExact( edits, Range{ h.pos, h.pos } );
+			if ( ! m ) continue;
+			p = m->start;
+		}
+		if ( p < a || b < p ) continue;
+		out.push_back( { { "position", lspPos( d->text, p ) }, { "label", h.label }, { "kind", h.kind },
+						 { "paddingLeft", false }, { "paddingRight", h.kind == 2 } } );
+	}
+	return out;
+}
+
+std::optional<RenamePlan> Server::renameAt( const Document & d, const json & params ) {
+	auto pos = cursorInSnapshot( d, params );
+	if ( ! pos ) return std::nullopt;
+	auto plan = d.analysis->rename( d.path, *pos );
+	if ( ! plan ) return std::nullopt;
+	if ( ! plan->error.empty() ) throw LspError{ RequestFailed, plan->error };
+	EditList edits = d.editsSince( d.analysisSeq );
+	auto current = [&]( Range r ) {
+		auto m = toCurrentExact( edits, r );
+		bool spelled = false;
+		if ( m && m->start.line == m->end.line && m->start.col <= m->end.col ) {
+			std::string_view line = d.text.line( m->start.line );
+			spelled = size_t( m->end.col ) <= line.size() && line.substr( m->start.col, m->end.col - m->start.col ) == plan->name;
+		}
+		if ( ! spelled || ( ! edits.empty() && ! wholeName( d.text, *m ) ) ) {
+			throw LspError{ RequestFailed, "an occurrence of `" + plan->name +
+											   "` changed since the file was last checked; try again after the next check" };
+		}
+		return *m;
+	};
+	plan->range = current( plan->range );
+	for ( Range & r : plan->sites ) r = current( r );
+	return plan;
+}
+
+nlohmann::json Server::prepareRename( const json & params ) {
+	Document * d = docFor( params );
+	if ( ! d || ! d->analysis ) return nullptr;
+	auto plan = renameAt( *d, params );
+	if ( ! plan ) return nullptr;
+	return { { "range", lspRange( d->text, plan->range ) }, { "placeholder", plan->name } };
+}
+
+nlohmann::json Server::rename( const json & params ) {
+	const json & nn = member( params, "newName" );
+	if ( ! nn.is_string() ) throw LspError{ InvalidParams, "missing newName" };
+	std::string name = nn.get<std::string>();
+	if ( ! text::isIdentifier( name ) || Analysis::isKeyword( name ) ) throw LspError{ InvalidParams, "`" + name + "` is not a valid identifier" };
+	Document * d = docFor( params );
+	if ( ! d || ! d->analysis ) throw LspError{ RequestFailed, "the file has not been checked yet" };
+	auto plan = renameAt( *d, params );
+	if ( ! plan ) throw LspError{ RequestFailed, "there is no symbol to rename here" };
+	json edits = json::array();
+	for ( const Range & r : plan->sites ) edits.push_back( { { "range", lspRange( d->text, r ) }, { "newText", name } } );
+	json changes = json::object();
+	changes[d->uri] = edits;
+	return { { "changes", changes } };
+}
+
+// clangd's extension: the header of a source file, or the other way round, by stem.
+nlohmann::json Server::switchSourceHeader( const json & params ) {
+	const json & uri = member( params, "uri" );
+	if ( ! uri.is_string() ) throw LspError{ InvalidParams, "missing uri" };
+	auto path = uriToPath( uri.get<std::string>() );
+	if ( ! path ) return nullptr;
+	fs::path p = fs::path( *path ).lexically_normal();
+	std::string other = p.extension() == ".cfa" ? ".hfa" : p.extension() == ".hfa" ? ".cfa" : "";
+	if ( other.empty() ) return nullptr;
+	fs::path next = p;
+	next.replace_extension( other );
+	std::error_code ec;
+	if ( docs.count( next.string() ) || fs::is_regular_file( next, ec ) ) return uriOf( next.string() );
+	// An open document elsewhere with the same stem, such as include/x.hfa for src/x.cfa.
+	for ( const auto & [q, doc] : docs ) {
+		fs::path qp( q );
+		if ( qp.stem() == p.stem() && qp.extension() == other ) return doc.uri;
+	}
+	return nullptr;
+}
+
+// The symbols of the open documents and of the project headers they include.
+nlohmann::json Server::workspaceSymbol( const json & params ) {
+	const json & q = member( params, "query" );
+	std::string query = q.is_string() ? q.get<std::string>() : std::string();
+	// A file that is open and checked gets its symbols from its own analysis.
+	std::set<std::string> owned;
+	for ( const auto & [path, doc] : docs ) {
+		if ( doc.analysis ) owned.insert( path );
+	}
+	json out = json::array();
+	std::set<std::string> seen;
+	for ( const auto & entry : docs ) {
+		const std::string & path = entry.first;
+		const Document & doc = entry.second;
+		if ( ! doc.analysis ) continue;
+		for ( const std::string & file : doc.analysis->projectFiles() ) {
+			std::string norm = fs::path( file ).lexically_normal().string();
+			if ( norm != path && owned.count( norm ) ) continue;
+			std::function<void( const Symbol &, const std::string & )> add = [&]( const Symbol & s, const std::string & container ) {
+				if ( out.size() >= 1000 ) return;
+				if ( fuzzyMatch( s.name, query ) ) {
+					if ( auto loc = lspLocation( doc, Location{ file, s.selectionRange }, false ) ) {
+						json j = { { "name", s.name }, { "kind", s.kind }, { "location", *loc } };
+						if ( ! container.empty() ) j["containerName"] = container;
+						if ( seen.insert( j.dump() ).second ) out.push_back( std::move( j ) );
+					}
+				}
+				for ( const auto & c : s.children ) add( c, s.name );
+			};
+			for ( const Symbol & s : doc.analysis->documentSymbols( file ) ) add( s, "" );
+		}
+	}
+	return out;
 }
 
 // ---------------------------------------------------------------- diagnostics
