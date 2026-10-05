@@ -11,6 +11,8 @@
 #include <tuple>
 
 #include "Flags.hpp"
+#include "Format.hpp"
+#include "Lexer.hpp"
 #include "Log.hpp"
 #include "TextScan.hpp"
 #include "Uri.hpp"
@@ -156,6 +158,91 @@ std::vector<std::pair<Range, std::string>> diffEdits( const Text & oldText, cons
 		out.push_back( { Range{ oldText.loc( ab ), oldText.loc( ae ) }, newText.substr( bb, be - bb ) } );
 	}
 	return out;
+}
+
+// The name in Analysis's summary of the resolver's "No alternatives for
+// expression Name: x", which is also what an undeclared function call gives.
+std::optional<std::string> undeclaredName( std::string_view message ) {
+	const std::string_view prefix = "use of undeclared identifier `";
+	if ( ! message.starts_with( prefix ) ) return std::nullopt;
+	size_t end = message.find( '`', prefix.size() );
+	if ( end == std::string_view::npos ) return std::nullopt;
+	std::string name( message.substr( prefix.size(), end - prefix.size() ) );
+	if ( ! text::isIdentifier( name ) ) return std::nullopt;
+	return name;
+}
+
+// Where `name` is spelled in `r`, a diagnostic's range in the current text:
+// the first identifier with that spelling inside it, else the first on the
+// range's first line.
+std::optional<Range> nameIn( const Text & text, Range r, const std::string & name ) {
+	std::optional<Range> fallback;
+	int last = std::min( r.end.line, r.start.line + 50 );
+	for ( int l = r.start.line; l <= last; l += 1 ) {
+		for ( const Token & t : lex( text.line( l ) ) ) {
+			if ( t.kind != TokKind::Identifier || t.text != name || t.endLine != t.line ) continue;
+			Range at{ { l, t.col }, { l, t.endCol } };
+			if ( ! ( at.start < r.start ) && ! ( r.end < at.end ) ) return at;
+			if ( ! fallback && l == r.start.line ) fallback = at;
+		}
+	}
+	return fallback;
+}
+
+// The identifier right before an identifier at `at`. A type used without its
+// header (`string s;` without string.hfa) is a syntax error at the variable.
+std::optional<std::string> identifierBefore( const Text & text, Loc at ) {
+	std::vector<Token> toks = lex( text.line( at.line ) );
+	for ( size_t i = 1; i < toks.size(); i += 1 ) {
+		if ( toks[i].col != at.col ) continue;
+		if ( toks[i].kind == TokKind::Identifier && toks[i - 1].kind == TokKind::Identifier && text::isIdentifier( toks[i - 1].text ) ) {
+			return toks[i - 1].text;
+		}
+		break;
+	}
+	return std::nullopt;
+}
+
+struct Includes {
+	int line = 0;							// where a new #include goes
+	std::set<std::string> headers;			// already included, as written and by file name
+};
+
+// A new #include goes after the last one before the first line of code, or
+// on that line if there is none.
+Includes includesOf( const Text & text ) {
+	LexOptions lo;
+	lo.comments = true;
+	lo.directives = true;
+	Includes out;
+	int after = -1, code = -1;
+	for ( const Token & t : lex( text.str(), lo ) ) {
+		if ( t.kind == TokKind::Comment ) continue;
+		if ( t.kind != TokKind::Directive ) {
+			if ( code < 0 ) code = t.line;
+			continue;
+		}
+		std::string_view d = t.text;
+		size_t i = d.find_first_not_of( " \t", 1 );
+		if ( i == std::string_view::npos || d.compare( i, 7, "include" ) != 0 ) continue;
+		size_t open = d.find_first_of( "<\"", i + 7 );
+		size_t close = open == std::string_view::npos ? open : d.find( d[open] == '<' ? '>' : '"', open + 1 );
+		if ( close != std::string_view::npos ) {
+			std::string name( d.substr( open + 1, close - open - 1 ) );
+			out.headers.insert( name );
+			out.headers.insert( name.substr( name.rfind( '/' ) + 1 ) );
+		}
+		if ( code < 0 ) after = t.endLine;
+	}
+	out.line = after >= 0 ? after + 1 : code >= 0 ? code : 0;
+	return out;
+}
+
+nlohmann::json quickFix( const std::string & title, const nlohmann::json & diag, const std::string & uri, nlohmann::json edit ) {
+	nlohmann::json changes = nlohmann::json::object();
+	changes[uri] = nlohmann::json::array( { std::move( edit ) } );
+	return { { "title", title }, { "kind", "quickfix" }, { "diagnostics", nlohmann::json::array( { diag } ) },
+			 { "edit", { { "changes", changes } } } };
 }
 
 } // namespace
@@ -328,6 +415,9 @@ nlohmann::json Server::request( const std::string & method, const json & params 
 	if ( method == "textDocument/rename" ) return rename( params );
 	if ( method == "textDocument/switchSourceHeader" ) return switchSourceHeader( params );
 	if ( method == "workspace/symbol" ) return workspaceSymbol( params );
+	if ( method == "textDocument/codeAction" ) return codeAction( params );
+	if ( method == "textDocument/formatting" ) return formatting( params, false );
+	if ( method == "textDocument/rangeFormatting" ) return formatting( params, true );
 	throw LspError{ MethodNotFound, "unhandled method " + method };
 }
 
@@ -415,6 +505,9 @@ nlohmann::json Server::initialize( const json & params ) {
 		{ "inlayHintProvider", true },
 		{ "renameProvider", prepareRenameSupport ? json{ { "prepareProvider", true } } : json( true ) },
 		{ "workspaceSymbolProvider", true },
+		{ "codeActionProvider", { { "codeActionKinds", json::array( { "quickfix" } ) } } },
+		{ "documentFormattingProvider", true },
+		{ "documentRangeFormattingProvider", true },
 	};
 	return { { "capabilities", capabilities }, { "serverInfo", { { "name", "cfa-lsp" }, { "version", "0.1.0" } } } };
 }
@@ -683,6 +776,14 @@ bool Server::sameIdentifier( const Document & d, Loc cur, const EditList & edits
 	if ( ! ma.exact || ! mb.exact ) return false;
 	auto back = toCurrentExact( edits, { ma.loc, mb.loc } );
 	return back && back->start == a && back->end == b;
+}
+
+const HeaderIndex & Server::headerIndex() {
+	if ( ! headers ) {
+		std::string prefix = checker ? checker->toolchain().cfaPrefix : std::string();
+		headers = prefix.empty() ? HeaderIndex() : HeaderIndex::scan( prefix + "/include/cfa" );
+	}
+	return *headers;
 }
 
 std::string Server::uriOf( const std::string & path ) const {
@@ -1060,6 +1161,91 @@ nlohmann::json Server::workspaceSymbol( const json & params ) {
 		}
 	}
 	return out;
+}
+
+nlohmann::json Server::codeAction( const json & params ) {
+	json out = json::array();
+	Document * d = docFor( params );
+	if ( ! d ) return out;
+	const json & context = member( params, "context" );
+	const json & only = member( context, "only" );
+	if ( only.is_array() && std::none_of( only.begin(), only.end(), []( const json & k ) { return k == "quickfix"; } ) ) return out;
+	const json & diags = member( context, "diagnostics" );
+	if ( ! diags.is_array() ) return out;
+	auto pos = [&]( const json & p ) {
+		return d->text.fromLsp( intOr( member( p, "line" ), 0 ), intOr( member( p, "character" ), 0 ), enc );
+	};
+	std::optional<Includes> includes;
+	auto addIncludes = [&]( std::vector<std::string> found, const json & diag ) {
+		if ( found.size() > 3 ) found.resize( 3 );
+		for ( const std::string & h : found ) {
+			if ( ! includes ) includes = includesOf( d->text );
+			if ( includes->headers.count( h ) ) continue;
+			Loc at{ includes->line, 0 };
+			std::string ins = "#include <" + h + ">\n";
+			if ( at.line >= d->text.lineCount() ) {				// after a last line with no newline
+				at = d->text.loc( d->text.str().size() );
+				ins = "\n#include <" + h + ">";
+			}
+			out.push_back( quickFix( "Add #include <" + h + ">", diag, d->uri,
+									 { { "range", lspRange( d->text, { at, at } ) }, { "newText", ins } } ) );
+		}
+	};
+	for ( const json & diag : diags ) {
+		const json & msg = member( diag, "message" );
+		const json & source = member( diag, "source" );
+		if ( ! msg.is_string() || ( source.is_string() && source != "cfa" ) ) continue;
+		std::string message = msg.get<std::string>();
+		message = message.substr( 0, message.find( '\n' ) );
+		const json & r = member( diag, "range" );
+		Range range{ pos( member( r, "start" ) ), pos( member( r, "end" ) ) };
+		if ( auto name = undeclaredName( message ) ) {
+			auto at = nameIn( d->text, range, *name );
+			if ( ! at ) continue;
+			// An exact name from a header is a likelier fix than a near one.
+			addIncludes( headerIndex().headersFor( *name ), diag );
+			if ( ! d->analysis ) continue;
+			Loc snap = toSnapshot( d->editsSince( d->analysisSeq ), at->start ).loc;
+			for ( const std::string & s : d->analysis->similarNames( d->path, snap, *name ) ) {
+				out.push_back( quickFix( "Change `" + *name + "` to `" + s + "`", diag, d->uri,
+										 { { "range", lspRange( d->text, *at ) }, { "newText", s } } ) );
+			}
+		} else if ( message.starts_with( "syntax error" ) ) {
+			if ( auto type = identifierBefore( d->text, range.start ) ) addIncludes( headerIndex().headersFor( *type, true ), diag );
+		}
+	}
+	return out;
+}
+
+nlohmann::json Server::formatting( const json & params, bool range ) {
+	Document * d = docFor( params );
+	if ( ! d ) return nullptr;
+	const json & o = member( params, "options" );
+	auto flag = [&]( const char * key, bool dflt ) {
+		const json & v = member( o, key );
+		return v.is_boolean() ? v.get<bool>() : dflt;
+	};
+	FormatOptions fo;
+	fo.tabSize = intOr( member( o, "tabSize" ), 4 );
+	fo.insertSpaces = flag( "insertSpaces", true );
+	fo.trimTrailingWhitespace = flag( "trimTrailingWhitespace", true );
+	fo.insertFinalNewline = flag( "insertFinalNewline", false );
+	fo.trimFinalNewlines = flag( "trimFinalNewlines", false );
+	int first = 0, last = INT_MAX;
+	if ( range ) {
+		const json & r = member( params, "range" );
+		const json & s = member( r, "start" ), & e = member( r, "end" );
+		Loc a = d->text.fromLsp( intOr( member( s, "line" ), 0 ), intOr( member( s, "character" ), 0 ), enc );
+		Loc b = d->text.fromLsp( intOr( member( e, "line" ), 0 ), intOr( member( e, "character" ), 0 ), enc );
+		first = a.line;
+		last = b.line > a.line && b.col == 0 ? b.line - 1 : b.line;	// a range ending at a line start leaves that line alone
+	}
+	std::string formatted = formatText( d->text.str(), fo, first, last );
+	json edits = json::array();
+	for ( const auto & [r, s] : diffEdits( d->text, formatted ) ) {
+		edits.push_back( { { "range", lspRange( d->text, r ) }, { "newText", s } } );
+	}
+	return edits;
 }
 
 // ---------------------------------------------------------------- diagnostics
