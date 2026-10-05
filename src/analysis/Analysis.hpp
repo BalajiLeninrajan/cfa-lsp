@@ -3,6 +3,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <nlohmann/json_fwd.hpp>
@@ -62,6 +63,25 @@ class Analysis {
 	// in unparsed code. `pos` as for completion().
 	std::optional<SignatureHelp> signatureHelp( const std::string & file, Loc pos,
 												const std::string & textBefore ) const;
+
+	// The declarations (kind 1) and uses (kind 2) in `file` of the entity at `pos`.
+	std::vector<DocumentHighlight> documentHighlights( const std::string & file, Loc pos ) const;
+
+	// Parameter names before the arguments of calls in `file`, and the result
+	// type after calls of polymorphic functions when it differs from the
+	// declared return type. Only hints positioned inside `range`.
+	std::vector<InlayHint> inlayHints( const std::string & file, Range range ) const;
+
+	// The occurrences in `file` of the entity at `pos`, or why it can't be
+	// renamed: its declarations must all be in `file`, and in a header only
+	// local names qualify, since uses in the files that include it are not
+	// known. nullopt if nothing renameable is at `pos`.
+	std::optional<RenamePlan> rename( const std::string & file, Loc pos ) const;
+	static bool isKeyword( std::string_view word );
+
+	// The user's files in this dump: focus files and project headers (not
+	// libcfa, the prelude or system headers). For workspace symbols.
+	std::vector<std::string> projectFiles() const;
 
 	std::vector<SemanticToken> semanticTokens( const std::string & file ) const;
 	static const std::vector<std::string> & tokenTypes();		// LSP legend

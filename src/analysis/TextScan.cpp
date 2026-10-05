@@ -402,6 +402,85 @@ std::optional<CallSite> callBefore( std::string_view t ) {
 	return CallSite{ std::string( t.substr( b, e - b ) ), e, call->commas };
 }
 
+std::optional<CallArguments> callArguments( const FileText & f, Loc from ) {
+	if ( from.line < 0 || from.line >= f.lineCount() ) return std::nullopt;
+	// The text from `from` on, and where each of its lines starts.
+	struct Piece { size_t offset; int line, col; };
+	std::vector<Piece> pieces;
+	std::string t;
+	for ( int l = from.line; l < f.lineCount() && l < from.line + 64; l += 1 ) {
+		std::string_view lt = f.line( l );
+		int c0 = l == from.line ? std::clamp( from.col, 0, int( lt.size() ) ) : 0;
+		pieces.push_back( { t.size(), l, c0 } );
+		t.append( lt.substr( c0 ) );
+		t += '\n';
+	}
+	auto locAt = [&]( size_t off ) {
+		auto it = std::upper_bound( pieces.begin(), pieces.end(), off, []( size_t o, const Piece & p ) { return o < p.offset; } );
+		const Piece & p = *std::prev( it );
+		return Loc{ p.line, p.col + int( off - p.offset ) };
+	};
+
+	size_t i = 0;
+	while ( i < t.size() && isSpace( t[i] ) ) i += 1;
+	if ( i >= t.size() || t[i] != '(' ) return std::nullopt;
+	CallArguments out;
+	size_t argStart = std::string::npos, argEnd = 0;
+	auto mark = [&]( size_t b, size_t e ) {
+		if ( argStart == std::string::npos ) argStart = b;
+		argEnd = e;
+	};
+	auto flush = [&]( size_t at, bool closing ) {
+		if ( argStart != std::string::npos ) out.args.push_back( { locAt( argStart ), locAt( argEnd ) } );
+		else if ( !closing || !out.args.empty() ) out.args.push_back( { locAt( at ), locAt( at ) } );
+		argStart = std::string::npos;
+	};
+	int depth = 0;
+	for ( ; i < t.size(); i += 1 ) {
+		char c = t[i];
+		if ( isSpace( c ) ) continue;
+		if ( c == '/' && i + 1 < t.size() && t[i + 1] == '/' ) {
+			i = t.find( '\n', i );
+			continue;
+		}
+		if ( c == '/' && i + 1 < t.size() && t[i + 1] == '*' ) {
+			size_t e = t.find( "*/", i + 2 );
+			if ( e == std::string::npos ) return std::nullopt;
+			i = e + 1;
+			continue;
+		}
+		if ( c == '"' || c == '\'' ) {
+			size_t j = i + 1;
+			while ( j < t.size() && t[j] != c && t[j] != '\n' ) j += t[j] == '\\' ? 2 : 1;
+			j = std::min( j, t.size() - 1 );
+			mark( i, j + 1 );
+			i = j;
+			continue;
+		}
+		if ( c == '(' || c == '[' || c == '{' ) {
+			depth += 1;
+			if ( depth > 1 ) mark( i, i + 1 );
+			continue;
+		}
+		if ( c == ')' || c == ']' || c == '}' ) {
+			depth -= 1;
+			if ( depth == 0 ) {
+				flush( i, true );
+				out.end = locAt( i + 1 );
+				return out;
+			}
+			mark( i, i + 1 );
+			continue;
+		}
+		if ( c == ',' && depth == 1 ) {
+			flush( i, false );
+			continue;
+		}
+		mark( i, i + 1 );
+	}
+	return std::nullopt;
+}
+
 CompletionContext completionContext( std::string_view lb ) {
 	CompletionContext ctx;
 	size_t first = lb.find_first_not_of( " \t" );
