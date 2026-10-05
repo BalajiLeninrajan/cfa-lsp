@@ -216,3 +216,17 @@ The translator changes live in the submodule, on branch `balaji/lsp` of
 them are in `cforall/src/LSP/Lsp.cpp`; the rest record source locations in the
 parser and keep going after errors. Change `docs/dump-format.md` first when
 the JSON changes, then both sides.
+
+## License
+
+The code in this repository is MIT licensed; see [LICENSE](LICENSE).
+
+The `cforall/` submodule is Cforall, copyright the University of Waterloo,
+under its own 3-clause BSD license (`cforall/LICENSE`). Its changes on the
+`balaji/lsp` branch are under that license too. The `cfa-cpp` that
+`make install` puts in `libexec/cfa-lsp` is built from it, so if you hand out
+that binary, include `cforall/LICENSE` with it.
+
+`third_party/` holds [nlohmann/json](https://github.com/nlohmann/json) and
+[doctest](https://github.com/doctest/doctest), both MIT licensed, with their
+license files next to them.
