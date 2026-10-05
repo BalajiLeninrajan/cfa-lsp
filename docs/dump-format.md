@@ -128,12 +128,14 @@ When `complete` is false:
   the next declaration (at file scope), and translation goes on with what
   parsed, so decls, refs, exprs and scopes cover the rest of the file. The
   statement or declaration with the error is left out; at file scope, so is
-  the body of a function whose declarator doesn't parse. An error the parser
-  can't recover from ends the parse, and only the declarations at file scope
-  before it are dumped: an unclosed block at the end of the file, or a construct
-  that the grammar rejects with an error of its own (most of the "illegal
-  syntax" errors). Only the syntax errors are reported, since diagnostics from
-  the later passes would mostly be about the code the parser skipped;
+  the body of a function whose declarator doesn't parse. Each `{` still open
+  at the end of the file is closed there, with an error at that `{`, so a
+  block left open keeps the function it is in. An error the parser can't
+  recover from ends the parse, and only the declarations at file scope before
+  it are dumped. Most of the "illegal syntax" errors, which the grammar reports
+  from its own rules, do that. Only the syntax errors are reported, since
+  diagnostics from the later passes would mostly be about the code the parser
+  skipped;
 - after an error in a pass before `Resolve`, decls (and type refs) come from
   the partly validated AST, and nothing is resolved;
 - after errors in `Resolve`, the statements and global declarations that

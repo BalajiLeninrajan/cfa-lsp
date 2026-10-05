@@ -514,6 +514,21 @@ TEST_CASE( "a check of a file with a syntax error still covers the code that par
 	json def = c.result( "textDocument/definition", at( uri, posOf( text, "a1 * 2" ) ) );
 	REQUIRE( def.size() == 1 );
 	CHECK( def[0]["range"]["start"] == posOf( text, "a1 = area" ) );
+
+	// A block left open: the `if` takes main's closing brace. The translator closes main at the end of the file
+	// and reports main's '{', and main is still translated.
+	ins = "\tif ( fresh > 0 ) {\n";
+	p = posOf( text, "\tsout | u | du;" );
+	text.insert( text.find( "\tsout | u | du;" ), ins );
+	c.change( uri, 3, p, p, ins );
+	d = c.diagnostics( uri, 3 );
+	REQUIRE( d );
+	std::set<int> lines;
+	for ( const json & x : ( *d )["diagnostics"] ) lines.insert( x["range"]["start"]["line"].get<int>() );
+	CHECK( lines == std::set<int>{ posOf( text, "int half" )["line"].get<int>(), posOf( text, "int main" )["line"].get<int>() } );
+	h = hoverText( c.result( "textDocument/hover", at( uri, posOf( text, "du;" ) ) ) );
+	CHECK( contains( h, "double du" ) );
+	CHECK_FALSE( contains( h, "from the text" ) );
 	CHECK( c.shutdown() == 0 );
 }
 
