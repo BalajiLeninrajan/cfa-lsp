@@ -53,6 +53,22 @@ std::string normalize( const std::string & p ) {
 	return fs::path( p ).lexically_normal().string();
 }
 
+// What quoteDirFlags makes of a directory without a comma.
+const std::string quotePrefix = "-Wp,-iquote";
+
+// An include directory as a key: normalized, without a trailing '/'.
+std::string dirKey( const std::string & d ) {
+	std::string n = normalize( d );
+	while ( n.size() > 1 && n.back() == '/' ) n.pop_back();
+	return n;
+}
+
+std::string replaceAll( std::string s, const std::string & from, const std::string & to ) {
+	if ( from.empty() ) return s;
+	for ( size_t p = s.find( from ); p != std::string::npos; p = s.find( from, p + to.size() ) ) s.replace( p, from.size(), to );
+	return s;
+}
+
 // The first and last few non-empty lines of a tool's stderr: usage errors
 // come first, crash reports last.
 std::string excerpt( const std::string & text ) {
@@ -271,15 +287,41 @@ std::vector<Diag> diagsFromOutput( const std::string & output, const std::string
 	return out;
 }
 
-std::vector<std::string> Checker::cppCommand( const CheckRequest & req, const FlagSet & flags, const std::string & in ) const {
+std::vector<std::string> Checker::cppCommand( const CheckRequest & req, const FlagSet & flags, const std::string & in,
+											  const OverlayDirs & overlays ) const {
 	std::vector<std::string> cmd = { tc.cfa, "-E", "-fdiagnostics-plain-output", "-fdiagnostics-column-unit=byte" };
+	auto overlayOf = [&]( const std::string & dir ) -> const std::string * {
+		std::string key = dirKey( dir );
+		for ( const auto & [d, o] : overlays ) {
+			if ( d == key ) return &o;
+		}
+		return nullptr;
+	};
 	// cpp looks for #include "x" in the directory of the file it reads, which
 	// is our temp directory. The real file's directory stands in for it, as a
 	// quote-only directory searched before the user's: with -I it would also
 	// be searched for <x>, and a project header named like a libcfa header
-	// would hide that one.
-	for ( const auto & f : quoteDirFlags( fs::path( req.path ).parent_path().string() ) ) cmd.push_back( f );
-	cmd.insert( cmd.end(), flags.cpp.begin(), flags.cpp.end() );
+	// would hide that one. Each directory holding an unsaved header comes
+	// right after its overlay.
+	std::string dir = fs::path( req.path ).parent_path().string();
+	if ( auto o = overlayOf( dir ) ) {
+		for ( const auto & f : quoteDirFlags( *o ) ) cmd.push_back( f );
+	}
+	for ( const auto & f : quoteDirFlags( dir ) ) cmd.push_back( f );
+	for ( size_t i = 0; i < flags.cpp.size(); i += 1 ) {
+		const std::string & f = flags.cpp[i];
+		if ( f == "-I" && i + 1 < flags.cpp.size() ) {
+			if ( auto o = overlayOf( flags.cpp[i + 1] ) ) {
+				cmd.push_back( "-I" );
+				cmd.push_back( *o );
+			}
+		} else if ( f.rfind( quotePrefix, 0 ) == 0 ) {
+			if ( auto o = overlayOf( f.substr( quotePrefix.size() ) ) ) {
+				for ( const auto & q : quoteDirFlags( *o ) ) cmd.push_back( q );
+			}
+		}
+		cmd.push_back( f );
+	}
 	cmd.push_back( in );
 	return cmd;
 }
@@ -292,6 +334,11 @@ std::vector<std::string> Checker::translatorCommand( const CheckRequest & req, c
 	// cc1.cc adds the input file and --colors.
 	std::vector<std::string> cmd = { tc.translator, "--lsp", json, "--lsp-focus", req.path };
 	if ( req.stopAfterResolve ) cmd.push_back( "--lsp-stop-after-resolve" );
+	for ( const std::string & f : req.extraFocus ) {
+		if ( f == req.path ) continue;
+		cmd.push_back( "--lsp-focus" );
+		cmd.push_back( f );
+	}
 	if ( ! cOut.empty() ) {
 		cmd.push_back( "--lsp-c-out" );
 		cmd.push_back( cOut );
@@ -500,6 +547,43 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 		clock = now;
 	};
 
+	// Unsaved headers: for each include directory (then the file's own) that
+	// holds one, a copy of it under an overlay directory searched first. The
+	// overlay paths in cpp's output are put back to the real ones.
+	OverlayDirs overlays;
+	if ( ! req.overlays.empty() ) {
+		std::vector<std::string> search = { dirKey( cwd ) };
+		for ( size_t i = 0; i < fr.flags.cpp.size(); i += 1 ) {
+			const std::string & f = fr.flags.cpp[i];
+			if ( f == "-I" && i + 1 < fr.flags.cpp.size() ) search.push_back( dirKey( fr.flags.cpp[i + 1] ) );
+			else if ( f.rfind( quotePrefix, 0 ) == 0 ) search.push_back( dirKey( f.substr( quotePrefix.size() ) ) );
+		}
+		for ( const std::string & d : search ) {
+			bool seen = d.size() <= 1;
+			for ( const auto & ov : overlays ) seen = seen || ov.first == d;
+			if ( seen ) continue;
+			std::string odir = dir + "/overlay" + std::to_string( overlays.size() );
+			bool used = false;
+			for ( const auto & [path, text] : req.overlays ) {
+				std::string p = normalize( path );
+				if ( p.size() <= d.size() + 1 || p.compare( 0, d.size(), d ) != 0 || p[d.size()] != '/' ) continue;
+				fs::path target = fs::path( odir ) / p.substr( d.size() + 1 );
+				std::error_code ec;
+				fs::create_directories( target.parent_path(), ec );
+				if ( ec || ! writeFile( target.string(), text ) ) {
+					log::warn( "cannot write overlay ", target.string() );
+					continue;
+				}
+				used = true;
+			}
+			if ( used ) overlays.push_back( { d, odir } );
+		}
+	}
+	auto unOverlay = [&overlays]( std::string s ) {
+		for ( const auto & [d, o] : overlays ) s = replaceAll( std::move( s ), o + "/", d + "/" );
+		return s;
+	};
+
 	// 1. Preprocess.
 	RunOptions o;
 	o.cwd = cwd;
@@ -507,13 +591,21 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 	o.stderrPath = dir + "/cpp.err";
 	o.timeout = req.timeout;
 	o.env = childEnv( dir );
-	RunResult r = runProcess( cppCommand( req, fr.flags, in ), o, &cancel );
+	RunResult r = runProcess( cppCommand( req, fr.flags, in, overlays ), o, &cancel );
 	if ( r.status == RunResult::Cancelled ) {
 		fr.status = FrontResult::Cancelled;
 		return fr;
 	}
 	lap( "cfa -E" );
-	std::string cppErr = readFile( o.stderrPath ).value_or( "" );
+	std::string cppErr = unOverlay( readFile( o.stderrPath ).value_or( "" ) );
+	if ( ! overlays.empty() ) {
+		// The translator reads in.i itself.
+		if ( ! writeFile( o.stdoutPath, unOverlay( readFile( o.stdoutPath ).value_or( "" ) ) ) && r.ok() ) {
+			fr.status = FrontResult::PreprocessFailed;
+			fr.diags.push_back( fileLevel( req.path, "cfa-lsp: cannot write " + o.stdoutPath ) );
+			return fr;
+		}
+	}
 	std::vector<Diag> cppDiags = diagsFromOutput( cppErr, req.path, in, cwd, tc, "cpp" );
 	if ( ! r.ok() ) {
 		fr.status = FrontResult::PreprocessFailed;
@@ -570,11 +662,12 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 		std::map<std::string, std::optional<std::string>> files;
 	};
 	auto cache = std::make_shared<Cache>();
-	SourceMap::Reader reader = [cache, main = req.path, text = req.text, cwd]( const std::string & p ) -> std::optional<std::string> {
+	SourceMap::Reader reader = [cache, main = req.path, text = req.text, buffers = req.overlays, cwd]( const std::string & p ) -> std::optional<std::string> {
 		std::string path = p;
 		if ( ! path.empty() && path[0] != '/' ) path = ( fs::path( cwd ) / path ).string();
 		path = normalize( path );
 		if ( path == main ) return text;
+		if ( auto b = buffers.find( path ); b != buffers.end() ) return b->second;
 		std::lock_guard<std::mutex> lock( cache->m );
 		auto it = cache->files.find( path );
 		if ( it != cache->files.end() ) return it->second;
@@ -626,7 +719,11 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 		if ( x.severity == 1 ) anyError = true;
 		all.push_back( std::move( x ) );
 	}
-	fr.diags = withIncludeSummaries( std::move( all ), req.path, includeSites( preprocessed, in, req.path ), tc );
+	IncludeSites sites = includeSites( preprocessed, in, req.path );
+	for ( const auto & [f, site] : sites ) {
+		if ( ! f.empty() && f[0] == '/' && f != req.path && f != normalize( in ) && ! tc.isSystemPath( f ) ) fr.files.push_back( f );
+	}
+	fr.diags = withIncludeSummaries( std::move( all ), req.path, sites, tc );
 
 	// Errors in the passes that only check the program don't stop code
 	// generation, so there can be C even when the translator reported errors.

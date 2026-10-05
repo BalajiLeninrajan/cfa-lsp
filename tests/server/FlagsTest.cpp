@@ -101,6 +101,31 @@ TEST_CASE( "commands passed to each stage" ) {
 	CHECK( std::find( be2.begin(), be2.end(), "-std=gnu11" ) == be2.end() );
 }
 
+TEST_CASE( "overlay directories come right before the directories they shadow" ) {
+	Toolchain tc;
+	tc.cfa = "/opt/cfa/bin/cfa";
+	tc.translator = "/x/cfa-cpp";
+	Checker ch( tc );
+	CheckRequest req;
+	req.path = "/home/u/proj/src/main.cfa";
+	req.extraFocus = { "/home/u/proj/inc/a.hfa", "/home/u/proj/src/main.cfa" };
+	FlagSet f = classifyFlags( { "-I", "../inc", "-I/opt/other/", "-iquote", "../q" }, "/home/u/proj/src" );
+	OverlayDirs ov = { { "/home/u/proj/src", "/tmp/t/overlay0" }, { "/home/u/proj/inc", "/tmp/t/overlay1" },
+					   { "/home/u/proj/q", "/tmp/t/overlay2" } };
+
+	V cpp = ch.cppCommand( req, f, "/tmp/t/in.cfa", ov );
+	CHECK( contains( cpp, { "-Wp,-iquote/tmp/t/overlay0", "-Wp,-iquote/home/u/proj/src" } ) );
+	CHECK( contains( cpp, { "-I", "/tmp/t/overlay1", "-I", "/home/u/proj/inc", "-I", "/opt/other/" } ) );
+	CHECK( contains( cpp, { "-Wp,-iquote/tmp/t/overlay2", "-Wp,-iquote/home/u/proj/q" } ) );
+	CHECK( std::count( cpp.begin(), cpp.end(), "-I" ) == 3 );
+	CHECK( ch.cppCommand( req, f, "/tmp/t/in.cfa" ).size() == cpp.size() - 4 );
+
+	// The main file is the first focus file, and only once.
+	V tr = ch.translatorCommand( req, f, "/tmp/t/in.i", "/tmp/t/out.json", "" );
+	CHECK( contains( tr, { "--lsp-focus", "/home/u/proj/src/main.cfa", "--lsp-focus", "/home/u/proj/inc/a.hfa", "-L" } ) );
+	CHECK( std::count( tr.begin(), tr.end(), "--lsp-focus" ) == 2 );
+}
+
 TEST_CASE( "prelude directory follows the driver's layout" ) {
 	TempDir tmp;
 	fs::create_directories( tmp.path() + "/lib/cfa/x64-debug" );

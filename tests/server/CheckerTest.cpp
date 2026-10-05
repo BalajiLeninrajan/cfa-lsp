@@ -115,6 +115,50 @@ TEST_CASE( "real cfa and translator: an error in a system header goes on the hea
 	CHECK( summary );
 }
 
+TEST_CASE( "real cfa: unsaved headers are read from their buffers" ) {
+	std::string fake = envOr( "CFA_LSP_FAKE_CFA" );
+	if ( findInPath( "cfa" ).empty() || ! executable( fake ) ) {
+		MESSAGE( "needs cfa on PATH and CFA_LSP_FAKE_CFA; skipping" );
+		return;
+	}
+	ToolchainOptions o;
+	o.translator = fake;						// only the cpp stage matters here
+	Checker ch( discoverToolchain( o ) );
+	TempDir proj;
+	fs::create_directories( proj.path() + "/inc" );
+	fs::create_directories( proj.path() + "/q" );
+	std::string main = proj.path() + "/main.cfa", local = proj.path() + "/local.hfa", other = proj.path() + "/inc/other.hfa",
+				quoted = proj.path() + "/q/quoted.hfa";
+	std::ofstream( local ) << "int local_thing;\n";
+	std::ofstream( other ) << "int other_thing;\n";
+	std::ofstream( quoted ) << "int quoted_thing;\n";
+	CheckRequest req = requestFor( main, "#include \"local.hfa\"\n#include \"other.hfa\"\n#include \"quoted.hfa\"\nint main() {}\n" );
+	req.flags = { "-I", "inc", "-iquote", "q" };
+
+	// From disk the files are fine.
+	FrontResult fr = ch.front( req, CancelToken() );
+	CHECK( fr.status != FrontResult::PreprocessFailed );
+
+	// The buffers are found first: next to the main file, through -I and
+	// through -iquote. cpp's messages name the real files.
+	req.overlays[local] = "int local_thing;\n#error local buffer\n";
+	req.overlays[other] = "\n\n#error other buffer\n";
+	req.overlays[quoted] = "#error quoted buffer\n";
+	fr = ch.front( req, CancelToken() );
+	CHECK( fr.status == FrontResult::PreprocessFailed );
+	bool sawLocal = false, sawOther = false, sawQuoted = false;
+	for ( const Diag & d : fr.diags ) {
+		INFO( d.file << ":" << d.range.start.line << ": " << d.message );
+		if ( d.file == local && d.range.start.line == 1 && d.message.find( "local buffer" ) != std::string::npos ) sawLocal = true;
+		if ( d.file == other && d.range.start.line == 2 && d.message.find( "other buffer" ) != std::string::npos ) sawOther = true;
+		if ( d.file == quoted && d.range.start.line == 0 && d.message.find( "quoted buffer" ) != std::string::npos ) sawQuoted = true;
+		CHECK( d.file.find( "/overlay" ) == std::string::npos );
+	}
+	CHECK( sawLocal );
+	CHECK( sawOther );
+	CHECK( sawQuoted );
+}
+
 TEST_CASE( "real cfa without the translator: falls back to compiling" ) {
 	if ( findInPath( "cfa" ).empty() ) {
 		MESSAGE( "needs cfa on PATH; skipping" );

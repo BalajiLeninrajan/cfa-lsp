@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -57,7 +58,16 @@ struct CheckRequest {
 	bool backend = true;
 	bool stopAfterResolve = false;			// translator skips the passes after Resolve; no backend
 	std::chrono::milliseconds timeout{ 120000 };	// per child process
+	// Headers to read from these texts instead of from disk (open buffers
+	// with unsaved edits): path -> text. The preprocessor finds them in
+	// overlay directories placed before each include directory.
+	std::map<std::string, std::string> overlays;
+	// More files to dump uses and locals for (--lsp-focus), besides `path`.
+	std::vector<std::string> extraFocus;
 };
+
+// An include directory and the overlay directory that shadows it.
+using OverlayDirs = std::vector<std::pair<std::string, std::string>>;
 
 struct FrontResult {
 	enum Status { Ok, Cancelled, NoCfa, PreprocessFailed, TranslatorFailed, LoadFailed, Fallback } status = Ok;
@@ -66,6 +76,7 @@ struct FrontResult {
 	bool usable = false;					// analysis has declarations for the main file
 	bool backendReady = false;				// translator wrote C
 	bool translatorErrors = false;			// and reported errors, so back() keeps only gcc's warnings
+	std::vector<std::string> files;			// project files the preprocessor read, besides the main file
 
 	// Kept for the backend stage.
 	std::shared_ptr<TempDir> tmp;
@@ -88,7 +99,8 @@ class Checker {
 	std::vector<Diag> back( const CheckRequest & req, const FrontResult & fr, const CancelToken & cancel ) const;
 
 	// The commands, exposed for tests.
-	std::vector<std::string> cppCommand( const CheckRequest & req, const FlagSet & fs, const std::string & in ) const;
+	std::vector<std::string> cppCommand( const CheckRequest & req, const FlagSet & fs, const std::string & in,
+										 const OverlayDirs & overlays = {} ) const;
 	std::vector<std::string> translatorCommand( const CheckRequest & req, const FlagSet & fs, const std::string & in,
 												const std::string & json, const std::string & cOut ) const;
 	std::vector<std::string> backendCommand( const FlagSet & fs, const std::string & cFile ) const;
