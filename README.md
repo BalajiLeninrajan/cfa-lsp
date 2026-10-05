@@ -180,10 +180,15 @@ the buffer:
 
 Requests are answered right away from the last good result, in the order
 they arrive. A request cancelled with `$/cancelRequest` before its turn comes
-gets the `RequestCancelled` error instead of an answer. When a check fails to
-parse the file, the previous result stays in use, so completion after `x.`
-keeps working while a line is half typed. Edits made since that result are
-tracked, and positions are mapped through them in both directions.
+gets the `RequestCancelled` error instead of an answer. After a syntax error
+the translator skips the broken statement or declaration and translates the
+rest, so a check of a half-typed line still covers the rest of the file. A
+check that finds no declarations in the file at all leaves the previous
+result in use. Edits made since that result are tracked, and positions are
+mapped through them in both directions. Names that the result doesn't have
+(declared since, or in code that didn't parse) get member completion, hover
+and definition from a scan of the buffer text for their declaration
+(`Rect r2;`), as long as the type is one the result knows.
 
 Macros never reach the translator, so hover and definition on a macro read
 the `#define` lines of the files in the translation unit. A definition in a

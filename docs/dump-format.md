@@ -110,8 +110,8 @@ greater than `pline`, and `endCol` can be less than `col`.
 ```jsonc
 {
   "format": 1,
-  "complete": true,        // false when parsing, a pre-Resolve pass or Resolve
-                           // failed; decls/refs/exprs may then be partial or empty.
+  "complete": true,        // false after a syntax error, or when a pre-Resolve pass
+                           // or Resolve failed; decls/refs/exprs may then be partial.
                            // Errors in passes after Resolve leave it true: the
                            // snapshot was already taken from a resolved unit
   "diagnostics": [Diagnostic],
@@ -124,7 +124,16 @@ greater than `pline`, and `endCol` can be less than `col`.
 
 When `complete` is false:
 
-- after a syntax error, there are no decls, refs, exprs or scopes;
+- after a syntax error, the parser skips to the next statement (in a block) or
+  the next declaration (at file scope), and translation goes on with what
+  parsed, so decls, refs, exprs and scopes cover the rest of the file. The
+  statement or declaration with the error is left out; at file scope, so is
+  the body of a function whose declarator doesn't parse. An error the parser
+  can't recover from ends the parse, and only the declarations at file scope
+  before it are dumped: an unclosed block at the end of the file, or a construct
+  that the grammar rejects with an error of its own (most of the "illegal
+  syntax" errors). Only the syntax errors are reported, since diagnostics from
+  the later passes would mostly be about the code the parser skipped;
 - after an error in a pass before `Resolve`, decls (and type refs) come from
   the partly validated AST, and nothing is resolved;
 - after errors in `Resolve`, the statements and global declarations that
