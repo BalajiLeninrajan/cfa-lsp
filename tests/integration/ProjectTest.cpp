@@ -667,7 +667,7 @@ TEST_CASE( "code actions: did you mean, and the #include a libcfa name needs" ) 
 	CHECK( e["range"]["end"] == lspPos( 1, 0 ) );
 	CHECK( e["newText"] == "#include <fstream.hfa>\n" );
 
-	// A type without its header is a syntax error at the name after it.
+	// A type without its header is a syntax error: "adjacent identifiers".
 	std::string stext =
 		"#include <fstream.hfa>\n"
 		"int main() {\n"
@@ -681,7 +681,7 @@ TEST_CASE( "code actions: did you mean, and the #include a libcfa name needs" ) 
 	INFO( ( *sd )["diagnostics"].dump() );
 	json syntax;
 	for ( const auto & x : ( *sd )["diagnostics"] ) {
-		if ( x["message"].get<std::string>().starts_with( "syntax error" ) ) syntax = x;
+		if ( x["message"].get<std::string>().starts_with( "illegal syntax, adjacent identifiers \"string\"" ) ) syntax = x;
 	}
 	REQUIRE( ! syntax.is_null() );
 	as = actions( suri, syntax );

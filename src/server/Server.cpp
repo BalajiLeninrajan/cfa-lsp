@@ -189,8 +189,22 @@ std::optional<Range> nameIn( const Text & text, Range r, const std::string & nam
 	return fallback;
 }
 
-// The identifier right before an identifier at `at`. A type used without its
-// header (`string s;` without string.hfa) is a syntax error at the variable.
+// The parser's name for "X" in `illegal syntax, adjacent identifiers "X" and
+// "Y" ...` and `illegal syntax, identifier "X" cannot appear before a type`:
+// what a type used without its header (`string s;` without string.hfa) gives.
+std::optional<std::string> identifierBeforeIdentifier( std::string_view message ) {
+	for ( std::string_view prefix : { "illegal syntax, adjacent identifiers \"", "illegal syntax, identifier \"" } ) {
+		if ( ! message.starts_with( prefix ) ) continue;
+		size_t end = message.find( '"', prefix.size() );
+		if ( end == std::string_view::npos ) return std::nullopt;
+		std::string name( message.substr( prefix.size(), end - prefix.size() ) );
+		if ( text::isIdentifier( name ) ) return name;
+	}
+	return std::nullopt;
+}
+
+// The identifier right before an identifier at `at`, for a plain syntax error
+// there.
 std::optional<std::string> identifierBefore( const Text & text, Loc at ) {
 	std::vector<Token> toks = lex( text.line( at.line ) );
 	for ( size_t i = 1; i < toks.size(); i += 1 ) {
@@ -1210,6 +1224,8 @@ nlohmann::json Server::codeAction( const json & params ) {
 				out.push_back( quickFix( "Change `" + *name + "` to `" + s + "`", diag, d->uri,
 										 { { "range", lspRange( d->text, *at ) }, { "newText", s } } ) );
 			}
+		} else if ( auto type = identifierBeforeIdentifier( message ) ) {
+			addIncludes( headerIndex().headersFor( *type, true ), diag );
 		} else if ( message.starts_with( "syntax error" ) ) {
 			if ( auto type = identifierBefore( d->text, range.start ) ) addIncludes( headerIndex().headersFor( *type, true ), diag );
 		}
