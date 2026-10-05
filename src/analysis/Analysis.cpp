@@ -2093,6 +2093,24 @@ std::optional<RenamePlan> Analysis::rename( const std::string & file, Loc pos ) 
 			}
 		}
 	}
+	// The dump has no refs in array dimensions, designators, dead #if
+	// branches or functions that failed to resolve. A spelling of the name
+	// that is neither a site nor the ref or name of another declaration may be
+	// one of those, and renaming would leave it behind.
+	std::optional<std::string> source;
+	if ( m.read ) source = m.read( m.files[fi].path );
+	if ( source ) {
+		std::set<Loc> known;
+		for ( const Range & r : plan.sites ) known.insert( r.start );
+		for ( int r : m.files[fi].refs ) known.insert( m.refs[r].range.start );
+		for ( int n : m.files[fi].names ) known.insert( m.decls[n].nameRange.start );
+		for ( const Token & tok : lex( *source ) ) {
+			if ( tok.kind != TokKind::Identifier || tok.text != x.name || known.count( Loc{ tok.line, tok.col } ) ) continue;
+			return refuse( quoted + " appears on line " + std::to_string( tok.line + 1 ) +
+						   " where the translator recorded no use (an array dimension, a designator, dead code "
+						   "or code that failed to resolve); rename it by hand" );
+		}
+	}
 	return plan;
 }
 

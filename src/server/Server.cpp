@@ -296,6 +296,7 @@ nlohmann::json Server::initialize( const json & params ) {
 	}
 	hierarchicalSymbols = member( member( member( caps, "textDocument" ), "documentSymbol" ), "hierarchicalDocumentSymbolSupport" ) == true;
 	prepareRenameSupport = member( member( member( caps, "textDocument" ), "rename" ), "prepareSupport" ) == true;
+	inlayHintRefresh = member( member( member( caps, "workspace" ), "inlayHint" ), "refreshSupport" ) == true;
 
 	const json & root = member( params, "rootUri" );
 	if ( root.is_string() ) {
@@ -1038,9 +1039,16 @@ void Server::workerLoop() {
 			continue;
 		}
 		Document & doc = dit->second;
+		std::optional<json> refresh;
 		if ( fr.analysis && ( fr.usable || ! doc.analysis ) ) {
 			doc.analysis = fr.analysis;
 			doc.analysisSeq = seq;
+			// Clients ask for inlay hints when the text changes, not when a
+			// check finishes, so the hints of a file just opened would stay empty.
+			if ( inlayHintRefresh ) {
+				refresh = json{ { "jsonrpc", "2.0" }, { "id", "cfa-lsp-refresh-" + std::to_string( ++refreshRequests ) },
+								{ "method", "workspace/inlayHint/refresh" } };
+			}
 		}
 		diskCache.clear();
 		storeDiags( path, seq, fr.diags, out );
@@ -1049,6 +1057,7 @@ void Server::workerLoop() {
 		{
 			std::lock_guard<std::mutex> pub( publishMtx );
 			lk.unlock();
+			if ( refresh ) send( *refresh );
 			for ( auto & p : out ) notify( "textDocument/publishDiagnostics", std::move( p ) );
 		}
 		out.clear();

@@ -278,6 +278,51 @@ TEST_CASE( "switchSourceHeader pairs .cfa and .hfa files with the same stem" ) {
 	CHECK( s.request( "shutdown" )["result"].is_null() );
 }
 
+TEST_CASE( "prepareRename when the client supports it; inlay hint refresh after a check" ) {
+	if ( fakeCfa().empty() ) {
+		MESSAGE( "CFA_LSP_FAKE_CFA not set; skipping (run through make test)" );
+		return;
+	}
+	FakeEnv env;
+	std::string path = fs::canonical( fixtures() + "/server/hello.cfa" ).string();
+	std::string uri = pathToUri( path );
+	json open = { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 }, { "text", readAll( path ) } } } };
+	auto refreshes = []( const Session & s ) {
+		int n = 0;
+		for ( const json & m : s.queue ) {
+			if ( m.value( "method", "" ) == "workspace/inlayHint/refresh" ) n += 1;
+		}
+		return n;
+	};
+	{
+		Session s;
+		json caps = { { "textDocument", { { "rename", { { "prepareSupport", true } } } } },
+					  { "workspace", { { "inlayHint", { { "refreshSupport", true } } } } } };
+		json r = s.initialize( fakeOptions( { { "backend", false } } ), caps );
+		CHECK( r["result"]["capabilities"]["renameProvider"] == json{ { "prepareProvider", true } } );
+		s.notify( "textDocument/didOpen", open );
+		REQUIRE( s.diagnosticsFor( uri, []( const json & ) { return true; } ) );
+		// Sent before the diagnostics, so it is queued by now.
+		CHECK( refreshes( s ) == 1 );
+		for ( const json & m : s.queue ) {
+			if ( m.value( "method", "" ) == "workspace/inlayHint/refresh" ) {
+				CHECK( m.contains( "id" ) );
+			}
+		}
+		// The client's answer is not a request.
+		s.send( { { "jsonrpc", "2.0" }, { "id", "cfa-lsp-refresh-1" }, { "result", nullptr } } );
+		CHECK( s.request( "shutdown" )["result"].is_null() );
+	}
+	{
+		Session s;
+		s.initialize( fakeOptions( { { "backend", false } } ) );
+		s.notify( "textDocument/didOpen", open );
+		REQUIRE( s.diagnosticsFor( uri, []( const json & ) { return true; } ) );
+		CHECK( s.request( "shutdown" )["result"].is_null() );
+		CHECK( refreshes( s ) == 0 );
+	}
+}
+
 TEST_CASE( "exit without shutdown, and garbage input" ) {
 	Session s;
 	s.send( "not json" );
