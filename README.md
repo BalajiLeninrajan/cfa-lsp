@@ -104,8 +104,9 @@ The flags are split between the stages the way the `cfa` driver splits them:
 `-D`, `-U`, `-I` and friends go to the preprocessor, `-Wall`, `-Werror`, `-w`
 and CFA's own warning names (`-Wself-assign`, ...) to the translator, and the
 rest of the warnings and `-f`, `-O`, `-std` options to gcc. `-iquote DIR` is
-passed as `-I DIR`, because the `cfa` driver mistakes the directory for an
-input file.
+passed to `cfa -E` as `-Wp,-iquoteDIR`, because the `cfa` driver mistakes the
+directory in `-iquote DIR` for an input file. A directory with a comma in its
+name can't go through `-Wp,`, so it is passed as `-I DIR` instead.
 
 ### initializationOptions
 
@@ -136,8 +137,10 @@ the buffer:
 
 1. It writes the buffer to a temporary file that starts with
    `# 1 "/real/path.cfa"`, so every location in the output names the real
-   file, and runs `cfa -E` on it with the user's flags plus `-I` for the real
-   file's directory.
+   file, and runs `cfa -E` on it with the user's flags. The real file's
+   directory is added as a quote directory (`-iquote`, see above), so
+   `#include "x.hfa"` finds the file next to it and a project header named
+   like a libcfa header doesn't hide that one from `#include <x.hfa>`.
 2. It runs the forked translator: `cfa-cpp --lsp out.json --lsp-focus
    /real/path.cfa [--lsp-c-out out.c] ... in.i`. The translator runs its
    passes as usual, records errors instead of stopping at the first one, and

@@ -229,11 +229,13 @@ std::vector<Diag> diagsFromOutput( const std::string & output, const std::string
 
 std::vector<std::string> Checker::cppCommand( const CheckRequest & req, const FlagSet & flags, const std::string & in ) const {
 	std::vector<std::string> cmd = { tc.cfa, "-E", "-fdiagnostics-plain-output", "-fdiagnostics-column-unit=byte" };
+	// cpp looks for #include "x" in the directory of the file it reads, which
+	// is our temp directory. The real file's directory stands in for it, as a
+	// quote-only directory searched before the user's: with -I it would also
+	// be searched for <x>, and a project header named like a libcfa header
+	// would hide that one.
+	for ( const auto & f : quoteDirFlags( fs::path( req.path ).parent_path().string() ) ) cmd.push_back( f );
 	cmd.insert( cmd.end(), flags.cpp.begin(), flags.cpp.end() );
-	// Stands in for the quote-include search of the real file's directory
-	// (-iquote can't go through the cfa driver; see Flags.hpp).
-	cmd.push_back( "-I" );
-	cmd.push_back( fs::path( req.path ).parent_path().string() );
 	cmd.push_back( in );
 	return cmd;
 }
@@ -291,11 +293,12 @@ FrontResult Checker::fallback( const CheckRequest & req, const FlagSet & flags, 
 	fr.status = FrontResult::Fallback;
 	std::string cwd = fs::path( req.path ).parent_path().string();
 	std::vector<std::string> cmd = { tc.cfa, "-fdiagnostics-plain-output", "-fdiagnostics-column-unit=byte" };
+	for ( const auto & f : quoteDirFlags( cwd ) ) cmd.push_back( f );	// as in cppCommand
 	cmd.insert( cmd.end(), flags.cpp.begin(), flags.cpp.end() );
 	for ( const auto & f : flags.backend ) {
 		if ( f.rfind( "-W", 0 ) != 0 && f.rfind( "-std", 0 ) != 0 && f.rfind( "--std", 0 ) != 0 && f != "-w" ) cmd.push_back( f );
 	}
-	cmd.insert( cmd.end(), { "-I", cwd, "-c", in, "-o", "/dev/null" } );
+	cmd.insert( cmd.end(), { "-c", in, "-o", "/dev/null" } );
 	RunOptions o;
 	o.cwd = cwd;
 	o.stderrPath = tmp.path() + "/cfa.err";
