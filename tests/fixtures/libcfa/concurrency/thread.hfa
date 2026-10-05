@@ -1,0 +1,9 @@
+#pragma once
+
+thread worker_base {
+	int id;
+};
+
+forall( T & | is_thread( T ) )
+void join( T & t );
+void yield( void );
