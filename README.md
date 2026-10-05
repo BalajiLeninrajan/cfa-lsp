@@ -28,6 +28,10 @@ Features:
 - workspace symbols from the open documents and the project headers they
   include
 - clangd's `textDocument/switchSourceHeader`, between `x.cfa` and `x.hfa`
+- quick fixes for an undeclared identifier: a visible name a typo away from
+  it, and the `#include` of the libcfa header that declares it (also for a
+  type such as `string` used without its header, which is a syntax error)
+- formatting of a file or a range, which only changes whitespace (see below)
 
 It runs on Linux and needs an installed CFA 1.0.0 (`cfa` on `PATH`). The
 translator fork is based on the same version (upstream commit `fade1b55`).
@@ -233,6 +237,20 @@ defined in the same file or in a header the file includes directly, whose
 arguments and body use no other macros, and whose body has no `#` or `##`.
 For other macros, such an identifier maps to the argument.
 
+### Formatting
+
+The formatter only touches whitespace, so it can't mangle `?{}`, `^?{}`,
+`with` clauses or `sout | x` chains the way a C formatter would. It indents
+each line that starts a statement or declaration by its brace depth, with one
+more level for the statements under a `case` label and for the body of an
+`if`, `for`, `while`, `with`, `else` or `do` written without braces. A line
+that continues a statement (arguments split over lines, a `| x` chain) moves
+by as much as the statement's first line moved, so alignment within the
+statement is kept. It also removes trailing whitespace and applies the
+client's `insertFinalNewline` and `trimFinalNewlines` options. Spacing within
+a line, preprocessor directives and the inside of strings are left alone, and
+lines inside a block comment move with the line the comment starts on.
+
 ## Limits
 
 - A check takes as long as compiling the file: about 3 seconds for a small
@@ -263,12 +281,20 @@ For other macros, such an identifier maps to the argument.
 - If the translator fails an internal assertion or crashes, the check reports
   `internal translator error` on line 1, and unless the crash came after
   resolution the previous results stay in use.
+- The formatter counts braces in every branch of an `#if`, so branches that
+  each open a brace (two versions of a function header) indent what follows
+  one level too deep.
+- The `#include` fix knows the names declared at file scope in the `.hfa`
+  files of `<prefix>/include/cfa` and its `concurrency/` and `collections/`
+  directories, found by scanning their tokens, so names that only a macro
+  declares are missing.
 
 ## Development
 
 ```
 src/server/          LSP transport, documents, the check pipeline (C++20)
-src/analysis/        dump loading, SourceMap (column mapping), queries
+src/analysis/        dump loading, SourceMap (column mapping), queries, the
+                     formatter and the libcfa header index
 cforall/             the CFA source, with the LSP dump in cforall/src/LSP
 docs/                the translator's JSON format, design notes
 tests/               doctest tests, one binary; fixtures in tests/fixtures

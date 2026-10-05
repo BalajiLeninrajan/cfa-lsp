@@ -18,6 +18,7 @@
 
 #include "Analysis.hpp"
 #include "Checker.hpp"
+#include "Headers.hpp"
 #include "PositionMap.hpp"
 #include "Text.hpp"
 #include "Transport.hpp"
@@ -157,6 +158,8 @@ class Server {
 	// The rename at the cursor with its ranges in the current buffer; nullopt
 	// if there is nothing to rename. Throws if the rename is refused.
 	std::optional<RenamePlan> renameAt( const Document & d, const json & params );
+	json codeAction( const json & params );
+	json formatting( const json & params, bool range );
 
 	// conversions (caller holds mtx)
 	json lspPos( const Text & text, Loc l ) const;
@@ -172,6 +175,8 @@ class Server {
 	// the end of a name makes a different name.
 	bool sameIdentifier( const Document & d, Loc cur, const EditList & edits ) const;
 	std::string uriOf( const std::string & path ) const;
+	// libcfa's headers, indexed on first use (caller holds mtx).
+	const HeaderIndex & headerIndex();
 
 	// diagnostics
 	void storeDiags( const std::string & source, uint64_t seq, const std::vector<Diag> & diags,
@@ -225,6 +230,7 @@ class Server {
 	std::thread worker;
 	std::map<std::string, Text> diskCache;	// cleared per request
 	int refreshRequests = 0;				// ids of the requests we send
+	std::optional<HeaderIndex> headers;		// see headerIndex()
 };
 
 } // namespace cfalsp

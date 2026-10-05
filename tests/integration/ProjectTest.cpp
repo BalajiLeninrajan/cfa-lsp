@@ -616,4 +616,81 @@ TEST_CASE( "operators, postfix calls and default arguments" ) {
 	CHECK( c.shutdown() == 0 );
 }
 
+TEST_CASE( "code actions: did you mean, and the #include a libcfa name needs" ) {
+	if ( ! ready() ) return;
+	LspClient c( envOr( "CFA_LSP_TEST_LOG" ) );
+	c.initialize( { { "debounceMs", 50 }, { "backend", false } } );
+	auto actions = [&]( const std::string & uri, const json & diag ) {
+		return c.result( "textDocument/codeAction", { { "textDocument", td( uri ) }, { "range", diag["range"] },
+													  { "context", { { "diagnostics", json::array( { diag } ) } } } } );
+	};
+	auto titles = []( const json & as ) {
+		std::set<std::string> out;
+		for ( const auto & a : as ) out.insert( a["title"].get<std::string>() );
+		return out;
+	};
+
+	// A typo, and sout without fstream.hfa.
+	std::string text =
+		"// Nothing included.\n"
+		"int main() {\n"
+		"\tint count = 1;\n"
+		"\tcount = cuont + 1;\n"
+		"\tsout | count;\n"
+		"}\n";
+	std::string uri = uriOf( projectDir() + "/scratch_actions.cfa" );
+	c.open( uri, text );
+	auto d = c.diagnostics( uri, 1 );
+	REQUIRE( d );
+	json typo, missing;
+	for ( const auto & x : ( *d )["diagnostics"] ) {
+		if ( x["message"] == "use of undeclared identifier `cuont`" ) typo = x;
+		if ( x["message"] == "use of undeclared identifier `sout`" ) missing = x;
+	}
+	INFO( ( *d )["diagnostics"].dump() );
+	REQUIRE( ! typo.is_null() );
+	REQUIRE( ! missing.is_null() );
+
+	json as = actions( uri, typo );
+	REQUIRE( ! as.empty() );
+	CHECK( as[0]["title"] == "Change `cuont` to `count`" );
+	json e = as[0]["edit"]["changes"][uri][0];
+	CHECK( e["range"]["start"] == posOf( text, "cuont" ) );
+	CHECK( e["range"]["end"] == posOf( text, "cuont", 5 ) );
+	CHECK( e["newText"] == "count" );
+
+	as = actions( uri, missing );
+	REQUIRE( ! as.empty() );
+	CHECK( as[0]["title"] == "Add #include <fstream.hfa>" );
+	e = as[0]["edit"]["changes"][uri][0];
+	CHECK( e["range"]["start"] == lspPos( 1, 0 ) );		// after the leading comment
+	CHECK( e["range"]["end"] == lspPos( 1, 0 ) );
+	CHECK( e["newText"] == "#include <fstream.hfa>\n" );
+
+	// A type without its header is a syntax error at the name after it.
+	std::string stext =
+		"#include <fstream.hfa>\n"
+		"int main() {\n"
+		"\tstring s = \"hi\";\n"
+		"\tsout | s;\n"
+		"}\n";
+	std::string suri = uriOf( projectDir() + "/scratch_actions_type.cfa" );
+	c.open( suri, stext );
+	auto sd = c.diagnostics( suri, 1 );
+	REQUIRE( sd );
+	INFO( ( *sd )["diagnostics"].dump() );
+	json syntax;
+	for ( const auto & x : ( *sd )["diagnostics"] ) {
+		if ( x["message"].get<std::string>().starts_with( "syntax error" ) ) syntax = x;
+	}
+	REQUIRE( ! syntax.is_null() );
+	as = actions( suri, syntax );
+	CHECK( titles( as ).count( "Add #include <string.hfa>" ) );
+	for ( const auto & a : as ) {
+		if ( a["title"] != "Add #include <string.hfa>" ) continue;
+		CHECK( a["edit"]["changes"][suri][0]["range"]["start"] == lspPos( 1, 0 ) );		// after the #include
+	}
+	CHECK( c.shutdown() == 0 );
+}
+
 } // TEST_SUITE

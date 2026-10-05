@@ -3,6 +3,7 @@
 #include <doctest/doctest.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -200,6 +201,25 @@ class Session {
 
 json pos( int line, int ch ) { return { { "line", line }, { "character", ch } }; }
 
+// `text` with LSP TextEdits applied (ASCII text, so characters are bytes).
+std::string applyEdits( std::string text, const json & edits ) {
+	auto offset = [&]( const json & p ) {
+		size_t off = 0;
+		for ( int l = 0; l < p["line"].get<int>(); l += 1 ) off = text.find( '\n', off ) + 1;
+		return off + p["character"].get<size_t>();
+	};
+	std::vector<json> sorted( edits.begin(), edits.end() );
+	std::sort( sorted.begin(), sorted.end(), []( const json & a, const json & b ) {
+		const json & x = a["range"]["start"], & y = b["range"]["start"];
+		return x["line"] != y["line"] ? x["line"] > y["line"] : x["character"] > y["character"];
+	} );
+	for ( const json & e : sorted ) {
+		size_t b = offset( e["range"]["start"] ), end = offset( e["range"]["end"] );
+		text.replace( b, end - b, e["newText"].get<std::string>() );
+	}
+	return text;
+}
+
 json fakeOptions( json extra = json::object() ) {
 	json o = { { "cfa", fakeCfa() }, { "translator", fakeCfa() }, { "cc", fakeCfa() }, { "debounceMs", 20 },
 			   { "preludeDir", "/nonexistent-prelude" }, { "flags", { "-Wall" } } };
@@ -276,6 +296,9 @@ TEST_CASE( "lifecycle" ) {
 	CHECK( caps["inlayHintProvider"] == true );
 	CHECK( caps["renameProvider"] == true );				// the client didn't announce prepareSupport
 	CHECK( caps["workspaceSymbolProvider"] == true );
+	CHECK( caps["codeActionProvider"]["codeActionKinds"] == json::array( { "quickfix" } ) );
+	CHECK( caps["documentFormattingProvider"] == true );
+	CHECK( caps["documentRangeFormattingProvider"] == true );
 
 	auto msg = s.waitFor( "window/showMessage", []( const json & ) { return true; } );
 	REQUIRE( msg );
@@ -973,4 +996,74 @@ TEST_CASE( "workspace/didChangeConfiguration applies without a restart" ) {
 		s.notify( "exit", nullptr );
 		CHECK( s.finish() == 0 );
 	}
+}
+
+TEST_CASE( "formatting and range formatting" ) {
+	Session s;
+	s.initialize( { { "cfa", "/nonexistent/cfa" } } );
+	std::string uri = "file:///nonexistent-dir/fmt.cfa";
+	std::string text = "int main() {\nint x = 1;   \n  if ( x ) {\nx += 1;\n}\nreturn x;\n}";
+	s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 }, { "text", text } } } } );
+	json options = { { "tabSize", 4 }, { "insertSpaces", false }, { "insertFinalNewline", true } };
+	json edits = s.request( "textDocument/formatting", { { "textDocument", { { "uri", uri } } }, { "options", options } } )["result"];
+	REQUIRE( edits.is_array() );
+	CHECK( applyEdits( text, edits ) == "int main() {\n\tint x = 1;\n\tif ( x ) {\n\t\tx += 1;\n\t}\n\treturn x;\n}\n" );
+	// Lines 2 and 3 only; a range ending at the start of line 4 leaves line 4 alone.
+	json range = { { "start", pos( 2, 0 ) }, { "end", pos( 4, 0 ) } };
+	edits = s.request( "textDocument/rangeFormatting", { { "textDocument", { { "uri", uri } } }, { "range", range }, { "options", options } } )["result"];
+	CHECK( applyEdits( text, edits ) == "int main() {\nint x = 1;   \n\tif ( x ) {\n\t\tx += 1;\n}\nreturn x;\n}" );
+	// Formatted text needs no edits.
+	std::string done = "int main() {\n\treturn 0;\n}\n";
+	s.notify( "textDocument/didChange", { { "textDocument", { { "uri", uri }, { "version", 2 } } }, { "contentChanges", { { { "text", done } } } } } );
+	CHECK( s.request( "textDocument/formatting", { { "textDocument", { { "uri", uri } } }, { "options", options } } )["result"] == json::array() );
+	CHECK( s.request( "textDocument/formatting", { { "textDocument", { { "uri", "file:///not/open.cfa" } } }, { "options", options } } )["result"].is_null() );
+	s.request( "shutdown" );
+	s.notify( "exit", nullptr );
+	CHECK( s.finish() == 0 );
+}
+
+TEST_CASE( "code actions: did you mean" ) {
+	if ( fakeCfa().empty() || ! realAnalysis() ) {
+		MESSAGE( "CFA_LSP_FAKE_CFA not set; skipping (run through make test)" );
+		return;
+	}
+	FakeEnv env;
+	std::string path = fs::canonical( fixtures() + "/server/hello.cfa" ).string();
+	std::string uri = pathToUri( path );
+	std::string text = readAll( path );
+	text.replace( text.find( "twice( 21 )" ), 5, "twcie" );		// line 9: int y = twcie( 21 );
+	Session s;
+	s.initialize( fakeOptions( { { "backend", false } } ) );
+	s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 }, { "text", text } } } } );
+	REQUIRE( s.diagnosticsFor( uri, []( const json & ) { return true; } ) );
+
+	json diag = { { "range", { { "start", pos( 8, 12 ) }, { "end", pos( 8, 17 ) } } }, { "severity", 1 }, { "source", "cfa" },
+				  { "message", "use of undeclared identifier `twcie`" } };
+	json params = { { "textDocument", { { "uri", uri } } }, { "range", diag["range"] }, { "context", { { "diagnostics", json::array( { diag } ) } } } };
+	json actions = s.request( "textDocument/codeAction", params )["result"];
+	REQUIRE( actions.is_array() );
+	REQUIRE( ! actions.empty() );
+	json a = actions[0];
+	CHECK( a["title"] == "Change `twcie` to `twice`" );
+	CHECK( a["kind"] == "quickfix" );
+	CHECK( a["diagnostics"][0]["message"] == diag["message"] );
+	json edit = a["edit"]["changes"][uri];
+	REQUIRE( edit.size() == 1 );
+	CHECK( edit[0]["range"] == diag["range"] );
+	CHECK( edit[0]["newText"] == "twice" );
+
+	// Other diagnostics, other sources and other kinds get nothing.
+	json other = diag;
+	other["message"] = "unused variable 'unused'";
+	params["context"]["diagnostics"] = json::array( { other } );
+	CHECK( s.request( "textDocument/codeAction", params )["result"] == json::array() );
+	other = diag;
+	other["source"] = "gcc";
+	params["context"]["diagnostics"] = json::array( { other } );
+	CHECK( s.request( "textDocument/codeAction", params )["result"] == json::array() );
+	params["context"] = { { "diagnostics", json::array( { diag } ) }, { "only", json::array( { "refactor" } ) } };
+	CHECK( s.request( "textDocument/codeAction", params )["result"] == json::array() );
+	s.request( "shutdown" );
+	s.notify( "exit", nullptr );
+	CHECK( s.finish() == 0 );
 }
