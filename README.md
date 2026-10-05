@@ -210,13 +210,21 @@ translator's columns are offsets into the preprocessed line, not the line in
 your file. Line numbers are right, thanks to the line markers. The server
 tokenizes both lines and aligns the tokens to map each column back. Tokens
 produced by a macro map to the whole macro invocation, and a macro argument
-maps to where it is written. The alignment is a heuristic, and it can pick
-the wrong spot in a few cases:
+maps to where it is written.
 
-- a system-header macro such as `assert` or `isdigit` makes cpp split the line
-  into pieces that share one line number;
-- a header included twice uses the mapping of its first inclusion;
-- a `#line` directive in your source breaks the line correspondence.
+The translator also gives each position's line in the preprocessed text. When
+a system-header macro such as `assert` or `isdigit` makes cpp split a line
+into pieces that share one line number, that line says which piece a column
+is in, and for a header included twice it says which copy. A `#line`
+directive in your file changes the line numbers in the markers; the server
+reads the file's directives to get the real lines back.
+
+To tell an identifier in a macro's body from the same name passed as an
+argument (`tmp` in `SWAP( x, tmp )` when the body declares its own `tmp`),
+the server redoes the expansion from the `#define`. That works for a macro
+defined in the same file or in a header the file includes directly, whose
+arguments and body use no other macros, and whose body has no `#` or `##`.
+For other macros, such an identifier maps to the argument.
 
 ## Limits
 

@@ -390,8 +390,28 @@ TEST_CASE( "sourcemap/cfa: local include and libcfa headers" ) {
 	MESSAGE( "preprocessed lines: " << std::count( prep->begin(), prep->end(), '\n' ) << ", " << n
 			 << " fstream.hfa tokens checked, " << ms << " ms" );
 	CHECK( ms < 2000 );
-	// Only the three queried files were read.
-	CHECK( *reads == std::set<std::string>{ real.string(), local, fstream } );
+	// Only the three queried files were read, and headers they include, where
+	// SourceMap looks for the #define of a macro to redo its expansion.
+	std::set<std::string> queried{ real.string(), local, fstream };
+	for ( const std::string & r : *reads ) {
+		if ( queried.count( r ) ) continue;
+		bool included = false;
+		for ( const std::string & q : queried ) {
+			std::istringstream in( slurp( q ) );
+			for ( std::string l; !included && std::getline( in, l ); ) {
+				size_t b = l.find_first_of( "\"<" );
+				if ( l.find( "#include" ) == std::string::npos || b == std::string::npos ) continue;
+				size_t e = l.find_first_of( "\">", b + 1 );
+				if ( e == std::string::npos ) continue;
+				std::string name = l.substr( b + 1, e - b - 1 );
+				included = r.size() > name.size() && r.compare( r.size() - name.size() - 1, std::string::npos, "/" + name ) == 0;
+			}
+		}
+		CHECK_MESSAGE( included, "read " << r );
+	}
+	CHECK( reads->count( real.string() ) );
+	CHECK( reads->count( local ) );
+	CHECK( reads->count( fstream ) );
 
 	auto P = prepLines( *prep, local );
 	Loc scale = origAt( slurp( local ), 11, "SCALE" );
@@ -403,13 +423,20 @@ TEST_CASE( "sourcemap/cfa: local include and libcfa headers" ) {
 
 namespace {
 
+// A preprocessed line and its 1-based line in the preprocessed text.
+struct Piece {
+	int pline;
+	std::string text;
+};
+
 // Every preprocessed line for 1-based `line` of `file`, in order.
-std::vector<std::string> allPrepLines( const std::string & prep, const std::string & file, int line ) {
-	std::vector<std::string> out;
+std::vector<Piece> allPieces( const std::string & prep, const std::string & file, int line ) {
+	std::vector<Piece> out;
 	std::istringstream in( prep );
 	std::string l, cur;
-	int next = 0;
+	int next = 0, pline = 0;
 	while ( std::getline( in, l ) ) {
+		++pline;
 		if ( !l.empty() && l[0] == '#' ) {
 			std::istringstream ls( l.substr( 1 ) );
 			int n;
@@ -422,9 +449,15 @@ std::vector<std::string> allPrepLines( const std::string & prep, const std::stri
 			}
 			continue;
 		}
-		if ( cur == file && next == line ) out.push_back( l );
+		if ( cur == file && next == line ) out.push_back( { pline, l } );
 		++next;
 	}
+	return out;
+}
+
+std::vector<std::string> allPrepLines( const std::string & prep, const std::string & file, int line ) {
+	std::vector<std::string> out;
+	for ( Piece & p : allPieces( prep, file, line ) ) out.push_back( std::move( p.text ) );
 	return out;
 }
 
@@ -450,16 +483,29 @@ TEST_CASE( "sourcemap/cfa: assert and ctype macros split lines" ) {
 	REQUIRE( subs5.size() > 1 );
 
 	// A column that has a token on more than one piece of the split line can't
-	// be told apart from (file, line, col) alone, so SourceMap guesses (issue #7).
-	// How many pieces there are depends on the glibc headers: 2.39's assert uses
-	// its argument twice, 2.43's once.
+	// be told apart from (file, line, col) alone, so without pline SourceMap
+	// guesses. How many pieces there are depends on the glibc headers: 2.39's
+	// assert uses its argument twice, 2.43's once.
 	auto ambiguous = []( const std::vector<std::string> & subs, size_t col ) {
 		int n = 0;
 		for ( const std::string & s : subs ) n += col < s.size() && s[col] != ' ';
 		return n > 1;
 	};
-	// The first piece of line 4 that has the argument `ch` (with glibc 2.43 it's
-	// the first piece; with 2.39 it isn't).
+	// With pline every copy of the argument `ch` maps to it, on whichever piece
+	// (not the "ch > 0" that assert makes of it).
+	const Range ch4{ origAt( T, 4, "ch" ), plus( origAt( T, 4, "ch" ), 2 ) };
+	int copies = 0;
+	for ( const Piece & p : allPieces( c.prep, F, 4 ) ) {
+		for ( const Token & t : lex( p.text ) ) {
+			if ( t.kind != TokKind::Identifier || t.text != "ch" ) continue;
+			CAPTURE( p.text );
+			CHECK( m.mapRange( F, { 4, t.col, p.pline }, { 4, t.endCol, p.pline } ) == ch4 );
+			++copies;
+		}
+	}
+	CHECK( copies >= 1 );
+	// Without pline, the first piece of line 4 that has `ch` is checked when no
+	// other piece has a token at that column.
 	size_t chCol = std::string::npos;
 	for ( const std::string & s : subs4 ) {
 		chCol = findWord( s, "ch", 0 );
@@ -467,10 +513,10 @@ TEST_CASE( "sourcemap/cfa: assert and ctype macros split lines" ) {
 	}
 	REQUIRE( chCol != std::string::npos );
 	int col = (int)chCol;
-	if ( ambiguous( subs4, chCol ) ) MESSAGE( "line 4: column " << col << " is on several pieces; skipping its exact check" );
-	else CHECK( m.mapRange( F, 4, col, 4, col + 2 ) == Range{ origAt( T, 4, "ch" ), plus( origAt( T, 4, "ch" ), 2 ) } );
+	if ( !ambiguous( subs4, chCol ) ) CHECK( m.mapRange( F, 4, col, 4, col + 2 ) == ch4 );
 	col = (int)subs4.back().find( ';' );
 	CHECK( m.map( F, 4, col ) == origAt( T, 4, ";" ) );
+	CHECK( m.map( F, { 4, col, allPieces( c.prep, F, 4 ).back().pline } ) == origAt( T, 4, ";" ) );
 
 	bool found = false;
 	for ( const std::string & s : subs5 ) {
@@ -481,10 +527,56 @@ TEST_CASE( "sourcemap/cfa: assert and ctype macros split lines" ) {
 	}
 	CHECK( found );
 	const std::string & last = subs5.back();
+	const int lastPline = allPieces( c.prep, F, 5 ).back().pline;
 	CHECK( m.map( F, 5, (int)last.find( "||" ) ) == origAt( T, 5, "||" ) );
 	REQUIRE( findWord( last, "ch", 0 ) != std::string::npos );
 	col = (int)findWord( last, "ch", 0 );
-	if ( ambiguous( subs5, (size_t)col ) ) MESSAGE( "line 5: column " << col << " is on several pieces; skipping its exact check" );
-	else CHECK( m.mapRange( F, 5, col, 5, col + 2 ) == Range{ origAt( T, 5, "ch", 1 ), plus( origAt( T, 5, "ch", 1 ), 2 ) } );
+	const Range ch5{ origAt( T, 5, "ch", 1 ), plus( origAt( T, 5, "ch", 1 ), 2 ) };
+	CHECK( m.mapRange( F, { 5, col, lastPline }, { 5, col + 2, lastPline } ) == ch5 );
+	if ( !ambiguous( subs5, (size_t)col ) ) CHECK( m.mapRange( F, 5, col, 5, col + 2 ) == ch5 );
 	CHECK( m.map( F, 6, (int)findWord( allPrepLines( c.prep, F, 6 ).front(), "return", 0 ) ) == origAt( T, 6, "return" ) );
+}
+
+TEST_CASE( "sourcemap/cfa: header included twice and #line" ) {
+	if ( !haveCfa() ) { MESSAGE( "cfa not on PATH; skipping" ); return; }
+	TempDir work;
+	REQUIRE( !work.path.empty() );
+	fs::path real = work.path / "src" / "twice.cfa";
+	const std::string header = "int  value = N;\n";
+	const std::string text =
+		"#define N 1\n"
+		"#include \"twice.h\"\n"
+		"#undef N\n"
+		"#define N 1000\n"
+		"#include \"twice.h\"\n"
+		"int main() {\n"
+		"#line 40\n"
+		"    return   value;\n"
+		"}\n";
+	spit( real.parent_path() / "twice.h", header );
+	spit( real, text );
+	auto prep = preprocess( real, text, work.path );
+	REQUIRE( prep );
+	const std::string F = real.string(), H = markerEndingWith( *prep, "/twice.h" );
+	REQUIRE( !H.empty() );
+	SourceMap m( *prep, diskReader() );
+
+	// Each copy of the header maps with its own columns.
+	auto copies = allPieces( *prep, H, 1 );
+	REQUIRE( copies.size() == 2 );
+	for ( const Piece & p : copies ) {
+		CAPTURE( p.text );
+		int semi = (int)p.text.find( ';' );
+		CHECK( m.map( H, { 1, semi, p.pline } ) == origAt( header, 1, ";" ) );
+		CHECK( m.map( H, { 1, semi + 1, p.pline }, true ) == plus( origAt( header, 1, ";" ), 1 ) );
+		CHECK( m.map( H, { 1, (int)findWord( p.text, "value", 0 ), p.pline } ) == origAt( header, 1, "value" ) );
+	}
+
+	// After #line 40 the markers say line 40 for what is line 8.
+	auto P = prepLines( *prep, F );
+	REQUIRE( P.count( 40 ) );
+	CHECK( m.map( F, 40, prepCol( P, 40, "return" ) ) == origAt( text, 8, "return" ) );
+	CHECK( m.map( F, 40, prepCol( P, 40, "value" ) ) == origAt( text, 8, "value" ) );
+	CHECK( m.map( F, 41, 0 ) == origAt( text, 9, "}" ) );
+	CHECK( m.map( F, 6, prepCol( P, 6, "main" ) ) == origAt( text, 6, "main" ) );
 }
