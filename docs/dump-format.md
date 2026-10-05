@@ -133,9 +133,9 @@ When `complete` is false:
   block left open keeps the function it is in. An error the parser can't
   recover from ends the parse, and only the declarations at file scope before
   it are dumped. Most of the "illegal syntax" errors, which the grammar reports
-  from its own rules, do that. Only the syntax errors are reported, since
-  diagnostics from the later passes would mostly be about the code the parser
-  skipped;
+  from its own rules, do that. Only the syntax errors and internal translator
+  errors are reported, since other diagnostics from the later passes would
+  mostly be about the code the parser skipped;
 - after an error in a pass before `Resolve`, decls (and type refs) come from
   the partly validated AST, and nothing is resolved;
 - after errors in `Resolve`, the statements and global declarations that
