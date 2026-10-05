@@ -1536,7 +1536,7 @@ class CondEval {
 				continue;
 			}
 			long long x = a.value, y = b.value;
-			if ( ( op == "/" || op == "%" ) && y == 0 ) {
+			if ( ( op == "/" || op == "%" ) && ( y == 0 || ( x == LLONG_MIN && y == -1 ) ) ) {
 				a = unknown();
 				continue;
 			}
@@ -1544,17 +1544,20 @@ class CondEval {
 				a = unknown();
 				continue;
 			}
+			// +, -, * and << wrap instead of overflowing, which is undefined
+			// for signed numbers.
+			unsigned long long ux = (unsigned long long)x, uy = (unsigned long long)y;
 			long long r = op == "|" ? x | y : op == "^" ? x ^ y : op == "&" ? x & y : op == "==" ? x == y : op == "!=" ? x != y
 						: op == "<" ? x < y : op == ">" ? x > y : op == "<=" ? x <= y : op == ">=" ? x >= y
-						: op == "<<" ? x << y : op == ">>" ? x >> y : op == "+" ? x + y : op == "-" ? x - y
-						: op == "*" ? x * y : op == "/" ? x / y : x % y;
+						: op == "<<" ? (long long)( ux << y ) : op == ">>" ? x >> y : op == "+" ? (long long)( ux + uy )
+						: op == "-" ? (long long)( ux - uy ) : op == "*" ? (long long)( ux * uy ) : op == "/" ? x / y : x % y;
 			a = of( r );
 		}
 	}
 	V unary() {
 		if ( take( "!" ) ) { V v = unary(); return v.known ? of( !v.value ) : v; }
 		if ( take( "~" ) ) { V v = unary(); return v.known ? of( ~v.value ) : v; }
-		if ( take( "-" ) ) { V v = unary(); return v.known ? of( -v.value ) : v; }
+		if ( take( "-" ) ) { V v = unary(); return v.known ? of( (long long)( 0ULL - (unsigned long long)v.value ) ) : v; }
 		if ( take( "+" ) ) return unary();
 		return primary();
 	}

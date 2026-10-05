@@ -361,6 +361,8 @@ int Server::sendRequest( const std::string & method, json params ) {
 void Server::response( const json & msg ) {
 	const json & id = member( msg, "id" );
 	if ( ! id.is_number_integer() || configRequests.erase( id.get<int>() ) == 0 ) return;
+	// After shutdown the worker is gone; there is nothing to re-check.
+	if ( phase != Phase::Running ) return;
 	const json & result = member( msg, "result" );
 	if ( result.is_array() && ! result.empty() ) applySettings( result[0] );
 }
