@@ -453,13 +453,21 @@ TEST_CASE( "sourcemap/cfa: assert and ctype macros split lines" ) {
 	// be told apart from (file, line, col) alone, so SourceMap guesses (issue #7).
 	// How many pieces there are depends on the glibc headers: 2.39's assert uses
 	// its argument twice, 2.43's once.
-	auto ambiguous = []( const std::vector<std::string> & subs, int col ) {
+	auto ambiguous = []( const std::vector<std::string> & subs, size_t col ) {
 		int n = 0;
-		for ( const std::string & s : subs ) n += col < (int)s.size() && s[col] != ' ';
+		for ( const std::string & s : subs ) n += col < s.size() && s[col] != ' ';
 		return n > 1;
 	};
-	int col = (int)findWord( subs4.front(), "ch", 0 );
-	if ( ambiguous( subs4, col ) ) MESSAGE( "line 4: column " << col << " is on several pieces; skipping its exact check" );
+	// The first piece of line 4 that has the argument `ch` (with glibc 2.43 it's
+	// the first piece; with 2.39 it isn't).
+	size_t chCol = std::string::npos;
+	for ( const std::string & s : subs4 ) {
+		chCol = findWord( s, "ch", 0 );
+		if ( chCol != std::string::npos ) break;
+	}
+	REQUIRE( chCol != std::string::npos );
+	int col = (int)chCol;
+	if ( ambiguous( subs4, chCol ) ) MESSAGE( "line 4: column " << col << " is on several pieces; skipping its exact check" );
 	else CHECK( m.mapRange( F, 4, col, 4, col + 2 ) == Range{ origAt( T, 4, "ch" ), plus( origAt( T, 4, "ch" ), 2 ) } );
 	col = (int)subs4.back().find( ';' );
 	CHECK( m.map( F, 4, col ) == origAt( T, 4, ";" ) );
@@ -474,8 +482,9 @@ TEST_CASE( "sourcemap/cfa: assert and ctype macros split lines" ) {
 	CHECK( found );
 	const std::string & last = subs5.back();
 	CHECK( m.map( F, 5, (int)last.find( "||" ) ) == origAt( T, 5, "||" ) );
+	REQUIRE( findWord( last, "ch", 0 ) != std::string::npos );
 	col = (int)findWord( last, "ch", 0 );
-	if ( ambiguous( subs5, col ) ) MESSAGE( "line 5: column " << col << " is on several pieces; skipping its exact check" );
+	if ( ambiguous( subs5, (size_t)col ) ) MESSAGE( "line 5: column " << col << " is on several pieces; skipping its exact check" );
 	else CHECK( m.mapRange( F, 5, col, 5, col + 2 ) == Range{ origAt( T, 5, "ch", 1 ), plus( origAt( T, 5, "ch", 1 ), 2 ) } );
 	CHECK( m.map( F, 6, (int)findWord( allPrepLines( c.prep, F, 6 ).front(), "return", 0 ) ) == origAt( T, 6, "return" ) );
 }
