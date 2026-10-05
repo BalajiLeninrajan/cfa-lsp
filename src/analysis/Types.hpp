@@ -72,6 +72,28 @@ struct Symbol {
 	std::vector<Symbol> children;
 };
 
+struct DocumentHighlight {
+	Range range;
+	int kind = 1;							// LSP DocumentHighlightKind: 1 text (a declaration), 2 read (a use)
+};
+
+// A hint shown inline at `pos`: a parameter name before an argument, or the
+// type of a call after it.
+struct InlayHint {
+	Loc pos;
+	std::string label;
+	int kind = 2;							// LSP InlayHintKind: 1 type, 2 parameter
+	Range span;								// the call the hint belongs to; edited since the snapshot means stale
+};
+
+// What renaming the entity under the cursor touches.
+struct RenamePlan {
+	std::string name;						// the current name
+	Range range;							// the occurrence under the cursor
+	std::vector<Range> sites;				// every occurrence, declarations included, all in the queried file
+	std::string error;						// non-empty: the rename is refused, and why
+};
+
 // One token for textDocument/semanticTokens, before delta encoding.
 struct SemanticToken {
 	Loc start;

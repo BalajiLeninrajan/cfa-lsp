@@ -64,6 +64,16 @@ struct CallSite {
 };
 std::optional<CallSite> callBefore( std::string_view text );
 
+// The argument list that starts at the first non-blank character at or after
+// `from` in `f`, which must be `(`: each argument's range without surrounding
+// blanks and comments, and the position just past the closing `)`. nullopt if
+// there is no `(` there or the list doesn't close within 64 lines.
+struct CallArguments {
+	std::vector<Range> args;				// empty ranges for empty arguments (`f( a, )`)
+	Loc end;
+};
+std::optional<CallArguments> callArguments( const FileText & f, Loc from );
+
 // What completion should offer, worked out from the text before the cursor on
 // the cursor's line.
 struct CompletionContext {

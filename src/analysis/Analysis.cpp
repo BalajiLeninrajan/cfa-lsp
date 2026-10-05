@@ -1919,6 +1919,196 @@ std::vector<SemanticToken> Analysis::semanticTokens( const std::string & file ) 
 	return out;
 }
 
+// -- highlights, inlay hints, rename -------------------------------------------
+
+namespace {
+
+bool isHeaderPath( const std::string & path ) {
+	for ( std::string_view ext : { ".hfa", ".h", ".ifa" } ) {
+		if ( path.size() > ext.size() && path.ends_with( ext ) ) return true;
+	}
+	return false;
+}
+
+// The return type in a signature from the dump: "forall( T ) T * biggest( T a, T b )" -> "T *". Empty if it
+// can't be found.
+std::string declaredReturnType( std::string_view sig, const std::string & name ) {
+	size_t b = 0;
+	while ( sig.substr( b ).starts_with( "forall" ) ) {
+		size_t i = sig.find( '(', b );
+		int depth = 0;
+		for ( ; i < sig.size(); i += 1 ) {
+			if ( sig[i] == '(' ) depth += 1;
+			else if ( sig[i] == ')' && --depth == 0 ) break;
+		}
+		if ( i >= sig.size() ) return {};
+		b = i + 1;
+		while ( b < sig.size() && sig[b] == ' ' ) b += 1;
+	}
+	size_t k = sig.find( " " + name + "(", b );
+	if ( k == std::string_view::npos ) return {};
+	return trimmed( sig.substr( b, k - b ) );
+}
+
+// Is `name` an identifier in `text`, outside string literals?
+bool mentions( std::string_view text, const std::string & name ) {
+	for ( const Token & t : lex( text ) ) {
+		if ( t.kind == TokKind::Identifier && t.text == name ) return true;
+	}
+	return false;
+}
+
+} // namespace
+
+std::vector<DocumentHighlight> Analysis::documentHighlights( const std::string & file, Loc pos ) const {
+	const Impl & m = *impl;
+	int fi = m.findFile( file );
+	if ( fi < 0 ) return {};
+	auto t = m.targetAt( fi, pos );
+	if ( t.decl < 0 ) return {};
+	std::vector<DocumentHighlight> out;
+	for ( int d : m.entityMembers[m.entity[t.decl]] ) {
+		const Decl & x = m.decls[d];
+		if ( x.file == fi && x.hasName && !x.generated ) out.push_back( { x.nameRange, 1 } );
+		for ( int r : m.refsOf[d] ) {
+			if ( m.refs[r].file == fi ) out.push_back( { m.refs[r].range, 2 } );
+		}
+	}
+	std::sort( out.begin(), out.end(), []( const DocumentHighlight & a, const DocumentHighlight & b ) {
+		return a.range.start != b.range.start ? a.range.start < b.range.start : a.kind < b.kind;
+	} );
+	out.erase( std::unique( out.begin(), out.end(),
+							[]( const DocumentHighlight & a, const DocumentHighlight & b ) { return a.range == b.range; } ),
+			   out.end() );
+	return out;
+}
+
+std::vector<InlayHint> Analysis::inlayHints( const std::string & file, Range range ) const {
+	const Impl & m = *impl;
+	int fi = m.findFile( file );
+	if ( fi < 0 ) return {};
+	auto ft = m.text( fi );
+	if ( !ft ) return {};
+	const File & f = m.files[fi];
+	auto inside = [&]( Loc p ) { return range.start <= p && p <= range.end; };
+	std::vector<InlayHint> out;
+	std::set<std::pair<Loc, std::string>> seen;
+	auto add = [&]( InlayHint h ) {
+		if ( seen.insert( { h.pos, h.label } ).second ) out.push_back( std::move( h ) );
+	};
+	for ( int r : f.refs ) {
+		const Ref & ref = m.refs[r];
+		if ( range.end < ref.range.start ) break;
+		if ( ref.role != Role::Call || ref.range.end.line + 64 < range.start.line ) continue;
+		const Decl & fn = m.decls[ref.decl];
+		if ( fn.kind != Kind::Function || !text::isIdentifier( fn.name ) || ft->slice( ref.range ) != fn.name ) continue;
+		auto call = text::callArguments( *ft, ref.range.end );
+		if ( !call || call->end < range.start ) continue;
+		Range span{ ref.range.start, call->end };
+
+		for ( size_t i = 0; i < call->args.size() && i < fn.params.size(); i += 1 ) {
+			const std::string & param = fn.params[i];
+			const Range & arg = call->args[i];
+			if ( param.empty() || param.starts_with( "__" ) || arg.start == arg.end || !inside( arg.start ) ) continue;
+			// Not when the argument already says it: f( x ), f( &x ), f( s.x ) for a parameter x.
+			std::string a = ft->slice( arg );
+			size_t k = std::min( a.find_first_not_of( "&* \t" ), a.size() );
+			auto chain = text::identChain( std::string_view( a ).substr( k ) );
+			if ( !chain.empty() && chain.back() == param ) continue;
+			add( { arg.start, param + ":", 2, span } );
+		}
+
+		// What a polymorphic call returns here, when that says more than the declaration.
+		if ( !fn.signature.starts_with( "forall" ) || !inside( call->end ) ) continue;
+		auto it = std::lower_bound( f.exprs.begin(), f.exprs.end(), ref.range.start,
+									[&m]( int e, Loc p ) { return m.exprs[e].range.start < p; } );
+		int best = -1;
+		for ( ; it != f.exprs.end() && m.exprs[*it].range.start == ref.range.start; ++it ) {
+			const Range & er = m.exprs[*it].range;
+			if ( er.end <= ref.range.end || call->end < er.end ) continue;
+			if ( best < 0 || m.exprs[best].range.end < er.end ) best = *it;
+		}
+		if ( best < 0 ) continue;
+		const std::string & type = m.exprs[best].type;
+		if ( type.empty() || type == "void" || stripSpaces( type ) == stripSpaces( declaredReturnType( fn.signature, fn.name ) ) ) continue;
+		add( { call->end, ": " + type, 1, span } );
+	}
+	std::stable_sort( out.begin(), out.end(), []( const InlayHint & a, const InlayHint & b ) { return a.pos < b.pos; } );
+	return out;
+}
+
+std::optional<RenamePlan> Analysis::rename( const std::string & file, Loc pos ) const {
+	const Impl & m = *impl;
+	int fi = m.findFile( file );
+	if ( fi < 0 ) return std::nullopt;
+	auto t = m.targetAt( fi, pos );
+	if ( t.decl < 0 ) return std::nullopt;
+	const Decl & x = m.decls[t.decl];
+	RenamePlan plan;
+	plan.name = x.name;
+	plan.range = t.range;
+	const std::string quoted = "`" + x.name + "`";
+	auto refuse = [&]( const std::string & why ) {
+		plan.error = why;
+		plan.sites.clear();
+		return plan;
+	};
+	if ( !text::isIdentifier( x.name ) ) return refuse( quoted + " is not an identifier; only identifiers can be renamed" );
+	for ( int d : m.entityMembers[m.entity[t.decl]] ) {
+		if ( m.decls[d].generated || m.decls[d].file == fi ) continue;
+		std::string w = m.where( d, file );
+		return refuse( quoted + " is declared in " + ( w.empty() ? std::string( "another file" ) : "`" + w + "`" ) +
+					   "; renaming across files is not supported yet" );
+	}
+	if ( isHeaderPath( file ) && !x.local ) {
+		return refuse( quoted + " is declared in a header, and the files that include it are not known; "
+					   "only local names can be renamed in a header" );
+	}
+	auto ft = m.text( fi );
+	for ( const Location & l : m.entityReferences( t.decl, true ) ) {
+		if ( l.file != file ) return refuse( quoted + " is used in another file; renaming across files is not supported yet" );
+		if ( ft && ft->slice( l.range ) != x.name ) return refuse( "an occurrence of " + quoted + " does not spell its name; rename it by hand" );
+		plan.sites.push_back( l.range );
+	}
+	// Uses inside macro bodies have no refs; don't leave them behind.
+	m.loadMacros();
+	for ( const auto & [name, list] : m.macros ) {
+		for ( const Impl::Macro & mac : list ) {
+			if ( mac.file != fi ) continue;
+			std::string_view body( mac.text );
+			size_t k = body.find( "define" );
+			if ( k != std::string_view::npos ) k = body.find( name, k + 6 );
+			if ( k == std::string_view::npos ) continue;
+			body.remove_prefix( k + name.size() );
+			if ( mac.function ) {
+				// A parameter of the same name is not a use.
+				size_t close = body.find( ')' );
+				if ( close == std::string_view::npos ) continue;
+				if ( mentions( body.substr( 0, close ), x.name ) ) continue;
+				body.remove_prefix( close + 1 );
+			}
+			if ( mentions( body, x.name ) ) {
+				return refuse( quoted + " is used in the macro `" + name + "` on line " + std::to_string( mac.name.start.line + 1 ) +
+							   ", which the translator doesn't see; rename it by hand" );
+			}
+		}
+	}
+	return plan;
+}
+
+bool Analysis::isKeyword( std::string_view word ) {
+	const auto & words = keywords();
+	return std::find( words.begin(), words.end(), word ) != words.end();
+}
+
+std::vector<std::string> Analysis::projectFiles() const {
+	std::vector<std::string> out;
+	for ( const File & f : impl->files ) {
+		if ( ( f.origin == Origin::Focus || f.origin == Origin::Project ) && !f.names.empty() ) out.push_back( f.path );
+	}
+	return out;
+}
+
 const std::vector<std::string> & Analysis::tokenTypes() {
 	static const std::vector<std::string> types = {
 		"type", "class", "enum", "interface", "struct", "typeParameter", "parameter", "variable",
