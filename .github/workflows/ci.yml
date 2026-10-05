@@ -94,9 +94,27 @@ jobs:
           git -C cforall diff --exit-code -I '^#line [0-9][0-9]* "Parser/lex\.cc"$' -- src/Parser
           git -C cforall checkout -- src/Parser
 
-      # The build must not run bison or flex when the grammar output only looks
-      # stale, as it can on a fresh clone. Backdating the output and replacing
-      # both tools with failing stubs checks that.
+      # make must regenerate lex.cc after an edit to lex.ll, whether or not the
+      # edit has been committed. The submodule is put back afterwards.
+      - name: Check make regenerates the parser after a grammar edit
+        run: |
+          head=$(git -C cforall rev-parse HEAD)
+          lex=cforall/src/Parser/lex.cc
+          echo '// uncommitted grammar edit' >> cforall/src/Parser/lex.ll
+          touch -d '1 minute ago' "$lex"
+          make "$lex"
+          grep -qF 'uncommitted grammar edit' "$lex"
+          git -C cforall checkout -- src/Parser
+          echo '// committed grammar edit' >> cforall/src/Parser/lex.ll
+          git -C cforall -c user.name=ci -c user.email=ci@localhost commit -qm 'Edit the grammar' src/Parser/lex.ll
+          touch -d '1 minute ago' "$lex"
+          make "$lex"
+          grep -qF 'committed grammar edit' "$lex"
+          git -C cforall reset -q --hard "$head"
+
+      # The build must not need bison or flex when the grammar output only
+      # looks stale, as it can on a fresh clone. Backdating the output and
+      # removing both tools checks that, configure included.
       - name: Build
         env:
           CXX: ccache g++
@@ -104,15 +122,11 @@ jobs:
           CCACHE_MAXSIZE: 2G
           CCACHE_BASEDIR: ${{ github.workspace }}
         run: |
+          sudo apt-get remove -yq bison flex
+          if command -v bison || command -v flex; then echo 'bison or flex is still installed'; exit 1; fi
           touch -d '1 hour ago' cforall/src/Parser/parser.cc cforall/src/Parser/parser.hh cforall/src/Parser/lex.cc
-          stubs="$RUNNER_TEMP/no-bison-flex"
-          mkdir -p "$stubs"
-          for tool in bison flex; do
-            printf '#!/bin/sh\necho "%s ran during the build" >&2\nexit 1\n' "$tool" > "$stubs/$tool"
-            chmod +x "$stubs/$tool"
-          done
           ccache -z
-          PATH="$stubs:$PATH" make -j"$(nproc)" TRANSLATOR_JOBS="$(nproc)" server translator
+          make -j"$(nproc)" TRANSLATOR_JOBS="$(nproc)" server translator
           ccache -s
 
       - name: Test
