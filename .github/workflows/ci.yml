@@ -153,6 +153,29 @@ jobs:
           cd "$(jq -r .directory <<<"$entry")"
           eval "$(jq -r .command <<<"$entry") -fsyntax-only"
 
+      # The installed layout (bin/cfa-lsp, libexec/cfa-lsp/cfa-cpp), stripped, as
+      # a tarball because artifact zips drop the executable bit. The translator
+      # is Cforall's code, so its BSD license goes along with it.
+      - name: Package binaries
+        env:
+          CXX: ccache g++
+          CCACHE_DIR: /home/runner/.cache/ccache
+          CCACHE_BASEDIR: ${{ github.workspace }}
+        run: |
+          dist="$RUNNER_TEMP/cfa-lsp"
+          make install PREFIX="$dist"
+          install -Dm644 LICENSE "$dist/share/doc/cfa-lsp/LICENSE"
+          install -Dm644 cforall/LICENSE "$dist/share/doc/cfa-lsp/LICENSE.cforall"
+          tar -C "$dist" -czf "$RUNNER_TEMP/cfa-lsp-linux-x86_64.tar.gz" .
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: cfa-lsp-linux-x86_64
+          path: ${{ runner.temp }}/cfa-lsp-linux-x86_64.tar.gz
+          retention-days: 30
+          if-no-files-found: error
+
       - name: Save ccache
         if: always() && steps.ccache.outcome == 'success'
         uses: actions/cache/save@v6
