@@ -1113,11 +1113,21 @@ nlohmann::json Server::signatureHelp( const json & params ) {
 nlohmann::json Server::semanticTokens( const json & params ) {
 	json data = json::array();
 	Document * d = docFor( params );
-	if ( ! d || ! d->analysis ) return { { "data", data } };
-	EditList edits = d->editsSince( d->analysisSeq );
+	if ( ! d ) return { { "data", data } };
 	struct Tok { int line, col, len, type, mods; };
 	std::vector<Tok> toks;
-	for ( const SemanticToken & t : d->analysis->semanticTokens( d->path ) ) {
+	// From the buffer as it is now, so they need no mapping.
+	for ( const SemanticToken & t : Analysis::keywordTokens( d->text.str() ) ) {
+		int c0 = d->text.toLspCol( t.start, enc ), c1 = d->text.toLspCol( { t.start.line, t.start.col + t.length }, enc );
+		if ( c1 > c0 ) toks.push_back( { t.start.line, c0, c1 - c0, t.type, t.modifiers } );
+	}
+	std::vector<SemanticToken> named;
+	EditList edits;
+	if ( d->analysis ) {
+		named = d->analysis->semanticTokens( d->path );
+		edits = d->editsSince( d->analysisSeq );
+	}
+	for ( const SemanticToken & t : named ) {
 		if ( t.length <= 0 ) continue;
 		Range r{ t.start, { t.start.line, t.start.col + t.length } };
 		auto m = toCurrentExact( edits, r );

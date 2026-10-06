@@ -799,8 +799,34 @@ TEST_CASE( "semantic tokens keep only the name inside a macro invocation" ) {
 }
 
 TEST_CASE( "legend" ) {
-	CHECK( Analysis::tokenTypes().size() == 12 );
+	CHECK( Analysis::tokenTypes().size() == 13 );
+	CHECK( Analysis::tokenTypes().back() == "keyword" );
 	CHECK( Analysis::tokenModifiers() == std::vector<std::string>{ "declaration", "readonly", "defaultLibrary" } );
+}
+
+TEST_CASE( "keyword tokens come from the text alone" ) {
+	std::string src =
+		"#include <fstream.hfa>\n"						// directives are left to the client
+		"static void f( int x ) {\n"					// basic types too
+		"\tfor () { suspend; }\n"
+		"\ttry { resume( c ); } catch ( E * ) {}\n"	// resume is a function
+		"\tenable_ehm(); // if while\n"				// so is enable_ehm; comments don't count
+		"\treturn \"for\" ? x : 0;\n"
+		"}\n";
+	std::vector<std::pair<Loc, int>> got;
+	for ( const SemanticToken & t : Analysis::keywordTokens( src ) ) {
+		CHECK( t.type == typeIndex( "keyword" ) );
+		CHECK( t.modifiers == 0 );
+		got.push_back( { t.start, t.length } );
+	}
+	CHECK( got == std::vector<std::pair<Loc, int>>{
+		{ { 1, 0 }, 6 },		// static
+		{ { 2, 1 }, 3 },		// for
+		{ { 2, 10 }, 7 },		// suspend
+		{ { 3, 1 }, 3 },		// try
+		{ { 3, 22 }, 5 },		// catch
+		{ { 5, 1 }, 6 },		// return
+	} );
 }
 
 TEST_CASE( "odd and missing data" ) {

@@ -302,7 +302,7 @@ int symbolKind( const Decl & d ) {
 
 // Indices into tokenTypes().
 enum TokenType { TType, TClass, TEnum, TInterface, TStruct, TTypeParameter, TParameter, TVariable,
-	TProperty, TEnumMember, TFunction, TLabel };
+	TProperty, TEnumMember, TFunction, TLabel, TKeyword };
 enum TokenModifier { MDeclaration = 1, MReadonly = 2, MDefaultLibrary = 4 };
 
 int tokenType( Kind k ) {
@@ -2580,6 +2580,31 @@ std::vector<SemanticToken> Analysis::semanticTokens( const std::string & file ) 
 	return out;
 }
 
+std::vector<SemanticToken> Analysis::keywordTokens( std::string_view text ) {
+	// The words cforall/src/Parser/lex.ll always reads as keywords, minus the
+	// basic type names, which tree-sitter's C++ grammar colours well enough.
+	static const std::unordered_set<std::string_view> words = {
+		"alignas", "_Alignas", "alignof", "_Alignof", "__alignof", "__alignof__", "and", "asm", "__asm",
+		"__asm__", "_Atomic", "__attribute", "__attribute__", "auto", "__auto_type", "basetypeof", "break",
+		"case", "catch", "catchResume", "choose", "coerce", "cofor", "const", "__const", "__const__",
+		"continue", "coroutine", "corun", "countof", "default", "disable", "do", "dtype", "else", "enable",
+		"enum", "exception", "__extension__", "extern", "fallthrough", "finally", "fixup", "for", "forall",
+		"fortran", "ftype", "generator", "_Generic", "goto", "if", "inline", "__inline", "__inline__",
+		"__label__", "monitor", "mutex", "_Noreturn", "or", "otype", "recover", "register", "report",
+		"restrict", "__restrict", "__restrict__", "return", "sizeof", "static", "_Static_assert",
+		"static_assert", "struct", "suspend", "switch", "thread", "__thread", "_Thread_local",
+		"thread_local", "throw", "throwResume", "timeout", "trait", "try", "ttype", "typedef", "typeid",
+		"typeof", "__typeof", "__typeof__", "union", "virtual", "volatile", "__volatile", "__volatile__",
+		"vtable", "waitfor", "waituntil", "when", "while", "with",
+	};
+	std::vector<SemanticToken> out;
+	for ( const Token & t : lex( text ) ) {
+		if ( t.kind != TokKind::Identifier || t.endLine != t.line || !words.count( t.text ) ) continue;
+		out.push_back( { { t.line, t.col }, t.endCol - t.col, TKeyword, 0 } );
+	}
+	return out;
+}
+
 // -- highlights, inlay hints, rename -------------------------------------------
 
 namespace {
@@ -2793,7 +2818,7 @@ std::vector<std::string> Analysis::projectFiles() const {
 const std::vector<std::string> & Analysis::tokenTypes() {
 	static const std::vector<std::string> types = {
 		"type", "class", "enum", "interface", "struct", "typeParameter", "parameter", "variable",
-		"property", "enumMember", "function", "label",
+		"property", "enumMember", "function", "label", "keyword",
 	};
 	return types;
 }

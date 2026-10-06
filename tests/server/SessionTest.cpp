@@ -1022,6 +1022,21 @@ TEST_CASE( "formatting and range formatting" ) {
 	CHECK( s.finish() == 0 );
 }
 
+TEST_CASE( "keyword tokens before any check, in UTF-16 columns" ) {
+	Session s;
+	json legend = s.initialize( { { "cfa", "/nonexistent/cfa" } } )["result"]["capabilities"]["semanticTokensProvider"]["legend"]["tokenTypes"];
+	std::string uri = "file:///nonexistent-dir/kw.cfa";
+	// The emoji is four bytes and two UTF-16 units.
+	std::string text = "void f() {\n\t/* \xF0\x9F\x98\x80 */ for () { suspend; }\n}\n";
+	s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 }, { "text", text } } } } );
+	json data = s.request( "textDocument/semanticTokens/full", { { "textDocument", { { "uri", uri } } } } )["result"]["data"];
+	CHECK( data == json::array( { 1, 10, 3, 12, 0, 0, 9, 7, 12, 0 } ) );
+	CHECK( legend[12] == "keyword" );
+	s.request( "shutdown" );
+	s.notify( "exit", nullptr );
+	CHECK( s.finish() == 0 );
+}
+
 TEST_CASE( "code actions: did you mean" ) {
 	if ( fakeCfa().empty() || ! realAnalysis() ) {
 		MESSAGE( "CFA_LSP_FAKE_CFA not set; skipping (run through make test)" );
