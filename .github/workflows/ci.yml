@@ -3,8 +3,14 @@ name: CI
 on:
   push:
     branches: [main]
+    # A v* tag (scripts/release.sh) is built and tested like main, then the
+    # release job publishes it.
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,9 +29,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
+      # Full history and tags, for the version `git describe` gives the build.
       - uses: actions/checkout@v7
         with:
           submodules: true
+          fetch-depth: 0
 
       - name: Install build tools
         run: |
@@ -155,7 +163,9 @@ jobs:
 
       # The installed layout (bin/cfa-lsp, libexec/cfa-lsp/cfa-cpp), stripped, as
       # a tarball because artifact zips drop the executable bit. The translator
-      # is Cforall's code, so its BSD license goes along with it.
+      # is Cforall's code, so its BSD license goes along with it. The tarball
+      # has no entry for its top directory, so unpacking it into ~/.local
+      # leaves that directory alone.
       - name: Package binaries
         env:
           CXX: ccache g++
@@ -166,7 +176,8 @@ jobs:
           make install PREFIX="$dist"
           install -Dm644 LICENSE "$dist/share/doc/cfa-lsp/LICENSE"
           install -Dm644 cforall/LICENSE "$dist/share/doc/cfa-lsp/LICENSE.cforall"
-          tar -C "$dist" -czf "$RUNNER_TEMP/cfa-lsp-linux-x86_64.tar.gz" .
+          "$dist/bin/cfa-lsp" --version
+          tar -C "$dist" -czf "$RUNNER_TEMP/cfa-lsp-linux-x86_64.tar.gz" bin libexec share
 
       - name: Upload binaries
         uses: actions/upload-artifact@v7
@@ -187,3 +198,36 @@ jobs:
         run: |
           git diff --exit-code
           git -C cforall diff --exit-code
+
+  # Publishes the tested binaries of a v* tag as a GitHub release. The asset
+  # names carry no version, so releases/latest/download/<asset> always works
+  # (scripts/install-release.sh).
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: cfa-lsp-linux-x86_64
+
+      - name: Check the binaries are this version
+        run: |
+          mkdir dist
+          tar -xzf cfa-lsp-linux-x86_64.tar.gz -C dist
+          got=$(dist/bin/cfa-lsp --version)
+          want="cfa-lsp ${GITHUB_REF_NAME#v}"
+          [ "$got" = "$want" ] || { echo "built '$got', expected '$want'"; exit 1; }
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum cfa-lsp-linux-x86_64.tar.gz > cfa-lsp-linux-x86_64.tar.gz.sha256
+          prerelease=
+          case "$GITHUB_REF_NAME" in *-*) prerelease=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "cfa-lsp ${GITHUB_REF_NAME#v}" --generate-notes $prerelease \
+            cfa-lsp-linux-x86_64.tar.gz cfa-lsp-linux-x86_64.tar.gz.sha256

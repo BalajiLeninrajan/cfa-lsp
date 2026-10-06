@@ -11,12 +11,13 @@
 #include "Log.hpp"
 #include "Server.hpp"
 #include "Toolchain.hpp"
+#include "Version.hpp"
 
 int main( int argc, char * argv[] ) {
 	for ( int i = 1; i < argc; i += 1 ) {
 		std::string a = argv[i];
 		if ( a == "--version" ) {
-			std::printf( "cfa-lsp 0.1.0\n" );
+			std::printf( "cfa-lsp %s\n", cfalsp::version );
 			return 0;
 		}
 		if ( a == "--help" || a == "-h" ) {

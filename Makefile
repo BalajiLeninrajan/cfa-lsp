@@ -6,6 +6,8 @@
 #   make parser       regenerate the translator's bison and flex output
 #   make test         unit and integration tests
 #   make install      PREFIX=~/.local (uninstall removes it again)
+#   make install-release  a published release instead of a build (V=0.2.0)
+#   make release V=0.2.0  tag and publish a release from main
 #   make compile_commands.json
 #
 # BUILD can be overridden (make BUILD=build/foo) so several builds can run in
@@ -36,16 +38,30 @@ TEST_OBJS     := $(call obj,$(TEST_SRCS))
 SERVER_BIN := $(BUILD)/cfa-lsp
 TEST_BIN   := $(BUILD)/cfa-lsp-tests
 
-.PHONY: all server test install uninstall clean
+# The version comes from the last v* tag (see src/server/Version.hpp), or is
+# 0.0.0-gabc1234 before the first one. The file is rewritten only when the
+# version changes, so a new commit rebuilds one small object and relinks.
+VERSION := $(shell git describe --tags --match 'v[0-9]*' --dirty --always 2>/dev/null \
+                   | sed -e 's/^v//' -e t -e 's/^/0.0.0-g/')
+VERSION := $(or $(VERSION),unknown)
+VERSION_SRC := $(BUILD)/version.cpp
+VERSION_OBJ := $(call obj,$(VERSION_SRC))
+
+.PHONY: all server test install uninstall clean release install-release FORCE
 all: server translator
 
 server: $(SERVER_BIN)
 
-$(SERVER_BIN): $(MAIN_OBJ) $(SERVER_OBJS) $(ANALYSIS_OBJS)
+$(SERVER_BIN): $(MAIN_OBJ) $(SERVER_OBJS) $(ANALYSIS_OBJS) $(VERSION_OBJ)
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-$(TEST_BIN): $(TEST_OBJS) $(SERVER_OBJS) $(ANALYSIS_OBJS)
+$(TEST_BIN): $(TEST_OBJS) $(SERVER_OBJS) $(ANALYSIS_OBJS) $(VERSION_OBJ)
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(VERSION_SRC): FORCE
+	@mkdir -p $(dir $@)
+	@printf '#include "server/Version.hpp"\nconst char * const cfalsp::version = "%s";\n' '$(VERSION)' > $@.tmp
+	@if cmp -s $@.tmp $@; then rm $@.tmp; else mv $@.tmp $@; fi
 
 $(BUILD)/obj/%.o: %.cpp
 	@mkdir -p $(dir $@)
@@ -72,12 +88,22 @@ install: all
 	install -Dm755 -s $(SERVER_BIN) $(PREFIX)/bin/cfa-lsp
 	install -Dm755 -s $(TRANSLATOR_BIN) $(PREFIX)/libexec/cfa-lsp/cfa-cpp
 
+# Tags main as vV and pushes the tag; CI then builds, tests and publishes the
+# release. See scripts/release.sh.
+release:
+	scripts/release.sh $(V)
+
+# Installs a published release (the latest, or V=0.2.0) into PREFIX without
+# building anything.
+install-release:
+	PREFIX=$(PREFIX) scripts/install-release.sh $(V)
+
 uninstall:
 	rm -f $(PREFIX)/bin/cfa-lsp $(PREFIX)/libexec/cfa-lsp/cfa-cpp
 	-rmdir $(PREFIX)/libexec/cfa-lsp
 
 clean:
-	rm -rf $(BUILD)/obj $(SERVER_BIN) $(TEST_BIN) $(FAKE_CFA)
+	rm -rf $(BUILD)/obj $(SERVER_BIN) $(TEST_BIN) $(FAKE_CFA) $(VERSION_SRC)
 
 # Defines `translator`, `parser`, TRANSLATOR_BIN (the forked cfa-cpp) and
 # the translator's compile commands.
