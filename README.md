@@ -20,7 +20,8 @@ Features:
 - completion of locals, `with` fields, globals and keywords, and of members
   after `.` and `->`
 - signature help
-- semantic tokens
+- semantic tokens, including keywords, so they stay coloured where a C or
+  C++ grammar loses its place at CFA syntax such as `for () {`
 - document highlight
 - inlay hints: parameter names at call sites, and the type a call of a
   `forall` function returns when it differs from the declared return type

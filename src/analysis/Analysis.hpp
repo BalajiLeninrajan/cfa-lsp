@@ -107,6 +107,10 @@ class Analysis {
 	UnitIndex unitIndex() const;
 
 	std::vector<SemanticToken> semanticTokens( const std::string & file ) const;
+	// A keyword token for each keyword in `text`. Clients colour keywords
+	// with a C or C++ grammar, which loses its place at CFA syntax such as
+	// `for () {`; these keep the keywords after it coloured.
+	static std::vector<SemanticToken> keywordTokens( std::string_view text );
 	static const std::vector<std::string> & tokenTypes();		// LSP legend
 	static const std::vector<std::string> & tokenModifiers();	// LSP legend
 
