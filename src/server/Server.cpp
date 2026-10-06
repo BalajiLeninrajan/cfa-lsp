@@ -17,6 +17,7 @@
 #include "Log.hpp"
 #include "TextScan.hpp"
 #include "Uri.hpp"
+#include "Version.hpp"
 
 namespace fs = std::filesystem;
 
@@ -564,7 +565,7 @@ nlohmann::json Server::initialize( const json & params ) {
 		{ "documentRangeFormattingProvider", true },
 		{ "callHierarchyProvider", true },
 	};
-	return { { "capabilities", capabilities }, { "serverInfo", { { "name", "cfa-lsp" }, { "version", "0.1.0" } } } };
+	return { { "capabilities", capabilities }, { "serverInfo", { { "name", "cfa-lsp" }, { "version", cfalsp::version } } } };
 }
 
 // ---------------------------------------------------------------- configuration

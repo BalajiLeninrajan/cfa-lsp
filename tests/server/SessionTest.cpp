@@ -25,6 +25,7 @@
 #include "server/Checker.hpp"
 #include "server/Server.hpp"
 #include "server/Uri.hpp"
+#include "server/Version.hpp"
 
 using namespace cfalsp;
 using json = nlohmann::json;
@@ -280,6 +281,7 @@ TEST_CASE( "lifecycle" ) {
 	r = s.initialize( { { "cfa", "/nonexistent/cfa" }, { "translator", "/nonexistent/cfa-cpp" } },
 					  { { "general", { { "positionEncodings", { "utf-16", "utf-8" } } } } } );
 	json caps = r["result"]["capabilities"];
+	CHECK( r["result"]["serverInfo"]["version"] == cfalsp::version );
 	CHECK( caps["positionEncoding"] == "utf-8" );
 	CHECK( caps["textDocumentSync"]["change"] == 2 );
 	CHECK( caps["textDocumentSync"]["openClose"] == true );

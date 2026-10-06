@@ -39,6 +39,22 @@ translator fork is based on the same version (upstream commit `fade1b55`).
 
 ## Install
 
+### From a release
+
+Releases have the server and the translator built for Linux x86-64 (on
+Ubuntu 24.04, the same OS as the cs343 student server). This installs the
+latest one into `~/.local`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/BalajiLeninrajan/cfa-lsp/main/scripts/install-release.sh | bash
+```
+
+In a clone, `make install-release` does the same, `V=0.2.0` picks a version
+and `PREFIX=...` another directory. The script checks the download's SHA-256
+and needs only curl. `cfa-lsp --version` shows what is installed.
+
+### From source
+
 ```sh
 git submodule update --init
 make -j8
@@ -385,6 +401,26 @@ prints whole hovers:
 ```sh
 make test ARGS='-tc=probe -s' CFA_LSP_PROBE=path/to/prog.cfa
 ```
+
+### Releasing
+
+```sh
+make release V=0.2.0
+```
+
+`scripts/release.sh` tags `main` as `v0.2.0` and pushes the tag. It refuses
+unless the checkout is `main`, clean and equal to `origin/main`, CI passed on
+that commit, and the version is higher than the last tag. The tag's CI run
+builds and tests it like any other, then the `release` job checks that
+`cfa-lsp --version` says `0.2.0` and publishes a GitHub release with the
+tarball and its SHA-256. The release notes list the PRs merged since the last
+release. A version with a suffix (`0.3.0-rc1`) is published as a prerelease.
+
+The version comes from `git describe`: `0.2.0` on the tagged commit,
+`0.2.0-3-gabc1234` three commits later, and `-dirty` with uncommitted changes.
+The server reports it in `--version` and in `serverInfo`.
+
+### The translator
 
 The translator changes live in the submodule, on branch `balaji/lsp` of
 [BalajiLeninrajan/cforall](https://github.com/BalajiLeninrajan/cforall). Most of
