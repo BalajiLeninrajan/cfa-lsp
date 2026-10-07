@@ -247,7 +247,7 @@ TEST_CASE( "format: continuation lines keep their alignment" ) {
 		   "}\n" );
 }
 
-TEST_CASE( "format: CFA declarations come through unchanged apart from indentation" ) {
+TEST_CASE( "format: CFA declarations come through unchanged apart from whitespace" ) {
 	std::string src =
 		"forall( T )\n"
 		"struct Pair {\n"
@@ -263,11 +263,38 @@ TEST_CASE( "format: CFA declarations come through unchanged apart from indentati
 		   "struct Pair {\n"
 		   "\tT first, second;\n"
 		   "};\n"
-		   "void ?{}( Pair(int) & p ) with( p ) {\n"
+		   "void ?{}( Pair( int ) & p ) with( p ) {\n"
 		   "\tfirst = 0; second = 0;\n"
 		   "}\n"
-		   "void ^?{}( Pair(int) & p ) {}\n"
-		   "int ?`len( Pair(int) p ) { return 2; }\n" );
+		   "void ^?{}( Pair( int ) & p ) {}\n"
+		   "int ?`len( Pair( int ) p ) { return 2; }\n" );
+}
+
+TEST_CASE( "format: spacing within a line" ) {
+	std::string src =
+		"int main() {\n"
+		"for  (   i;   10     )        {\n"
+		"f(a ,b);   g( );\n"
+		"if(x){ y; }\n"
+		"}\n"
+		"while (x)\t  x -= 1 ;\n"
+		"for (;;) {}\n"
+		"sout  |  f (x)  |  nl;\n"
+		"}\n"
+		"int z = ({ 1; });  // kept\n"
+		"#define M(a)   ( a ,b )\n";
+	CHECK( formatText( src, tabs() ) ==
+		   "int main() {\n"
+		   "\tfor ( i; 10 ) {\n"
+		   "\t\tf( a, b ); g();\n"
+		   "\t\tif ( x ) { y; }\n"
+		   "\t}\n"
+		   "\twhile ( x ) x -= 1;\n"
+		   "\tfor ( ;; ) {}\n"
+		   "\tsout | f ( x ) | nl;\n"
+		   "}\n"
+		   "int z = ({ 1; });  // kept\n"
+		   "#define M(a)   ( a ,b )\n" );
 }
 
 TEST_CASE( "format: comments move with their line, directives stay" ) {
@@ -382,6 +409,7 @@ TEST_CASE( "format: never changes a token, on every fixture" ) {
 		"\treturn ({ int t = 1;\n"
 		"\t\tt; });\n"
 		"}\n"
+		"c ?( ) : d; e ?(\t) : f;\n"
 		"} } ) ] unbalanced {\n"
 		"x;\n"
 		"/* unterminated\n"

@@ -129,6 +129,23 @@ more level for the statements under a `case` label and for the body of an
 that continues a statement (arguments split over lines, a `| x` chain) moves
 by as much as the statement's first line moved, so alignment within the
 statement is kept. It also removes trailing whitespace and applies the
-client's `insertFinalNewline` and `trimFinalNewlines` options. Spacing within
-a line, preprocessor directives and the inside of strings are left alone, and
-lines inside a block comment move with the line the comment starts on.
+client's `insertFinalNewline` and `trimFinalNewlines` options. Preprocessor
+directives and the inside of strings are left alone, and lines inside a block
+comment move with the line the comment starts on.
+
+Spacing within a line follows libcfa's style, so
+`for  (   i;   10     )        {` becomes `for ( i; 10 ) {`:
+
+- one space inside non-empty parentheses (`f( a, b )`) and none inside empty
+  ones (`g()`), except next to the braces of a statement expression `({ })`
+- one space after a comma or semicolon and none before, so `for ( ;; )`
+- one space between `if`, `for`, `while`, `switch` or `choose` and its `(`
+- one space before a `{` that follows a `)` or a name (`) {`, `else {`)
+- any other run of blanks between two tokens becomes one space, and tokens
+  with nothing between them stay together, so `f (x)` becomes `f ( x )`,
+  not `f( x )`
+
+The space before and after a comment is kept, so trailing comments stay
+aligned. A line keeps its spacing if the new spacing would lex differently.
+Changing the spacing on a line doesn't move the lines that continue its
+statement, so arguments aligned under an opening `(` can end up a column off.

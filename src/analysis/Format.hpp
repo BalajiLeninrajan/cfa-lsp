@@ -7,8 +7,8 @@
 namespace cfalsp {
 
 // A formatter that only changes whitespace. It reindents lines by brace
-// depth, trims trailing whitespace and, if asked, fixes the newlines at the
-// end of the file. It never adds, removes or changes a token, so CFA syntax
+// depth, sets the spacing between tokens on a line, trims trailing
+// whitespace and, if asked, fixes the newlines at the end of the file. It never adds, removes or changes a token, so CFA syntax
 // that C formatters mangle (?{}, ^?{}, with clauses, sout | x chains) comes
 // through as written.
 //
@@ -20,6 +20,13 @@ namespace cfalsp {
 // alignment inside a statement is kept. Preprocessor directives keep their
 // indentation, and lines inside a block comment move with the line the
 // comment starts on.
+//
+// Within a line, the spacing follows libcfa: one space inside non-empty
+// parentheses and none inside `()`, one after a comma or semicolon and none
+// before, one between if, for, while, switch or choose and its `(`, and one
+// before a `{` that follows a `)` or a name. Other runs of blanks between
+// tokens become one space. Directives and the space before or after a
+// comment are left alone.
 struct FormatOptions {
 	int tabSize = 4;
 	bool insertSpaces = false;
