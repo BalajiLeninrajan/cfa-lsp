@@ -303,6 +303,7 @@ class Server {
 	bool prepareRenameSupport = false;
 	bool watchFiles = false;				// the client takes dynamic registration of file watchers
 	bool inlayHintRefresh = false;			// the client takes workspace/inlayHint/refresh
+	bool semanticTokensRefresh = false;		// the client takes workspace/semanticTokens/refresh
 	std::string rootPath;
 	bool configurationPull = false;			// client answers workspace/configuration
 	bool configurationRegistration = false;	// client takes dynamic registration of didChangeConfiguration

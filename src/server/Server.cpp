@@ -518,6 +518,7 @@ nlohmann::json Server::initialize( const json & params ) {
 	hierarchicalSymbols = member( member( member( caps, "textDocument" ), "documentSymbol" ), "hierarchicalDocumentSymbolSupport" ) == true;
 	prepareRenameSupport = member( member( member( caps, "textDocument" ), "rename" ), "prepareSupport" ) == true;
 	inlayHintRefresh = member( member( member( caps, "workspace" ), "inlayHint" ), "refreshSupport" ) == true;
+	semanticTokensRefresh = member( member( member( caps, "workspace" ), "semanticTokens" ), "refreshSupport" ) == true;
 	const json & ws = member( caps, "workspace" );
 	configurationPull = member( ws, "configuration" ) == true;
 	configurationRegistration = member( member( ws, "didChangeConfiguration" ), "dynamicRegistration" ) == true;
@@ -1985,18 +1986,22 @@ void Server::workerLoop() {
 			continue;
 		}
 		Document & doc = dit->second;
-		std::optional<json> refresh;
+		std::vector<json> refresh;
 		if ( fr.analysis && ( fr.usable || ! doc.analysis ) ) {
 			doc.analysis = fr.analysis;
 			doc.analysisSeq = seq;
 			doc.analysisReads = reads;
 			doc.table = table;
-			// Clients ask for inlay hints when the text changes, not when a
-			// check finishes, so the hints of a file just opened would stay empty.
-			if ( inlayHintRefresh ) {
-				refresh = json{ { "jsonrpc", "2.0" }, { "id", "cfa-lsp-refresh-" + std::to_string( ++refreshRequests ) },
-								{ "method", "workspace/inlayHint/refresh" } };
-			}
+			// Clients ask for inlay hints and semantic tokens when the text
+			// changes, not when a check finishes. The hints of a file just
+			// opened would stay empty, and lines typed since the last check,
+			// which have no tokens, would stay uncoloured until the next edit.
+			auto ask = [&]( const char * method ) {
+				refresh.push_back( { { "jsonrpc", "2.0" }, { "id", "cfa-lsp-refresh-" + std::to_string( ++refreshRequests ) },
+									 { "method", method } } );
+			};
+			if ( inlayHintRefresh ) ask( "workspace/inlayHint/refresh" );
+			if ( semanticTokensRefresh ) ask( "workspace/semanticTokens/refresh" );
 		}
 		// The last backend warnings stay until the backend runs again, which
 		// it can't while the translator reports errors that stop it before
@@ -2020,7 +2025,7 @@ void Server::workerLoop() {
 		{
 			std::lock_guard<std::mutex> pub( publishMtx );
 			lk.unlock();
-			if ( refresh ) send( *refresh );
+			for ( const json & r : refresh ) send( r );
 			if ( testHook ) testHook( "publish" );
 			for ( auto & p : out ) notify( "textDocument/publishDiagnostics", std::move( p ) );
 		}

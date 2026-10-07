@@ -372,7 +372,7 @@ TEST_CASE( "switchSourceHeader pairs .cfa and .hfa files with the same stem" ) {
 	CHECK( s.request( "shutdown" )["result"].is_null() );
 }
 
-TEST_CASE( "prepareRename when the client supports it; inlay hint refresh after a check" ) {
+TEST_CASE( "prepareRename when the client supports it; inlay hint and semantic token refresh after a check" ) {
 	if ( fakeCfa().empty() ) {
 		MESSAGE( "CFA_LSP_FAKE_CFA not set; skipping (run through make test)" );
 		return;
@@ -381,25 +381,28 @@ TEST_CASE( "prepareRename when the client supports it; inlay hint refresh after 
 	std::string path = fs::canonical( fixtures() + "/server/hello.cfa" ).string();
 	std::string uri = pathToUri( path );
 	json open = { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 }, { "text", readAll( path ) } } } };
-	auto refreshes = []( const Session & s ) {
+	auto refreshes = []( const Session & s, const char * method = "workspace/inlayHint/refresh" ) {
 		int n = 0;
 		for ( const json & m : s.queue ) {
-			if ( m.value( "method", "" ) == "workspace/inlayHint/refresh" ) n += 1;
+			if ( m.value( "method", "" ) == method ) n += 1;
 		}
 		return n;
 	};
 	{
 		Session s;
 		json caps = { { "textDocument", { { "rename", { { "prepareSupport", true } } } } },
-					  { "workspace", { { "inlayHint", { { "refreshSupport", true } } } } } };
+					  { "workspace", { { "inlayHint", { { "refreshSupport", true } } },
+									   { "semanticTokens", { { "refreshSupport", true } } } } } };
 		json r = s.initialize( fakeOptions( { { "backend", false } } ), caps );
 		CHECK( r["result"]["capabilities"]["renameProvider"] == json{ { "prepareProvider", true } } );
 		s.notify( "textDocument/didOpen", open );
 		REQUIRE( s.diagnosticsFor( uri, []( const json & ) { return true; } ) );
 		// Sent before the diagnostics, so it is queued by now.
 		CHECK( refreshes( s ) == 1 );
+		CHECK( refreshes( s, "workspace/semanticTokens/refresh" ) == 1 );
 		for ( const json & m : s.queue ) {
-			if ( m.value( "method", "" ) == "workspace/inlayHint/refresh" ) {
+			std::string method = m.value( "method", "" );
+			if ( method == "workspace/inlayHint/refresh" || method == "workspace/semanticTokens/refresh" ) {
 				CHECK( m.contains( "id" ) );
 			}
 		}
@@ -414,6 +417,7 @@ TEST_CASE( "prepareRename when the client supports it; inlay hint refresh after 
 		REQUIRE( s.diagnosticsFor( uri, []( const json & ) { return true; } ) );
 		CHECK( s.request( "shutdown" )["result"].is_null() );
 		CHECK( refreshes( s ) == 0 );
+		CHECK( refreshes( s, "workspace/semanticTokens/refresh" ) == 0 );
 	}
 }
 
