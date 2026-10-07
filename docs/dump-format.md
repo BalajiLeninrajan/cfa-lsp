@@ -9,7 +9,7 @@ here first, then on both sides.
 
 ```
 cfa-cpp --lsp OUT.json [--lsp-focus PATH]... [--lsp-c-out OUT.c] [--lsp-stop-after-resolve]
-        [usual cfa-cpp flags] INPUT.i
+        [--lsp-skip-bodies DIR]... [usual cfa-cpp flags] INPUT.i
 ```
 
 - `INPUT.i` is the output of `cfa -E` (preprocessed, with `# N "file"` line
@@ -38,6 +38,17 @@ cfa-cpp --lsp OUT.json [--lsp-focus PATH]... [--lsp-c-out OUT.c] [--lsp-stop-aft
   below), skipping the passes after `Resolve` and code generation. That saves
   40 to 45% of the time, but those passes' diagnostics are lost (listed
   below). `--lsp-c-out` writes nothing then. `complete` is unaffected.
+- `--lsp-skip-bodies DIR` (repeatable): right before `Resolve`, every
+  function defined in a file under `DIR` that is not a focus file gets an
+  empty body at the same location. The passes before `Resolve` still see
+  the real bodies, and code that calls those functions resolves against
+  their declarations as before. `Resolve` and the passes after it then skip
+  the work on those bodies, which for a program that includes a few libcfa
+  headers is most of the run. The server passes the libcfa install and the
+  system directories. What is lost is the diagnostics inside those bodies.
+  libcfa's own bodies have none, so in practice that means errors that the
+  code before an `#include` causes there (a macro or an overload that breaks
+  the header). The generated C has the empty bodies too.
 
 The AST snapshot is taken right after the `Resolve` pass. Passes after it
 still run (to report their errors) but don't change the dump. If `Resolve`

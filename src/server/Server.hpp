@@ -160,6 +160,7 @@ class Server {
 		bool backend = true;
 		int timeoutMs = 120000;
 		bool stopAfterResolve = false;
+		bool skipSystemBodies = true;
 		bool index = true;
 		std::optional<std::vector<std::string>> flags;
 	};

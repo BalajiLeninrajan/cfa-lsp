@@ -21,6 +21,9 @@ struct Toolchain {
 	// True if `path` belongs to the compiler or the system (libcfa headers,
 	// the prelude, /usr/...), not to the user's project.
 	bool isSystemPath( const std::string & path ) const;
+
+	// The directories whose absolute paths isSystemPath accepts.
+	std::vector<std::string> systemDirs() const;
 };
 
 struct ToolchainOptions {
