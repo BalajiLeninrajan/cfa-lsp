@@ -46,6 +46,36 @@ bool isKeyword( const Token & t, std::initializer_list<const char *> words ) {
 	return false;
 }
 
+bool isPunct( const Token & t, const char * s ) { return t.kind == TokKind::Punct && t.text == s; }
+
+bool isCode( const Token & t ) {
+	return t.kind != TokKind::Comment && t.kind != TokKind::Directive && t.kind != TokKind::Other;
+}
+
+// The spaces wanted between two code tokens on one line, in the libcfa
+// style: `for ( i; 10 ) {`, `f( a, b )`, `g()`. -1 keeps whether there were
+// any.
+int wantedSpace( const Token & a, const Token & b ) {
+	if ( ( isPunct( b, "," ) || isPunct( b, ";" ) ) &&
+		 !isPunct( a, "(" ) && !isPunct( a, "[" ) && !isPunct( a, "{" ) && !isPunct( a, "," ) && !isPunct( a, ":" ) ) return 0;
+	if ( isPunct( a, "," ) || isPunct( a, ";" ) ) return 1;
+	if ( isPunct( a, "(" ) ) return isPunct( b, ")" ) ? 0 : isPunct( b, "{" ) ? -1 : 1;	// ({ ... }) stays
+	if ( isPunct( b, ")" ) ) return isPunct( a, "}" ) ? -1 : 1;
+	if ( isPunct( b, "(" ) && isKeyword( a, { "if", "for", "while", "switch", "choose" } ) ) return 1;
+	if ( isPunct( b, "{" ) && ( isPunct( a, ")" ) || a.kind == TokKind::Identifier ) ) return 1;
+	return -1;
+}
+
+// The texts of a line's tokens, lexed on their own.
+std::vector<std::string> lineTokens( std::string_view s ) {
+	LexOptions lo;
+	lo.comments = true;
+	lo.directives = true;
+	std::vector<std::string> out;
+	for ( Token & t : lex( s, lo ) ) out.push_back( std::move( t.text ) );
+	return out;
+}
+
 // An open bracket. Braces (and file scope) also hold the state of the
 // statements directly inside them.
 struct Open {
@@ -117,6 +147,7 @@ class Formatter {
 	void index();
 	void process( const Token & t );
 	bool canTrim( int l, std::string_view content ) const;
+	std::string spaced( int l, std::string_view content ) const;
 };
 
 void Formatter::index() {
@@ -234,6 +265,34 @@ bool Formatter::canTrim( int l, std::string_view content ) const {
 	return true;
 }
 
+// The line with the space between its code tokens set by wantedSpace, runs
+// of blanks cut to one. Space next to a comment and gaps holding anything
+// else (a line splice) stay. If the new spacing would lex differently (a
+// `?` before `( )` would become `?()`), the line keeps its spacing.
+std::string Formatter::spaced( int l, std::string_view content ) const {
+	const size_t base = lines[l].begin;
+	std::string out;
+	size_t copied = 0;
+	for ( int i = first[l]; i >= 0 && i + 1 < int( toks.size() ) && toks[i + 1].line == l; i += 1 ) {
+		const Token & a = toks[i], & b = toks[i + 1];
+		if ( a.endLine != l || !isCode( a ) || !isCode( b ) ) continue;
+		size_t gb = a.endOffset - base, ge = b.offset - base;
+		if ( gb > ge || ge > content.size() ) continue;
+		std::string_view gap = content.substr( gb, ge - gb );
+		if ( gap.find_first_not_of( " \t" ) != std::string_view::npos ) continue;
+		int want = wantedSpace( a, b );
+		if ( want < 0 ) want = gap.empty() ? 0 : 1;
+		if ( gap.size() == size_t( want ) && gap.find( '\t' ) == std::string_view::npos ) continue;
+		out.append( content.substr( copied, gb - copied ) );
+		out.append( size_t( want ), ' ' );
+		copied = ge;
+	}
+	if ( copied == 0 ) return std::string( content );
+	out.append( content.substr( copied ) );
+	if ( lineTokens( out ) != lineTokens( content ) ) return std::string( content );
+	return out;
+}
+
 std::string Formatter::run() {
 	index();
 	const int n = int( lines.size() );
@@ -294,9 +353,8 @@ std::string Formatter::run() {
 			out.append( text.substr( ln.begin, ln.next - ln.begin ) );
 			continue;
 		}
-		std::string line;
-		if ( newWidth >= 0 && lead < content.size() ) line = indentation( newWidth, opts ) + std::string( content.substr( lead ) );
-		else line = std::string( content );
+		std::string line = spaced( l, content );
+		if ( newWidth >= 0 && lead < content.size() ) line = indentation( newWidth, opts ) + line.substr( lead );
 		if ( opts.trimTrailingWhitespace && canTrim( l, content ) ) {
 			size_t k = line.find_last_not_of( " \t" );
 			line.resize( k == std::string::npos ? 0 : k + 1 );
