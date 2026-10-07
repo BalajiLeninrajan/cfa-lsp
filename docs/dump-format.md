@@ -48,7 +48,8 @@ cfa-cpp --lsp OUT.json [--lsp-focus PATH]... [--lsp-c-out OUT.c] [--lsp-stop-aft
   system directories. What is lost is the diagnostics inside those bodies.
   libcfa's own bodies have none, so in practice that means errors that the
   code before an `#include` causes there (a macro or an overload that breaks
-  the header). The generated C has the empty bodies too.
+  the header). Fix Init doesn't check that an emptied constructor or
+  destructor handles each field. The generated C has the empty bodies too.
 
 The AST snapshot is taken right after the `Resolve` pass. Passes after it
 still run (to report their errors) but don't change the dump. If `Resolve`
