@@ -262,6 +262,24 @@ bool waitForFile( const std::string & path ) {
 	return fs::exists( path );
 }
 
+// The pid a FAKE_DELAY translator writes to $FAKE_CFA_STARTED, once it has.
+pid_t startedPid( const std::string & path ) {
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+	pid_t pid = 0;
+	while ( std::chrono::steady_clock::now() < deadline ) {
+		std::ifstream( path ) >> pid;
+		if ( pid > 0 ) return pid;
+		std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
+	}
+	return 0;
+}
+
+size_t count( const std::string & text, const std::string & word ) {
+	size_t n = 0;
+	for ( size_t p = text.find( word ); p != std::string::npos; p = text.find( word, p + 1 ) ) n += 1;
+	return n;
+}
+
 bool processGone( pid_t pid ) {
 	std::ifstream stat( "/proc/" + std::to_string( pid ) + "/stat" );
 	if ( ! stat ) return true;
@@ -674,6 +692,8 @@ TEST_CASE( "an edit lets the running check finish and publish, mapped through th
 										  { "contentChanges", { { { "range", { { "start", pos( 0, 0 ) }, { "end", pos( 0, 0 ) } } },
 																  { "text", "// a\n" } } } } } );
 	REQUIRE( waitForFile( started ) );
+	// An edit in the first half of the check would cancel it.
+	std::this_thread::sleep_for( std::chrono::milliseconds( 1200 ) );
 
 	// While it runs, turn the first line into two.
 	s.notify( "textDocument/didChange", { { "textDocument", { { "uri", uri }, { "version", 3 } } },
@@ -704,6 +724,115 @@ TEST_CASE( "an edit lets the running check finish and publish, mapped through th
 	size_t runs = 0;
 	for ( size_t p = log.find( "--lsp " ); p != std::string::npos; p = log.find( "--lsp ", p + 1 ) ) runs += 1;
 	CHECK( runs == 3 );
+	s.request( "shutdown" );
+	s.notify( "exit", nullptr );
+	CHECK( s.finish() == 0 );
+	CHECK( env.tempDirsLeft() == 0 );
+}
+
+TEST_CASE( "a check that finishes after an edit leaves out its diagnostics on the edited text" ) {
+	if ( fakeCfa().empty() ) {
+		MESSAGE( "CFA_LSP_FAKE_CFA not set; skipping (run through make test)" );
+		return;
+	}
+	FakeEnv env;
+	std::string path = fs::canonical( fixtures() + "/server/hello.cfa" ).string();
+	std::string uri = pathToUri( path );
+	std::string text = readAll( path );
+
+	Session s;
+	s.initialize( fakeOptions() );
+	s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 },
+															{ "text", "// FAKE_DELAY\n" + text } } } } );
+	REQUIRE( s.diagnosticsFor( uri, []( const json & ds ) { return ! ds.empty(); } ) );
+
+	std::string started = env.scratch.path() + "/started";
+	fs::remove( started );
+	s.notify( "textDocument/didChange", { { "textDocument", { { "uri", uri }, { "version", 2 } } },
+										  { "contentChanges", { { { "range", { { "start", pos( 0, 0 ) }, { "end", pos( 0, 0 ) } } },
+																  { "text", "// a\n" } } } } } );
+	REQUIRE( waitForFile( started ) );
+	std::this_thread::sleep_for( std::chrono::milliseconds( 1200 ) );
+	// Rewrite line 3, where this check's backend warning will be.
+	s.notify( "textDocument/didChange", { { "textDocument", { { "uri", uri }, { "version", 3 } } },
+										  { "contentChanges", { { { "range", { { "start", pos( 3, 0 ) }, { "end", pos( 4, 0 ) } } },
+																  { "text", "// edited\n" } } } } } );
+	auto onLine = []( int line ) {
+		return [line]( const json & ds ) {
+			for ( const auto & x : ds ) {
+				if ( x["range"]["start"]["line"] == line ) return true;
+			}
+			return false;
+		};
+	};
+	// The check's first publish carries the first check's warning, now on line 4, which no edit touched.
+	REQUIRE( s.diagnosticsFor( uri, onLine( 4 ) ) );
+	// Its backend publish has its own warning on line 3, which was edited, so it is left out.
+	auto back = s.diagnosticsFor( uri, []( const json & ) { return true; } );
+	REQUIRE( back );
+	CHECK( ( *back )["diagnostics"] == json::array() );
+	// The check of the edited text reports it again.
+	auto d = s.diagnosticsFor( uri, onLine( 3 ) );
+	REQUIRE( d );
+	CHECK( ( *d )["version"] == 3 );
+	CHECK( count( readAll( env.scratch.path() + "/log" ), "delay done" ) == 3 );
+	s.request( "shutdown" );
+	s.notify( "exit", nullptr );
+	CHECK( s.finish() == 0 );
+	CHECK( env.tempDirsLeft() == 0 );
+}
+
+TEST_CASE( "an edit early in a check cancels it, but not two checks in a row" ) {
+	if ( fakeCfa().empty() ) {
+		MESSAGE( "CFA_LSP_FAKE_CFA not set; skipping (run through make test)" );
+		return;
+	}
+	FakeEnv env;
+	std::string path = fs::canonical( fixtures() + "/server/hello.cfa" ).string();
+	std::string uri = pathToUri( path );
+	std::string text = readAll( path );
+	std::string log = env.scratch.path() + "/log";
+	std::string started = env.scratch.path() + "/started";
+
+	Session s;
+	s.initialize( fakeOptions() );
+	s.notify( "textDocument/didOpen", { { "textDocument", { { "uri", uri }, { "languageId", "cfa" }, { "version", 1 },
+															{ "text", "// FAKE_DELAY\n" + text } } } } );
+	REQUIRE( s.diagnosticsFor( uri, []( const json & ds ) { return ! ds.empty(); } ) );
+	auto edit = [&]( int version ) {
+		s.notify( "textDocument/didChange", { { "textDocument", { { "uri", uri }, { "version", version } } },
+											  { "contentChanges", { { { "range", { { "start", pos( 0, 0 ) }, { "end", pos( 0, 0 ) } } },
+																	  { "text", "// " + std::to_string( version ) + "\n" } } } } } );
+	};
+	auto waitFor = [&]( std::function<bool()> done ) {
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+		while ( ! done() && std::chrono::steady_clock::now() < deadline ) {
+			std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
+		}
+		return done();
+	};
+
+	// The second check is cancelled by an edit right after it starts: its translator is killed long before its
+	// 1.5 s are up.
+	fs::remove( started );
+	edit( 2 );
+	pid_t second = startedPid( started );
+	REQUIRE( second > 0 );
+	fs::remove( started );
+	edit( 3 );
+	auto t = std::chrono::steady_clock::now();
+	CHECK( waitFor( [&] { return processGone( second ); } ) );
+	CHECK( std::chrono::steady_clock::now() - t < std::chrono::milliseconds( 1000 ) );
+
+	// The third, of the text after both edits, is not, although the next edit comes as early.
+	pid_t third = startedPid( started );
+	REQUIRE( third > 0 );
+	REQUIRE( third != second );
+	edit( 4 );
+	CHECK( waitFor( [&] { return count( readAll( log ), "delay done" ) == 2; } ) );
+	// Then the fourth runs, and the second never finished.
+	CHECK( waitFor( [&] { return count( readAll( log ), "delay done" ) == 3; } ) );
+	CHECK( count( readAll( log ), "--lsp " ) == 4 );
 	s.request( "shutdown" );
 	s.notify( "exit", nullptr );
 	CHECK( s.finish() == 0 );

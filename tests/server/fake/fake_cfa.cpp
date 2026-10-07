@@ -16,8 +16,9 @@
 //                        FAKE_GCC_ERROR line. If the input contains FAKE_SLOW
 //                        it first forks a grandchild, writes both pids to
 //                        $FAKE_CFA_PIDS and sleeps. If it contains FAKE_DELAY
-//                        it creates $FAKE_CFA_STARTED and sleeps for 1.5 s
-//                        first. FAKE_CRASH makes it print an assertion failure
+//                        it writes its pid to $FAKE_CFA_STARTED, sleeps for
+//                        1.5 s first and then appends "delay done" to
+//                        $FAKE_CFA_LOG. FAKE_CRASH makes it print an assertion failure
 //                        and abort without writing OUT, FAKE_EMPTY_DUMP makes
 //                        it write an empty OUT and exit with status 0.
 //   -fsyntax-only ... C  backend: print $FAKE_CFA_DIR/gcc.err to stderr with
@@ -148,6 +149,7 @@ int main( int argc, char * argv[] ) {
 		if ( readFile( in ).find( "FAKE_DELAY" ) != std::string::npos ) {
 			if ( ! env( "FAKE_CFA_STARTED" ).empty() ) std::ofstream( env( "FAKE_CFA_STARTED" ) ) << getpid() << '\n';
 			usleep( 1500 * 1000 );
+			if ( ! env( "FAKE_CFA_LOG" ).empty() ) std::ofstream( env( "FAKE_CFA_LOG" ), std::ios::app ) << "delay done\n";
 		}
 		std::string focusDir = focus.substr( 0, focus.rfind( '/' ) );
 		bool headerError = readFile( in ).find( "FAKE_HEADER_ERROR" ) != std::string::npos;

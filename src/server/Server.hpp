@@ -28,10 +28,11 @@ namespace cfalsp {
 
 // The language server: reads JSON-RPC from one fd, writes to another.
 // Requests are answered on the calling thread from the last good analysis;
-// one worker thread runs checks and publishes diagnostics. An edit does not
-// cancel the check in flight unless it has run more than twice as long as the
-// document's last check: it finishes and publishes, mapped through the edits
-// made since, and the next check starts after it. When it has nothing else
+// one worker thread runs checks and publishes diagnostics. An edit cancels
+// the check in flight if it has run less than half as long as the document's
+// last check (but not two in a row) or more than twice as long. Otherwise it
+// finishes and publishes, mapped through the edits made since, without the
+// diagnostics on text those edits changed, and the next check starts after it. When it has nothing else
 // to do, the worker checks every .cfa file under the workspace root from disk
 // (the background index) for cross-file queries.
 class Server {
@@ -89,6 +90,8 @@ class Server {
 		// How long the last check that finished took, or how long one that an
 		// edit cancelled had run. Zero until a check finishes.
 		Clock::duration lastCheck{};
+		// An edit cancelled the last check early; the next one finishes.
+		bool cancelledEarly = false;
 
 		EditList editsSince( uint64_t s ) const;
 		EditList editsBetween( uint64_t from, uint64_t to ) const;	// took seq `from` to seq `to`
@@ -276,7 +279,9 @@ class Server {
 	void storeDiags( const std::string & source, uint64_t seq, const SeqMap & reads, const std::vector<Diag> & diags,
 					 std::vector<json> & out );	// caller holds mtx
 	json publishFor( const std::string & target );	// caller holds mtx
-	json diagJson( const Diag & d, const std::string & target, const std::string & source, const DiagSet & set );
+	// nullopt if an edit made since the check changed the text the diagnostic is about.
+	std::optional<json> diagJson( const Diag & d, const std::string & target, const std::string & source,
+								  const DiagSet & set );
 
 	// checking
 	void workerLoop();
