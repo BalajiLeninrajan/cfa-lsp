@@ -303,13 +303,17 @@ lines inside a block comment move with the line the comment starts on.
 
 ## Limits
 
-- A check takes as long as compiling the file: about 3 seconds for a small
-  program that includes `fstream.hfa`, 5 seconds with `string.hfa`. Almost
-  all of it is the translator, and half of that is the resolver.
-  `stopAfterResolve` cuts 40 to 45% of it. Most of the rest is re-parsing and
-  re-resolving the prelude and the libcfa headers on every check;
-  `docs/persistent-translator.md` describes how a long-running translator
-  could avoid that.
+- A check runs the translator over the file and every header it includes.
+  The translator skips the bodies of the functions in libcfa and system
+  headers (`skipSystemBodies`), which makes a check of a cs343 assignment 2
+  to 4 times faster, but it still parses and resolves every declaration in
+  them: about 2 seconds for a small program that includes `fstream.hfa`,
+  `string.hfa` and `stdlib.hfa`. `stopAfterResolve` cuts a further part of
+  that. `docs/persistent-translator.md` describes how a long-running
+  translator could avoid re-reading the headers on every check.
+- With `skipSystemBodies`, an error that your code causes inside a libcfa
+  function body (a macro or an overload declared before the `#include` that
+  breaks the header) is not reported. Set it to `false` to get those back.
 - Each file is checked on its own. Open headers are checked as if they were
   the main file.
 - The index matches declarations by location. A function declared separately
