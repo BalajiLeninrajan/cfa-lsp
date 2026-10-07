@@ -715,20 +715,28 @@ void Server::didChange( const json & params ) {
 			d->log.push_back( { d->seq, makeEdit( s, e, ins ) } );
 		}
 	}
-	// The check in flight keeps running and its results are mapped through
-	// these edits. Cancelling it would starve diagnostics while someone types
-	// with pauses shorter than the debounce plus the check time. A check that
-	// has run more than twice as long as the last one is probably stuck on
-	// text this edit may have fixed, such as an expression the resolver takes
-	// minutes on, so that one is cancelled. Raising lastCheck to the time it
-	// ran means a check that got slower for good still finishes after a few
-	// edits.
+	// Usually the check in flight keeps running and its results are mapped
+	// through these edits. Cancelling every time would starve diagnostics
+	// while someone types with pauses shorter than the debounce plus the
+	// check time. Two cases are cancelled:
+	// - A check that has run less than half as long as the last one: the next
+	//   check, of the text the user wants checked, starts sooner than this one
+	//   would finish. The check after a cancelled one always finishes, so
+	//   while someone keeps typing every other check still publishes.
+	// - A check that has run more than twice as long as the last one, which
+	//   is probably stuck on text this edit may have fixed, such as an
+	//   expression the resolver takes minutes on. Raising lastCheck to the
+	//   time it ran means a check that got slower for good still finishes
+	//   after a few edits.
 	if ( inflight && ! inflight->index && inflight->path == d->path && ! inflight->token->cancelled() &&
 		 d->lastCheck > Clock::duration::zero() ) {
 		Clock::duration ran = Clock::now() - inflight->started;
 		if ( ran > 2 * d->lastCheck ) {
 			inflight->token->cancel();
 			d->lastCheck = ran;
+		} else if ( ran < d->lastCheck / 2 && ! d->cancelledEarly ) {
+			inflight->token->cancel();
+			d->cancelledEarly = true;
 		}
 	}
 	schedule( d->path, opts.debounceMs );
@@ -1764,15 +1772,34 @@ std::optional<RenamePlan> Server::renameAcross( const Document & d, const json &
 
 // ---------------------------------------------------------------- diagnostics
 
-nlohmann::json Server::diagJson( const Diag & d, const std::string & target, const std::string & source, const DiagSet & set ) {
+// A diagnostic's range in the current text, or nullopt if one of the edits
+// touched what it is about: its range, the rest of the line after a position,
+// or its whole line. The check that comes after the edits reports it again if
+// it still applies.
+static std::optional<Range> liveRange( const EditList & edits, const Diag & d ) {
+	if ( edits.empty() ) return d.range;
+	int l = d.range.start.line;
+	Range about = d.range;
+	if ( d.wholeLine ) about = { { l, 0 }, { l + 1, 0 } };
+	else if ( d.range.start == d.range.end ) about.end = { l + 1, 0 };
+	if ( ! toCurrentExact( edits, about ) ) return std::nullopt;
+	return toCurrentClamped( edits, d.range );
+}
+
+std::optional<nlohmann::json> Server::diagJson( const Diag & d, const std::string & target, const std::string & source,
+												const DiagSet & set ) {
 	const Text * text = &textOf( target );
 	Range r = d.range;
 	auto dit = docs.find( target );
 	if ( target == source && dit != docs.end() ) {
-		r = toCurrentClamped( dit->second.editsSince( set.seq ), r );
+		auto live = liveRange( dit->second.editsSince( set.seq ), d );
+		if ( ! live ) return std::nullopt;
+		r = *live;
 	} else if ( auto rd = set.reads.find( target ); rd != set.reads.end() && dit != docs.end() ) {
 		// Another document's check read this file from its buffer.
-		r = toCurrentClamped( dit->second.editsSince( rd->second ), r );
+		auto live = liveRange( dit->second.editsSince( rd->second ), d );
+		if ( ! live ) return std::nullopt;
+		r = *live;
 	} else if ( dit != docs.end() ) {
 		// Another document's check read this file from disk.
 		auto m = fromDisk( target, r, false );
@@ -1806,7 +1833,9 @@ nlohmann::json Server::publishFor( const std::string & target ) {
 	auto it = diagStore.find( target );
 	if ( it != diagStore.end() ) {
 		for ( const auto & [source, set] : it->second ) {
-			for ( const Diag & d : set.diags ) list.push_back( diagJson( d, target, source, set ) );
+			for ( const Diag & d : set.diags ) {
+				if ( auto j = diagJson( d, target, source, set ) ) list.push_back( std::move( *j ) );
+			}
 		}
 	}
 	json p = { { "uri", uriOf( target ) }, { "diagnostics", list } };
@@ -2026,7 +2055,10 @@ void Server::workerLoop() {
 		Clock::duration took = Clock::now() - inflight->started;
 		inflight.reset();
 		if ( auto it = docs.find( path ); it != docs.end() ) {
-			if ( ! token->cancelled() ) it->second.lastCheck = took;
+			if ( ! token->cancelled() ) {
+				it->second.lastCheck = took;
+				it->second.cancelledEarly = false;
+			}
 			trimLog( it->second );
 		}
 	}

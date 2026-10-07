@@ -56,13 +56,19 @@ condition with the macros defined so far, and counts as kept when the
 condition depends on something the source doesn't show, such as a compiler
 macro or a `-D` flag.
 
-An edit does not cancel the check in flight. It finishes and publishes its
+An edit usually lets the check in flight finish. It publishes its
 diagnostics, mapped through the edits made since it started, and the next
-check starts after it. Otherwise, while you type with pauses a little longer
-than `debounceMs`, every check would be cancelled before it finished and the
-diagnostics would never update. The exception is a check that has already
-run more than twice as long as the file's last one, which is likely stuck on
-something the edit may have fixed; an edit cancels that one. Closing the file
+check starts after it. A diagnostic on text that one of those edits changed
+is left out, so an error you have just fixed doesn't come back; if it still
+applies, the next check reports it again. Cancelling on every edit would mean
+that while you type with pauses a little longer than `debounceMs`, every
+check is cancelled before it finishes and the diagnostics never update.
+
+An edit does cancel two kinds of check. One that has run less than half as
+long as the file's last check is cancelled so that the check of the new text
+starts sooner, but never two in a row, so while you keep typing every other
+check still finishes. One that has run more than twice as long as the last
+check is likely stuck on something the edit may have fixed. Closing the file
 also cancels its check.
 
 ## The background index
