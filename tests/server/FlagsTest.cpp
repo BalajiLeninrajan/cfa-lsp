@@ -82,10 +82,16 @@ TEST_CASE( "commands passed to each stage" ) {
 	req.path = "/home/u/proj/main.cfa";
 
 	V tr = ch.translatorCommand( req, f, "/tmp/t/in.i", "/tmp/t/out.json", "/tmp/t/out.c" );
-	CHECK( tr == V{ "/x/cfa-cpp", "--lsp", "/tmp/t/out.json", "--lsp-focus", "/home/u/proj/main.cfa", "--lsp-c-out",
-					"/tmp/t/out.c", "-Wall", "--prelude-dir=/p/x64-debug", "-L", "--colors=never", "/tmp/t/in.i" } );
+	CHECK( tr == V{ "/x/cfa-cpp", "--lsp", "/tmp/t/out.json", "--lsp-focus", "/home/u/proj/main.cfa",
+					"--lsp-skip-bodies", "/p/x64-debug", "--lsp-skip-bodies", "/usr", "--lsp-skip-bodies", "/lib",
+					"--lsp-skip-bodies", "/lib64", "--lsp-skip-bodies", "/opt", "--lsp-c-out", "/tmp/t/out.c", "-Wall",
+					"--prelude-dir=/p/x64-debug", "-L", "--colors=never", "/tmp/t/in.i" } );
 	V noC = ch.translatorCommand( req, f, "/tmp/t/in.i", "/tmp/t/out.json", "" );
 	CHECK( std::find( noC.begin(), noC.end(), "--lsp-c-out" ) == noC.end() );
+	req.skipSystemBodies = false;
+	V keep = ch.translatorCommand( req, f, "/tmp/t/in.i", "/tmp/t/out.json", "" );
+	CHECK( std::find( keep.begin(), keep.end(), "--lsp-skip-bodies" ) == keep.end() );
+	req.skipSystemBodies = true;
 
 	V be = ch.backendCommand( f, "/tmp/t/out.c" );
 	CHECK( be.front() == "gcc" );
@@ -149,4 +155,8 @@ TEST_CASE( "prelude directory follows the driver's layout" ) {
 	CHECK( tc.isSystemPath( "extras.cfa" ) );
 	CHECK( tc.isSystemPath( "<built-in>" ) );
 	CHECK( ! tc.isSystemPath( "/home/u/proj/x.hfa" ) );
+	CHECK( ! tc.isSystemPath( "/usrlocal/x.hfa" ) );
+	// Only the prefix's installed headers and libraries: a dev build's prefix can hold the user's project.
+	CHECK( ! tc.isSystemPath( tmp.path() + "/src/main.cfa" ) );
+	CHECK( tc.systemDirs() == V{ tmp.path() + "/include", tmp.path() + "/lib", "/override", "/usr", "/lib", "/lib64", "/opt" } );
 }

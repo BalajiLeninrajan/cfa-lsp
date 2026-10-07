@@ -57,6 +57,9 @@ struct CheckRequest {
 	std::string flagsBase;					// directory relative flag paths resolve against
 	bool backend = true;
 	bool stopAfterResolve = false;			// translator skips the passes after Resolve; no backend
+	// The translator empties the bodies of functions in the toolchain's and
+	// the system's headers before resolving (--lsp-skip-bodies).
+	bool skipSystemBodies = true;
 	std::chrono::milliseconds timeout{ 120000 };	// per child process
 	// Headers to read from these texts instead of from disk (open buffers
 	// with unsaved edits): path -> text. The preprocessor finds them in

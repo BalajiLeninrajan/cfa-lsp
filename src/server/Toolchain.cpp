@@ -64,14 +64,23 @@ static bool under( const std::string & path, const std::string & dir ) {
 
 bool Toolchain::isSystemPath( const std::string & path ) const {
 	if ( path.empty() || path[0] != '/' ) return true;	// <built-in>, prelude names, ...
-	// Only the installed headers and libraries: when cfa is a dev build or a
-	// test stand-in, its prefix can contain the user's project.
-	if ( ! cfaPrefix.empty() && ( under( path, cfaPrefix + "/include" ) || under( path, cfaPrefix + "/lib" ) ) ) return true;
-	if ( under( path, preludeDir ) ) return true;
-	for ( const char * sys : { "/usr/", "/lib/", "/lib64/", "/opt/" } ) {
-		if ( under( path, sys ) ) return true;
+	for ( const std::string & dir : systemDirs() ) {
+		if ( under( path, dir ) ) return true;
 	}
 	return false;
+}
+
+std::vector<std::string> Toolchain::systemDirs() const {
+	std::vector<std::string> dirs;
+	// Only the installed headers and libraries: when cfa is a dev build or a
+	// test stand-in, its prefix can contain the user's project.
+	if ( ! cfaPrefix.empty() ) {
+		dirs.push_back( cfaPrefix + "/include" );
+		dirs.push_back( cfaPrefix + "/lib" );
+	}
+	if ( ! preludeDir.empty() ) dirs.push_back( preludeDir );
+	for ( const char * sys : { "/usr", "/lib", "/lib64", "/opt" } ) dirs.push_back( sys );
+	return dirs;
 }
 
 Toolchain discoverToolchain( const ToolchainOptions & opts ) {

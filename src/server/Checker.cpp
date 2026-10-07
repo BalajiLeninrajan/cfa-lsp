@@ -334,6 +334,12 @@ std::vector<std::string> Checker::translatorCommand( const CheckRequest & req, c
 	// cc1.cc adds the input file and --colors.
 	std::vector<std::string> cmd = { tc.translator, "--lsp", json, "--lsp-focus", req.path };
 	if ( req.stopAfterResolve ) cmd.push_back( "--lsp-stop-after-resolve" );
+	if ( req.skipSystemBodies ) {
+		for ( const std::string & dir : tc.systemDirs() ) {
+			cmd.push_back( "--lsp-skip-bodies" );
+			cmd.push_back( dir );
+		}
+	}
 	for ( const std::string & f : req.extraFocus ) {
 		if ( f == req.path ) continue;
 		cmd.push_back( "--lsp-focus" );

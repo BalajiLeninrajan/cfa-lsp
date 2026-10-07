@@ -142,6 +142,7 @@ All optional.
 | `backend` | `true` | Run gcc `-fsyntax-only` on the generated C for gcc's warnings. |
 | `cc` | `gcc` | The C compiler for the backend check. |
 | `stopAfterResolve` | `false` | Stop the translator after `Resolve`. Checks take 40 to 45% less time, but you lose the warnings and errors of the later passes and gcc's warnings (see below). |
+| `skipSystemBodies` | `true` | Give the translator empty bodies for the functions defined in libcfa and system headers before it resolves them (see below). |
 | `debounceMs` | `500` | Wait after the last edit before checking. |
 | `index` | `true` | Check every `.cfa` file under the workspace root in the background, for workspace-wide references, rename, symbols and call hierarchy. |
 | `timeoutMs` | `120000` | Limit for each child process. |

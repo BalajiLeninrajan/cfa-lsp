@@ -583,6 +583,7 @@ void Server::applyOptions( const json & io ) {
 	o.timeoutMs = std::max( 1, intOr( member( io, "timeoutMs" ), 120000 ) );
 	if ( member( io, "backend" ).is_boolean() ) o.backend = member( io, "backend" ).get<bool>();
 	if ( member( io, "stopAfterResolve" ).is_boolean() ) o.stopAfterResolve = member( io, "stopAfterResolve" ).get<bool>();
+	if ( member( io, "skipSystemBodies" ).is_boolean() ) o.skipSystemBodies = member( io, "skipSystemBodies" ).get<bool>();
 	if ( member( io, "index" ).is_boolean() ) o.index = member( io, "index" ).get<bool>();
 	const json & fl = member( io, "flags" );
 	if ( fl.is_array() ) {
@@ -637,7 +638,8 @@ void Server::applySettings( const json & s ) {
 	// Our settings override initializationOptions key by key; null removes
 	// one. Other keys are someone else's.
 	json eff = initOptions;
-	for ( const char * k : { "cfa", "translator", "preludeDir", "flags", "backend", "stopAfterResolve", "index", "cc", "debounceMs", "timeoutMs" } ) {
+	for ( const char * k : { "cfa", "translator", "preludeDir", "flags", "backend", "stopAfterResolve", "skipSystemBodies", "index", "cc",
+							  "debounceMs", "timeoutMs" } ) {
 		auto it = settings.find( k );
 		if ( it == settings.end() ) continue;
 		if ( it->is_null() ) eff.erase( k );
@@ -1842,6 +1844,7 @@ CheckRequest Server::makeRequest( const std::string & path, const std::string & 
 	req.text = text;
 	req.backend = opts.backend;
 	req.stopAfterResolve = opts.stopAfterResolve;
+	req.skipSystemBodies = opts.skipSystemBodies;
 	req.timeout = std::chrono::milliseconds( opts.timeoutMs );
 	std::string dir = fs::path( path ).parent_path().string();
 	if ( opts.flags ) {

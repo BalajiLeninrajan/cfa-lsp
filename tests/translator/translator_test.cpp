@@ -62,6 +62,7 @@ std::string findOnPath( const std::string & name ) {
 
 struct Tools {
 	std::string translator, cfa, prelude, fixtures, skip;
+	std::string include;								// the installed libcfa headers, <prefix>/include
 };
 
 const Tools & tools() {
@@ -80,10 +81,11 @@ const Tools & tools() {
 			return t;
 		}
 		// The installed driver lives in <prefix>/bin; the prelude in <prefix>/lib/cfa/<arch>-debug.
+		std::error_code ec;
+		fs::path prefix = fs::canonical( t.cfa, ec ).parent_path().parent_path();
+		t.include = ( prefix / "include" ).string();
 		t.prelude = env( "CFA_LSP_PRELUDE" );
 		if ( t.prelude.empty() ) {
-			std::error_code ec;
-			fs::path prefix = fs::canonical( t.cfa, ec ).parent_path().parent_path();
 			for ( const char * arch : { "x64-debug", "arm64-debug", "x86-debug" } ) {
 				fs::path dir = prefix / "lib" / "cfa" / arch;
 				if ( fs::exists( dir / "prelude.cfa" ) ) {
@@ -124,9 +126,9 @@ struct Run {
 	}
 };
 
-// Runs each fixture once (per withC and stop). withC adds --lsp-c-out and keeps the generated C in Run::c; stop adds
-// --lsp-stop-after-resolve.
-const Run * run( const std::string & name, bool withC = false, bool stop = false ) {
+// Runs each fixture once (per withC, stop and skip). withC adds --lsp-c-out and keeps the generated C in Run::c; stop
+// adds --lsp-stop-after-resolve; skip adds --lsp-skip-bodies for each of its directories.
+const Run * run( const std::string & name, bool withC = false, bool stop = false, const std::vector<std::string> & skip = {} ) {
 	static std::map<std::string, Run> runs;
 	const Tools & t = tools();
 	if ( ! t.skip.empty() ) {
@@ -134,6 +136,7 @@ const Run * run( const std::string & name, bool withC = false, bool stop = false
 		return nullptr;
 	}
 	std::string key = name + ( withC ? ":c" : "" ) + ( stop ? ":stop" : "" );
+	for ( const std::string & dir : skip ) key += ":skip=" + dir;
 	auto found = runs.find( key );
 	if ( found != runs.end() ) return &found->second;
 
@@ -157,8 +160,9 @@ const Run * run( const std::string & name, bool withC = false, bool stop = false
 	std::string cmd = quote( t.translator ) + " --prelude-dir=" + quote( t.prelude )
 		+ " --lsp " + quote( ( work / "out.json" ).string() ) + " --lsp-focus " + quote( r.file )
 		+ ( withC ? " --lsp-c-out " + quote( ( work / "out.c" ).string() ) : std::string() )
-		+ ( stop ? " --lsp-stop-after-resolve" : "" )
-		+ " " + quote( ( work / "in.i" ).string() ) + " > " + quote( ( work / "translator.err" ).string() ) + " 2>&1";
+		+ ( stop ? " --lsp-stop-after-resolve" : "" );
+	for ( const std::string & dir : skip ) cmd += " --lsp-skip-bodies " + quote( dir );
+	cmd += " " + quote( ( work / "in.i" ).string() ) + " > " + quote( ( work / "translator.err" ).string() ) + " 2>&1";
 	int rc = std::system( cmd.c_str() );
 	r.status = WIFEXITED( rc ) ? WEXITSTATUS( rc ) : -1;
 	INFO( readFile( work / "translator.err" ) );
@@ -961,6 +965,32 @@ TEST_CASE( "translator: --lsp-stop-after-resolve drops only the later passes' di
 	REQUIRE( type );
 	CHECK( type->dump["complete"] == false );
 	CHECK( type->dump["diagnostics"] == run( "type_error.cfa" )->dump["diagnostics"] );
+}
+
+TEST_CASE( "translator: --lsp-skip-bodies empties the library's bodies and leaves the dump as it was" ) {
+	if ( ! run( "concurrency.cfa" ) ) return;
+	const std::vector<std::string> skip = { tools().include, "/usr" };
+	for ( const char * name : { "concurrency.cfa", "desugar.cfa", "corun.cfa", "readable.cfa" } ) {
+		CAPTURE( name );
+		const Run * full = run( name, true );
+		const Run * r = run( name, true, false, skip );
+		REQUIRE( full );
+		REQUIRE( r );
+		for ( const auto & [key, value] : full->dump.items() ) {
+			CAPTURE( key );
+			CHECK( r->dump[key] == value );
+		}
+		CHECK( r->dump.size() == full->dump.size() );
+	}
+	// The coroutine, monitor and thread headers define functions; their bodies are gone from the C.
+	CHECK( run( "concurrency.cfa", true, false, skip )->c.size() < run( "concurrency.cfa", true )->c.size() );
+
+	// A focus file keeps its bodies under a skipped directory: Fix Init's self-assignment warning is still there.
+	const Run * full = run( "check_error.cfa" );
+	const Run * own = run( "check_error.cfa", false, false, { fs::path( full->file ).parent_path().string() } );
+	REQUIRE( own );
+	CHECK( diagnosticOn( *own, 8, "warning" ) );
+	CHECK( own->dump == full->dump );
 }
 
 TEST_CASE( "translator: bytes that are not UTF-8 in messages don't break the dump" ) {
