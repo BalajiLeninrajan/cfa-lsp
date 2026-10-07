@@ -1274,7 +1274,7 @@ TEST_CASE( "translator: code that desugaring moves into a generated function has
 	// cofor ( i; 3 ) { ... }
 	expectRef( *r, 8, "bump", 3, "call" );
 	expectRef( *r, 8, "total", 5, "read" );
-	// A known gap (see the README): in the body, i names the copy that cofor makes in its generated function,
+	// A known gap (see docs/limits.md): in the body, i names the copy that cofor makes in its generated function,
 	// which is a generated declaration.
 	INFO( "refs on line 8:" << refsOn( *r, 8 ) );
 	CHECK_FALSE( refAt( *r, 8, r->col( 8, "i", 1 ) ) );
