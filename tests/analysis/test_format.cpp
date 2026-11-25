@@ -424,3 +424,30 @@ TEST_CASE( "format: never changes a token, on every fixture" ) {
 }
 
 } // TEST_SUITE
+
+TEST_CASE( "format: conditional branches start from the state at #if" ) {
+	// Each branch opens the struct, and the shared fields and }; follow the
+	// #endif. Only the first branch's { counts after it.
+	std::string src =
+		"#if defined( A )\n"
+		"struct S {\n"
+		"\tint a;\n"
+		"#elif defined( B )\n"
+		"struct S {\n"
+		"\tint b;\n"
+		"#else\n"
+		"#error no\n"
+		"#endif\n"
+		"\tint common;\n"
+		"};\n"
+		"void f() {\n"
+		"#ifdef A\n"
+		"\tif ( x ) {\n"
+		"#else\n"
+		"\tif ( y ) {\n"
+		"#endif\n"
+		"\t\tg();\n"
+		"\t}\n"
+		"}\n";
+	CHECK( formatText( src, tabs() ) == src );
+}

@@ -1,6 +1,8 @@
 #include "Format.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <optional>
 #include <vector>
 
 #include "Lexer.hpp"
@@ -119,13 +121,34 @@ class Formatter {
 
 	std::vector<int> first, cover, last;	// per line: first token starting on it, token covering
 											// its start, last token touching it (-1: none)
-	std::vector<Open> stack{ { 'R' } };
-	Prev prev = Prev::Terminator;
-	bool bodyStart = false;			// the last token ended a header, or was else or do
-	bool caseLabel = false;			// in a case label, before its ':'
-	std::string popped;				// the bodies the last token completed, for an else after it
-	size_t caseDepth = 0;
-	const Token * prevTok = nullptr;
+	// Everything process() tracks, so a conditional's branches can each start
+	// from the state at its #if.
+	struct State {
+		std::vector<Open> stack{ { 'R' } };
+		Prev prev = Prev::Terminator;
+		bool bodyStart = false;			// the last token ended a header, or was else or do
+		bool caseLabel = false;			// in a case label, before its ':'
+		std::string popped;				// the bodies the last token completed, for an else after it
+		size_t caseDepth = 0;
+		const Token * prevTok = nullptr;
+	} st;
+	std::vector<Open> & stack = st.stack;
+	Prev & prev = st.prev;
+	bool & bodyStart = st.bodyStart;
+	bool & caseLabel = st.caseLabel;
+	std::string & popped = st.popped;
+	size_t & caseDepth = st.caseDepth;
+	const Token *& prevTok = st.prevTok;
+
+	// An open #if. Each #elif and #else starts again from the state at the #if
+	// and the first branch's end state carries on after the #endif, the way
+	// clang-format does, so branches that each open the same brace
+	// (#if A struct S { ... #else struct S { ... #endif ... };) count it once.
+	struct Cond {
+		State start;
+		std::optional<State> firstEnd;
+	};
+	std::vector<Cond> conds;
 
 	bool inRange( int l ) const { return l >= firstLine && l <= lastLine; }
 	static bool braceLike( const Open & o ) { return o.c == '{' || o.c == 'R'; }
@@ -145,6 +168,7 @@ class Formatter {
 		return lv;
 	}
 	void index();
+	void directive( const Token & t );
 	void process( const Token & t );
 	bool canTrim( int l, std::string_view content ) const;
 	std::string spaced( int l, std::string_view content ) const;
@@ -168,8 +192,34 @@ void Formatter::index() {
 	}
 }
 
+void Formatter::directive( const Token & t ) {
+	std::string_view s = t.text;
+	size_t b = s.find_first_not_of( " \t", 1 );		// s[0] is '#'
+	if ( b == std::string_view::npos ) return;
+	size_t e = b;
+	while ( e < s.size() && ( std::isalnum( (unsigned char)s[e] ) || s[e] == '_' ) ) e += 1;
+	std::string_view name = s.substr( b, e - b );
+
+	if ( name == "if" || name == "ifdef" || name == "ifndef" ) {
+		conds.push_back( { st, std::nullopt } );
+	} else if ( conds.empty() ) {
+		return;
+	} else if ( name == "elif" || name == "elifdef" || name == "elifndef" || name == "else" ) {
+		Cond & c = conds.back();
+		if ( !c.firstEnd ) c.firstEnd = st;
+		st = c.start;
+	} else if ( name == "endif" ) {
+		if ( conds.back().firstEnd ) st = *conds.back().firstEnd;
+		conds.pop_back();
+	}
+}
+
 void Formatter::process( const Token & t ) {
-	if ( t.kind == TokKind::Comment || t.kind == TokKind::Directive ) return;
+	if ( t.kind == TokKind::Directive ) {
+		directive( t );
+		return;
+	}
+	if ( t.kind == TokKind::Comment ) return;
 	const std::string & s = t.text;
 	bool punct = t.kind == TokKind::Punct;
 	bool atStatement = braceLike( stack.back() ) && prev != Prev::Other;
