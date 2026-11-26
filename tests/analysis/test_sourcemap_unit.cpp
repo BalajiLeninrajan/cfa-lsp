@@ -415,6 +415,83 @@ TEST_CASE( "sourcemap: a skipped #line before a live one" ) {
 	CHECK( m.outputLines( F ) == ( std::vector<int>{ 5, 14 } ) );
 }
 
+// A system-header macro at the start of a line: cpp prints the indent, then a
+// marker with the system-header flag, the expansion, and a marker back. The
+// first marker isn't followed by a continued line, and the expansion matches
+// neither numbering, but the skipped #line still doesn't take it. gcc's
+// output.
+TEST_CASE( "sourcemap: a skipped #line with the number of a system-header marker" ) {
+	Files f;
+	const std::string F = "/r/e.cfa";
+	f.text[F] =
+		"#include <errno.h>\n"				// 0
+		"void g(void);\n"					// 1
+		"void f(void) {\n"					// 2
+		"\terrno = 0;\n"					// 3
+		"}\n"								// 4
+		"#if 0\n"							// 5
+		"#line 4\n"							// 6
+		"#endif\n"							// 7
+		"int h(void) { return 1; }\n";		// 8
+	SourceMap m( "# 1 \"/r/e.cfa\"\n"
+				 "# 1 \"/usr/include/errno.h\" 1 3\n"
+				 "extern int *__errno_location (void);\n"
+				 "# 2 \"/r/e.cfa\" 2\n"
+				 "\n"
+				 "# 2 \"/r/e.cfa\"\n"
+				 "void g(void);\n"
+				 "void f(void) {\n"
+				 " \n"
+				 "# 4 \"/r/e.cfa\" 3\n"
+				 "(*__errno_location ()) \n"
+				 "# 4 \"/r/e.cfa\"\n"
+				 "      = 0;\n"
+				 "}\n"
+				 "\n\n\n"
+				 "int h(void) { return 1; }\n",
+				 f.reader() );
+	CHECK( m.outputLines( F ) == ( std::vector<int>{ 1, 2, 3, 3, 4, 8 } ) );
+	CHECK( m.map( F, 9, 4 ) == L( 8, 4 ) );
+	CHECK( m.realLine( F, 4 ) == 4 );
+	CHECK( m.realLine( F, 9 ) == 9 );
+}
+
+// A skipped #line, then a live one that numbers backwards. Under the old
+// numbering the last line before cpp's marker for the skipped number lies
+// above the skipped directive, but an earlier one doesn't. gcc's output.
+TEST_CASE( "sourcemap: a skipped #line before a live backwards one" ) {
+	Files f;
+	const std::string F = "/r/b.cfa";
+	std::string text =
+		"int a;\n"							// 0
+		"#if 0\n"							// 1
+		"#line 30\n"						// 2
+		"#endif\n"							// 3
+		"int b;\n"							// 4
+		"#line 1\n"							// 5
+		"int c;\n";							// 6, numbered 1
+	for ( int i = 7; i < 35; ++i ) text += "\n";
+	text += "int d;\n";						// 35, numbered 30
+	text += "int e;\n";						// 36
+	f.text[F] = text;
+	SourceMap m( "# 1 \"/r/b.cfa\"\n"		// 1
+				 "int a;\n"					// 2
+				 "\n\n\n"					// 3-5
+				 "int b;\n"					// 6
+				 "# 1 \"/r/b.cfa\"\n"		// 7
+				 "int c;\n"					// 8
+				 "# 30 \"/r/b.cfa\"\n"		// 9
+				 "int d;\n"					// 10
+				 "int e;\n",				// 11
+				 f.reader() );
+	CHECK( m.outputLines( F ) == ( std::vector<int>{ 0, 4, 6, 35, 36 } ) );
+	CHECK( m.map( F, { 1, 4, 8 } ) == L( 6, 4 ) );
+	CHECK( m.map( F, { 30, 4, 10 } ) == L( 35, 4 ) );
+	CHECK( m.map( F, { 31, 4, 11 } ) == L( 36, 4 ) );
+	CHECK( m.realLine( F, 30, "'d' declared here" ) == 36 );
+	CHECK( m.realLine( F, 31, "'e' declared here" ) == 37 );
+}
+
 // The same line twice around a #line 1. cpp's first marker also says 1 and
 // fits as well; the directive's own marker is the one after the first line.
 TEST_CASE( "sourcemap: a #line 1 that repeats the first line" ) {

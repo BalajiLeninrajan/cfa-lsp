@@ -738,10 +738,13 @@ int score( const FileTable & ft, const Run & run, const Region & g ) {
 //
 // Where the marker sits rules some of them out. cpp prints a directive's
 // marker where it reads the directive, so the lines before the marker must lie
-// above the directive under the current numbering. cpp's own markers keep the
+// above the directive under the current numbering. All of them, not just the
+// last: after a live #line that numbers backwards, the old numbering puts the
+// lines after it above the directive again. cpp's own markers keep the
 // numbering going forward, so they can't put the next line at or above the
-// last one. A marker cpp prints around a system-header macro in the middle of
-// a line is followed by the rest of that line, and explains nothing.
+// last one. cpp prints a pair of markers around a system-header macro. The
+// first turns the system-header flag on, which a #line never does, and the
+// second is followed by the rest of the line. Neither explains anything.
 //
 // What is left is decided by the numbering under which the lines after the
 // marker match the original lines best. A marker that only the directive
@@ -778,15 +781,21 @@ std::vector<LineDirective> obeyedLines( const FileTable & ft, const std::string 
 		}
 		const Region mine = regionOf( d );
 		size_t pick = SIZE_MAX, tie = SIZE_MAX;
+		long top = -1;
+		size_t seen = start;
 		for ( size_t k = from; k < marks->size() && pick == SIZE_MAX; ++k ) {
 			const Mark & m = ( *marks )[k];
 			if ( !renames( m ) || m.number != d.number ) continue;
 			if ( m.before < ft.prep.size() && ft.prep[m.before].cont ) continue;	// inside a line
-			// The real line of the last line before the marker, under the
-			// current numbering.
+			if ( ( m.flags & 4 ) && k > 0 && !( ( *marks )[k - 1].flags & 4 ) ) continue;	// into a system-header macro
+			// The real lines before the marker, under the current numbering:
+			// the last one, and the one furthest down the file.
 			long last = -1;
-			if ( here && m.before > start ) last = under( *here, ft.prep[m.before - 1].presumed );
-			if ( last >= d.at ) continue;
+			if ( here ) {
+				for ( ; seen < m.before; ++seen ) top = std::max( top, under( *here, ft.prep[seen].presumed ) );
+				if ( m.before > start ) last = under( *here, ft.prep[m.before - 1].presumed );
+			}
+			if ( top >= d.at ) break;
 			const Run run = runAfter( ft, prep, k );
 			const int s = score( ft, run, mine );
 			bool shared = false;
