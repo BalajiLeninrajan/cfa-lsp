@@ -477,11 +477,13 @@ TEST_CASE( "sourcemap: nested macros, rescanning and macros in arguments" ) {
 	CHECK( m.inMacroBody( F, { 12, 17 } ) );
 	CHECK( m.map( F, 12, 25 ) == L( 11, 9 ) );
 	CHECK( m.inMacroBody( F, { 12, 25 } ) );
-	// A macro is not expanded again inside its own expansion.
+	// A macro is not expanded again inside its own expansion. The name it
+	// leaves is the one the source spells there.
 	CHECK( m.map( F, 13, 9 ) == L( 12, 9 ) );
-	CHECK( m.inMacroBody( F, { 13, 9 } ) );
+	CHECK_FALSE( m.inMacroBody( F, { 13, 9 } ) );
 	CHECK( m.inMacroBody( F, { 13, 15 } ) );
-	CHECK( m.inMacroBody( F, { 14, 9 } ) );
+	CHECK_FALSE( m.inMacroBody( F, { 14, 9 } ) );
+	CHECK( m.inMacroBody( F, { 14, 13 } ) );
 	CHECK( m.inMacroBody( F, { 14, 17 } ) );
 	// CALLER's body ends with G, which takes the ( tmp ) after CALLER.
 	CHECK( m.map( F, 15, 9 ) == L( 14, 17 ) );
