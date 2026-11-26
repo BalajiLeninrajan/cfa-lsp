@@ -598,6 +598,48 @@ TEST_CASE( "sourcemap: an #if around a header that isn't an include guard" ) {
 	CHECK( m.inMacroBody( F, { 4, 63 } ) );
 }
 
+// glibc's stdlib.h has #defines and #includes between its #ifndef _STDLIB_H
+// and its #define _STDLIB_H, and is still guarded. Were H1 to H4 taken to be
+// conditional, each would add "not defined" to the combinations tried before
+// M's second definition, and the redo would run out of attempts.
+TEST_CASE( "sourcemap: an include guard whose #define isn't its first directive" ) {
+	Files f;
+	f.text["/r/g.h"] =
+		"#ifndef G_H\n"
+		"#define G_PRE\n"
+		"#define G_H 1\n"
+		"#define H1 1\n"
+		"#define H2 2\n"
+		"#define H3 3\n"
+		"#define H4 4\n"
+		"#endif\n";
+	f.text["/r/main.cfa"] =
+		"#include \"g.h\"\n"
+		"#define OLD\n"
+		"#ifdef OLD\n"
+		"#define M tmp\n"
+		"#else\n"
+		"#define M\n"									// 5
+		"#endif\n"
+		"#define USE( a ) H1 + H2 + H3 + H4 + M * a\n"
+		"int f( int tmp ) { return USE( tmp ); }\n";
+	std::string prep =
+		"# 0 \"/r/main.cfa\"\n"
+		"# 0 \"<built-in>\"\n"
+		"# 0 \"<command-line>\"\n"
+		"# 1 \"/r/main.cfa\"\n"
+		"# 1 \"/r/g.h\" 1\n"
+		"# 2 \"/r/main.cfa\" 2\n"
+		"\n\n\n\n\n\n\n"
+		"int f( int tmp ) { return 1 + 2 + 3 + 4 + tmp * tmp; }\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/main.cfa";
+	CHECK( m.map( F, 9, 42 ) == L( 8, 26 ) );
+	CHECK( m.inMacroBody( F, { 9, 42 } ) );
+	CHECK( m.map( F, 9, 48 ) == L( 8, 31 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 9, 48 } ) );
+}
+
 // The alignment can give a macro use the wrong tokens: two uses side by side,
 // a body that ends in a function-like macro name, which takes the ( ... )
 // after the use, or a use whose arguments it matched one by one. The redo
@@ -712,7 +754,9 @@ TEST_CASE( "sourcemap: cut uses of macros with more than one definition" ) {
 }
 
 // A macro that expands to its own name, as glibc's stdin, stdout and stderr
-// do, leaves the name the source spells in an argument.
+// do, leaves the name the source spells in an argument. So does one whose
+// body calls the function of the same name, as glibc's tolower( c ) does
+// with optimization on.
 TEST_CASE( "sourcemap: a macro that expands to its own name" ) {
 	Files f;
 	f.text["/r/self.cfa"] =
@@ -720,12 +764,17 @@ TEST_CASE( "sourcemap: a macro that expands to its own name" ) {
 		"#define OUT stdout\n"
 		"#define CHECK( e ) if ( ( e ) != 0 ) abort()\n"
 		"void f() { CHECK( fflush( stdout ) ); }\n"
-		"void g() { CHECK( fflush( OUT ) ); }\n";
+		"void g() { CHECK( fflush( OUT ) ); }\n"
+		"#define body( c, f ) ( { int r; if ( c < 0 ) r = c; else r = f ( c ); r; } )\n"	// 5
+		"#define lower( c ) body( c, lower )\n"
+		"int d = lower( x );\n";
 	std::string prep =
 		"# 1 \"/r/self.cfa\"\n"
 		"\n\n\n"
 		"void f() { if ( ( fflush( stdout ) ) != 0 ) abort(); }\n"
-		"void g() { if ( ( fflush( stdout ) ) != 0 ) abort(); }\n";
+		"void g() { if ( ( fflush( stdout ) ) != 0 ) abort(); }\n"
+		"\n\n"
+		"int d = ( { int r; if ( x < 0 ) r = x; else r = lower ( x ); r; } );\n";
 	SourceMap m( prep, f.reader() );
 	const std::string F = "/r/self.cfa";
 	CHECK( m.map( F, 4, 18 ) == L( 3, 18 ) );
@@ -737,6 +786,61 @@ TEST_CASE( "sourcemap: a macro that expands to its own name" ) {
 	// Here stdout is OUT's body.
 	CHECK( m.map( F, 5, 26 ) == L( 4, 26 ) );
 	CHECK( m.inMacroBody( F, { 5, 26 } ) );
+	// The lower that body calls is the source's, and only its name.
+	CHECK( m.mapRange( F, 8, 48, 8, 53 ) == Range{ L( 7, 8 ), L( 7, 13 ) } );
+	CHECK_FALSE( m.inMacroBody( F, { 8, 48 } ) );
+	CHECK( m.map( F, 8, 56 ) == L( 7, 15 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 8, 56 } ) );
+	CHECK( m.inMacroBody( F, { 8, 16 } ) );
+}
+
+// An empty use followed by the tokens another definition's body would give
+// gives nothing, even when nothing follows them on the line, or a macro use
+// follows that can't give the rest.
+TEST_CASE( "sourcemap: a cut use that would take the source's own tokens" ) {
+	Files f;
+	f.text["/r/own.cfa"] =
+		"#define OFF_ON\n"									// 0
+		"#ifndef OFF_ON\n"
+		"#define OFF( x ) check( x );\n"
+		"#else\n"
+		"#define OFF( x )\n"
+		"#endif\n"											// 5
+		"#ifndef OFF_ON\n"
+		"#define A x B\n"
+		"#else\n"
+		"#define A x\n"
+		"#endif\n"											// 10
+		"#define B y\n"
+		"void check( int );\n"
+		"void g( int y ) {\n"
+		"\tOFF( y ) check( y );\n"
+		"}\n"												// 15
+		"A B\n"
+		"A B ;\n";
+	std::string prep =
+		"# 1 \"/r/own.cfa\"\n"
+		"# 13 \"/r/own.cfa\"\n"
+		"void check( int );\n"
+		"void g( int y ) {\n"
+		" check( y );\n"
+		"}\n"
+		"x y\n"
+		"x y ;\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/own.cfa";
+	CHECK( m.map( F, 15, 1 ) == L( 14, 10 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 15, 1 } ) );
+	CHECK( m.map( F, 15, 8 ) == L( 14, 17 ) );
+	// A gave x and B gave y.
+	CHECK( m.map( F, 17, 0 ) == L( 16, 0 ) );
+	CHECK( m.inMacroBody( F, { 17, 0 } ) );
+	CHECK( m.map( F, 17, 2 ) == L( 16, 2 ) );
+	CHECK( m.inMacroBody( F, { 17, 2 } ) );
+	CHECK( m.map( F, 18, 2 ) == L( 17, 2 ) );
+	CHECK( m.inMacroBody( F, { 18, 2 } ) );
+	CHECK( m.map( F, 18, 4 ) == L( 17, 4 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 18, 4 } ) );
 }
 
 TEST_CASE( "sourcemap: __VA_OPT__" ) {

@@ -266,7 +266,7 @@ struct XTok {
 class Expander {
   public:
 	Expander( const std::vector<Token> & O, const std::vector<PTok> & P, size_t pb, size_t pe, const DefineLookup & defines )
-		: O( O ), P( P ), pb( pb ), pe( pe ), defines( defines ) {}
+		: Expander( O, P, pb, pe, defines, P[pb].pline ) {}
 
 	// Expands O[ob, oe) and compares the result with P[pb, pe). On a match,
 	// from[i] is where P[pb + i] came from.
@@ -275,10 +275,10 @@ class Expander {
 	// Expands the macro use that starts at O[ob], with as many of the tokens
 	// before O[oe] as it takes, and compares the result with the start of
 	// P[pb, pe). Of the combinations of definitions that match, and after
-	// which the rest can still align, takes the one that gives the most
-	// tokens. On a match, from is as above (empty when the use gives nothing)
-	// and `stop` is the use's end in O. False when nothing matches or O[ob]
-	// isn't a macro.
+	// which the source's next tokens can still give the rest, takes the one
+	// that gives the most tokens. On a match, from is as above (empty when
+	// the use gives nothing) and `stop` is the use's end in O. False when
+	// nothing matches or O[ob] isn't a macro.
 	bool prefix( size_t ob, size_t oe, std::vector<Origin> & from, size_t & stop );
 
   private:
@@ -286,6 +286,12 @@ class Expander {
 	static constexpr size_t MaxWork = 200000;		// tokens scanned per attempt
 	static constexpr size_t MaxTokens = 100000;		// in an expanded argument
 	static constexpr int MaxDepth = 100;			// arguments within arguments
+
+	// Looks up definitions at preprocessed line `line`, which P[pb] may not
+	// exist to give when pb == pe.
+	Expander( const std::vector<Token> & O, const std::vector<PTok> & P, size_t pb, size_t pe, const DefineLookup & defines,
+			  int line )
+		: O( O ), P( P ), pb( pb ), pe( pe ), line( line ), defines( defines ) {}
 
 	struct Name {
 		std::vector<const Define *> defs;			// likeliest first; empty when never defined
@@ -297,6 +303,7 @@ class Expander {
 	const std::vector<Token> & O;
 	const std::vector<PTok> & P;
 	const size_t pb, pe;
+	const int line;
 	const DefineLookup & defines;
 	std::unordered_map<std::string, Name> names;
 	std::vector<Name *> choices;					// names with more than one definition, in the order met
@@ -310,6 +317,7 @@ class Expander {
 	const Define * lookup( const std::string & name );
 	int idOf( const std::string & name );
 	bool followed( size_t p, size_t o, size_t oe );
+	bool starts( size_t ob, size_t oe );
 	template<typename Take>
 	void search( size_t ob, size_t oe, Take take );
 	bool emit( XTok t, std::vector<XTok> & out, bool top );
@@ -323,7 +331,7 @@ class Expander {
 const Define * Expander::lookup( const std::string & name ) {
 	auto [it, added] = names.try_emplace( name );
 	if ( added ) {
-		it->second.defs = defines( name, P[pb].pline );
+		it->second.defs = defines( name, line );
 		if ( it->second.defs.size() > 1 ) choices.push_back( &it->second );
 	}
 	const Name & n = it->second;
@@ -380,18 +388,26 @@ bool Expander::run( size_t ob, size_t oe, std::vector<Origin> & from ) {
 	return found;
 }
 
-// Whether the rest can align after a use that gave P[pb, p) and ends at O[o]:
-// cpp printed nothing more, the tokens after O[oe] aren't known, or P[p] is
-// O[o] itself or can come from a macro use at O[o].
+// Whether the source's tokens from O[o] on can give what cpp printed after a
+// use that gave P[pb, p): the tokens after O[oe] aren't known, P[p] is O[o]
+// itself, or a macro use at O[o] can give the start of P[p, pe) or nothing.
+// When cpp printed nothing more, O[o] has to be a use that gives nothing.
 bool Expander::followed( size_t p, size_t o, size_t oe ) {
-	if ( p == pe || o >= oe ) return true;
-	if ( O[o].text == P[p].tok.text ) return true;
+	if ( o >= oe ) return true;
+	if ( p < pe && O[o].text == P[p].tok.text ) return true;
 	if ( O[o].kind != TokKind::Identifier ) return false;
-	if ( madeUpByCpp( O[o].text ) ) return true;
-	for ( const Define * d : defines( O[o].text, P[pb].pline ) ) {
-		if ( d ) return true;
-	}
-	return false;
+	if ( madeUpByCpp( O[o].text ) ) return p < pe;
+	return Expander( O, P, p, pe, defines, line ).starts( o, oe );
+}
+
+// Whether the macro use at O[ob] gives the start of P[pb, pe), or nothing,
+// with some combination of definitions.
+bool Expander::starts( size_t ob, size_t oe ) {
+	prefixMode = true;
+	first = ob;
+	bool found = false;
+	search( ob, oe, [&]( const std::vector<XTok> & ) { return found = true; } );
+	return found;
 }
 
 bool Expander::prefix( size_t ob, size_t oe, std::vector<Origin> & from, size_t & stop ) {
@@ -400,8 +416,8 @@ bool Expander::prefix( size_t ob, size_t oe, std::vector<Origin> & from, size_t 
 	// The first match isn't enough: when two uses sit side by side, a shorter
 	// body (or an empty one) can match the start of what the first use gave.
 	// So every combination is tried. A longer match that leaves a token the
-	// source can't account for, as when an empty use is followed by the
-	// tokens a longer body would give, is passed over.
+	// source can't give, as when an empty use is followed by the tokens a
+	// longer body would give, is passed over.
 	bool found = false;
 	search( ob, oe, [&]( const std::vector<XTok> & out ) {
 		size_t end = std::min( stopAt, oe );
@@ -761,14 +777,16 @@ void Aligner::redone( size_t pb, size_t pe, size_t ob, size_t oe, const std::vec
 		m.start = m.outerStart = invStart;
 		m.end = m.outerEnd = invEnd;
 		const Origin & f = from[p - pb];
-		// A macro that expands to its own name (glibc's #define stdout
-		// stdout) leaves the name the source spells there.
-		m.body = f.body && !( f.b >= 0 && f.e == f.b + 1 && O[f.b].text == P[p].tok.text );
+		// A macro whose body has its own name (glibc's #define stdout stdout,
+		// or tolower( c ), whose body calls the function tolower) leaves the
+		// name the source spells at the start of the use.
+		const bool own = f.b >= 0 && O[f.b].text == P[p].tok.text;
+		m.body = f.body && !own;
 		// An identifier maps to the argument it was copied from, or for
 		// one from a body, to the invocation in an argument that made it.
 		if ( P[p].tok.kind == TokKind::Identifier && f.b >= 0 ) {
 			m.start = startOf( O[f.b] );
-			m.end = endOf( O[f.e - 1] );
+			m.end = endOf( O[own ? f.b : f.e - 1] );
 		}
 	}
 }
@@ -1154,8 +1172,9 @@ std::string guardName( std::string_view rest, bool ifndef ) {
 // and #line. The lexer finds them, so a directive inside a comment is skipped.
 // Conditionals are not evaluated, but a #define or #undef inside one is marked
 // `conditional`: it may not have happened. An include guard doesn't count: an
-// #ifndef X (or #if !defined X) whose next directive is #define X, around
-// everything else in the file, with no #else.
+// #ifndef X (or #if !defined X) with a #define X directly inside it, around
+// everything else in the file, with no #else. glibc's stdlib.h has other
+// #defines and #includes before its #define _STDLIB_H.
 Directives scanDirectives( std::string_view text ) {
 	Directives out;
 	LexOptions opts;
@@ -1163,9 +1182,9 @@ Directives scanDirectives( std::string_view text ) {
 	int depth = 0;
 	std::vector<int> depths;			// per entry of out.defines
 	// The first #if at depth 0, if no #define or #undef comes before it.
-	// Tested when it asks whether a name is undefined, Open once the next
-	// directive defines that name, and a guard (Closed) at its #endif, unless
-	// it has an #else or anything follows it.
+	// Tested when it asks whether a name is undefined, Open once a #define
+	// directly inside it defines that name, and a guard (Closed) at its
+	// #endif, unless it has an #else or anything follows it.
 	enum { None, Tested, Open, Closed, NotGuard } guard = None;
 	std::string guarded;
 	for ( const Token & t : lex( text, opts ) ) {
@@ -1176,8 +1195,6 @@ Directives scanDirectives( std::string_view text ) {
 		size_t k = i;
 		while ( k < l.size() && identChar( l[k] ) ) ++k;
 		const std::string_view word = std::string_view( l ).substr( i, k - i );
-		const bool tested = guard == Tested;
-		if ( tested ) guard = NotGuard;
 		if ( word == "if" || word == "ifdef" || word == "ifndef" ) {
 			if ( depth == 0 ) {
 				if ( guard == None && word != "ifdef" ) {
@@ -1188,7 +1205,7 @@ Directives scanDirectives( std::string_view text ) {
 			}
 			++depth;
 		} else if ( word == "endif" ) {
-			if ( depth > 0 && --depth == 0 && guard == Open ) guard = Closed;
+			if ( depth > 0 && --depth == 0 ) guard = guard == Open ? Closed : NotGuard;
 		} else if ( word == "else" || word == "elif" || word == "elifdef" || word == "elifndef" ) {
 			if ( depth == 1 ) guard = NotGuard;
 		} else {
@@ -1196,7 +1213,7 @@ Directives scanDirectives( std::string_view text ) {
 			parseDirective( l, t.line, out );
 			if ( out.defines.size() > before ) {
 				const Define & d = out.defines.back();
-				if ( tested && !d.undef && d.name == guarded ) guard = Open;
+				if ( guard == Tested && depth == 1 && !d.undef && d.name == guarded ) guard = Open;
 				if ( depth == 0 ) guard = NotGuard;
 				depths.push_back( depth );
 			}

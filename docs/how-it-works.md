@@ -123,9 +123,10 @@ none, until one gives what cpp printed. The redo also decides where a use
 ends, so two uses side by side, or a body that ends in a function-like macro
 name and takes the `( ... )` after the use, map right. A name from the body
 maps to the whole invocation, and isn't a reference or a declaration name,
-because your file doesn't spell it there. A macro that expands to its own
-name, like glibc's `stdout`, is the exception: in an argument, your file does
-spell it. The expansion can't be redone for
+because your file doesn't spell it there. A body that has the macro's own
+name is the exception, like glibc's `stdout`, or `tolower( c )`, which calls
+the function `tolower` when optimization is on. Your file spells that name,
+so it maps to the name at the start of the use. The expansion can't be redone for
 a body that uses a macro cpp predefines, such as `__INT_MAX__`, or for
 `__VA_OPT__` when the variable arguments are there but expand to nothing,
 where gcc versions may not agree. Such an identifier then maps to the argument
