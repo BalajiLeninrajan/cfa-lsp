@@ -450,7 +450,7 @@ TEST_CASE( "sourcemap: a skipped #line with the number of a system-header marker
 				 "\n\n\n"
 				 "int h(void) { return 1; }\n",
 				 f.reader() );
-	CHECK( m.outputLines( F ) == ( std::vector<int>{ 1, 2, 3, 3, 4, 8 } ) );
+	CHECK( m.outputLines( F ) == ( std::vector<int>{ 1, 2, 3, 4, 8 } ) );
 	CHECK( m.map( F, 9, 4 ) == L( 8, 4 ) );
 	CHECK( m.realLine( F, 4 ) == 4 );
 	CHECK( m.realLine( F, 9 ) == 9 );
