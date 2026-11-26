@@ -103,6 +103,9 @@ struct LineDirective {
 	int at;							// 0-based line of the directive
 	int number;						// the 1-based line it gives the next line
 	std::optional<std::string> file;
+	// When obeyedLines matched it to a marker of this file: how many of the
+	// file's PrepLines come before that marker.
+	size_t before = SIZE_MAX;
 };
 
 struct Directives {
@@ -774,6 +777,7 @@ std::vector<LineDirective> obeyedLines( const FileTable & ft, const std::string 
 			}
 			if ( later ) break;
 			out.push_back( d );
+			out.back().before = ( *marks )[k].before;
 			from = k + 1;
 			current = name;
 			here = mine;
@@ -796,11 +800,18 @@ void remapLines( FileTable & ft, const std::string & name, const std::vector<Lin
 	// region from the current one on that puts it after the previous line. A
 	// line number that two regions share is then taken from the right one.
 	// Failing that (a header included again starts over), the first region
-	// that has the line number.
+	// that has the line number. Past the marker a directive was matched to,
+	// the search starts at the directive's region: after a #line that numbers
+	// backwards, an earlier region would also put the line after the previous
+	// one.
 	auto actual = [&]( size_t k, int presumed ) { return ft.regions[k].actual + ( presumed - ft.regions[k].presumed ); };
-	size_t r = 0;
+	size_t r = 0, d = 0;
 	int prev = -1;
-	for ( PrepLine & pl : ft.prep ) {
+	for ( size_t p = 0; p < ft.prep.size(); ++p ) {
+		PrepLine & pl = ft.prep[p];
+		for ( ; d < dirs.size() && ( dirs[d].before == SIZE_MAX || dirs[d].before <= p ); ++d ) {
+			if ( dirs[d].before != SIZE_MAX ) r = d + 1;
+		}
 		if ( pl.cont ) {
 			pl.line = prev >= 0 ? prev : pl.line;
 			continue;
