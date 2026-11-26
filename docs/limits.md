@@ -43,9 +43,9 @@
 - If the translator fails an internal assertion or crashes, the check reports
   `internal translator error` on line 1, and unless the crash came after
   resolution the previous results stay in use.
-- The formatter counts braces in every branch of an `#if`, so branches that
-  each open a brace (two versions of a function header) indent what follows
-  one level too deep.
+- The formatter carries on after `#endif` from the end of an `#if`'s first
+  branch. When the branches leave different numbers of braces open, the lines
+  after `#endif` are indented for the first branch.
 - The `#include` fix knows the names declared at file scope in the `.hfa`
   files of `<prefix>/include/cfa` and its `concurrency/` and `collections/`
   directories, found by scanning their tokens, so names that only a macro
