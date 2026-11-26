@@ -245,6 +245,20 @@ const json * diagnosticOn( const Run & r, int line, const std::string & severity
 	return nullptr;
 }
 
+// What a ref to a declaration named `name` can spell: the name, the name after ?` for a postfix call (v`len), or the
+// operator of an operator call (+ for ?+?, ++ for ?++, [ for ?[?], { for ?{}).
+std::set<std::string> refSpellings( const std::string & name ) {
+	std::set<std::string> out = { name };
+	if ( name.rfind( "?`", 0 ) == 0 ) out.insert( name.substr( 2 ) );
+	if ( name == "?[?]" ) out.insert( "[" );
+	else if ( name == "?()" ) out.insert( "(" );
+	else if ( name == "?{}" ) out.insert( "{" );
+	else if ( name.size() >= 3 && name.front() == '?' && name.back() == '?' ) out.insert( name.substr( 1, name.size() - 2 ) );
+	else if ( name.size() >= 2 && name.back() == '?' ) out.insert( name.substr( 0, name.size() - 1 ) );
+	else if ( name.size() >= 2 && name.front() == '?' ) out.insert( name.substr( 1 ) );
+	return out;
+}
+
 // Invariants of every dump: unique ids, refs to present non-generated decls, refs in the focus file.
 void checkInvariants( const Run & r ) {
 	const json & decls = r.dump["decls"];
@@ -259,16 +273,28 @@ void checkInvariants( const Run & r ) {
 		CHECK( ref["file"] == r.file );
 		std::string role = ref["role"];
 		CHECK( std::set<std::string>{ "read", "call", "member", "type", "with" }.count( role ) );
-		// A ref is a token the translator read, so it has its line in the input, and its columns are on that line.
+		// A ref is a token the translator read, so it has its line in the input, and the text there spells the
+		// declaration's name. Blanks inside the range are left out, as the translator does, so "?{ }" spells ?{}.
 		INFO( "ref " << ref.dump() );
+		INFO( "decl " << decls[id].dump() );
 		REQUIRE( ref.contains( "pline" ) );
 		CHECK( ref["endPline"] == ref["pline"] );
+		CHECK( ref["endLine"] == ref["line"] );
 		int pline = ref["pline"];
 		REQUIRE( pline >= 1 );
 		REQUIRE( pline <= (int)r.input.size() );
 		const std::string & text = r.input[pline - 1];
+		INFO( "input line " << pline << ": " << text );
 		CHECK( ( text.empty() || text[0] != '#' ) );
-		CHECK( ref["endCol"].get<int>() <= (int)text.size() );
+		int col = ref["col"], endCol = ref["endCol"];
+		REQUIRE( 0 <= col );
+		REQUIRE( col < endCol );
+		REQUIRE( endCol <= (int)text.size() );
+		std::string word;
+		for ( char c : text.substr( col, endCol - col ) ) {
+			if ( c != ' ' && c != '\t' ) word += c;
+		}
+		CHECK_MESSAGE( refSpellings( decls[id]["name"] ).count( word ), "the ref spells " << word );
 	}
 	for ( const json & d : decls ) {
 		for ( const char * link : { "parent", "typeDecl" } ) {
@@ -598,6 +624,71 @@ TEST_CASE( "translator: macros and irregular spacing (lines only)" ) {
 	REQUIRE( p->contains( "pline" ) );
 	CHECK( (*p)["pline"].get<int>() < pline );
 	CHECK( (*p)["endPline"].get<int>() >= pline );
+}
+
+TEST_CASE( "translator: a header included twice and a #line give a second copy of a line" ) {
+	const Run * r = run( "line_markers.cfa" );
+	if ( ! r ) return;
+	checkInvariants( *r );
+	INFO( "diagnostics: " << r->dump["diagnostics"].dump() );
+	CHECK( r->dump["complete"] == true );
+	auto inHeader = []( const json & d ) {
+		std::string file = d["file"];
+		return file.size() > 8 && file.compare( file.size() - 8, 8, "/twice.h" ) == 0;
+	};
+	// Each copy of twice.h declares its own name on line 2, so the second name is spelled only in the second copy.
+	// The translator keeps both copies and finds each name in its own by pline.
+	std::map<std::string, const json *> header;
+	for ( const char * name : { "alpha", "alpha_again" } ) {
+		for ( const json * d : declsNamed( *r, name ) ) {
+			if ( inHeader( *d ) ) header[name] = d;
+		}
+	}
+	REQUIRE( header.size() == 2 );
+	for ( const auto & [name, d] : header ) {
+		CAPTURE( name );
+		INFO( "decl " << d->dump() );
+		const json & range = (*d)["nameRange"];
+		CHECK_FALSE( (*d)["generated"].get<bool>() );
+		CHECK( range["line"] == 2 );
+		REQUIRE( range.contains( "pline" ) );
+		int pline = range["pline"];
+		REQUIRE( pline >= 1 );
+		REQUIRE( pline <= (int)r->input.size() );
+		CHECK( r->input[pline - 1].substr( range["col"].get<int>(), name.size() ) == name );
+		// main uses both, on the line the #line numbers 10.
+		bool used = false;
+		for ( const json & ref : r->dump["refs"] ) {
+			if ( ref["line"] == 10 && ref["decl"] == (*d)["id"] ) used = true;
+		}
+		CHECK_MESSAGE( used, "refs on line 10:" << refsOn( *r, 10 ) );
+	}
+	CHECK( header["alpha"]->at( "nameRange" )["pline"] < header["alpha_again"]->at( "nameRange" )["pline"] );
+
+	// `#line 8` repeats line 8 with no switch to or from a system header, so the line after it is a second copy of
+	// line 8, not a second piece of the first. The first copy has a + after the column where `first` ends in the
+	// second, so the + of `first + second` on the next line is only the one operator in between when the
+	// translator looks in the second copy alone.
+	const json * first = nullptr;
+	for ( const json * d : declsNamed( *r, "first" ) ) {
+		if ( (*d)["file"] == r->file ) first = d;
+	}
+	REQUIRE( first );
+	CHECK( (*first)["nameRange"]["line"] == 8 );
+	const json * use = nullptr;
+	for ( const json & ref : r->dump["refs"] ) {
+		if ( ref["line"] == 8 && ref["decl"] == (*first)["id"] ) use = &ref;
+	}
+	INFO( "refs on line 8:" << refsOn( *r, 8 ) );
+	REQUIRE( use );
+	CHECK( (*use)["pline"].get<int>() > (*first)["nameRange"]["pline"].get<int>() );
+	INFO( "refs on line 9:" << refsOn( *r, 9 ) );
+	const json * plus = refAt( *r, 9, 0 );
+	REQUIRE( plus );
+	CHECK( (*plus)["endCol"] == 1 );
+	const json * add = declById( *r, (*plus)["decl"] );
+	REQUIRE( add );
+	CHECK( (*add)["name"] == "?+?" );
 }
 
 TEST_CASE( "translator: syntax error" ) {

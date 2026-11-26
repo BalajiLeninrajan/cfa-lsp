@@ -102,7 +102,10 @@ _Bool
 and `positive` is at line 8, column 4 (of the second piece). Its `pline` is
 the line of `    positive( int v );` in the input, which says which piece the
 column is in. A header included twice (without a guard) also gives two input
-lines for one (`file`, `line`), and `pline` tells the copies apart.
+lines for one (`file`, `line`), and `pline` tells the copies apart. So does a
+`#line` that goes back to a number already used. Its marker repeats the line
+number without switching flag 3 on or off, which is how a second copy is told
+from a second piece.
 
 The translator writes `pline` for every position it read from the input file.
 It is missing where the translator only knows a line (a diagnostic without a
