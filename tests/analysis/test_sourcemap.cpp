@@ -410,6 +410,96 @@ TEST_CASE( "sourcemap/cfa: macro bodies" ) {
 	CHECK( at( 18, "tmp", 1 ) == origAt( T, 18, "WRAP" ) );
 }
 
+// A #define after the use or in a dead #if branch, macro uses side by side or
+// that take the ( ... ) after them, GNU's comma rule and __VA_OPT__.
+TEST_CASE( "sourcemap/cfa: late definitions, dead branches and uses the alignment cuts" ) {
+	if ( !haveCfa() ) { MESSAGE( "cfa not on PATH; skipping" ); return; }
+	TempDir work;
+	REQUIRE( !work.path.empty() );
+	fs::path real = work.path / "src" / "late.cfa";
+	const std::string text =
+		"#define SWAP( a, b ) { int tmp = a; a = b; b = tmp; check( tmp ); }\n"	// 1
+		"void check( int );\n"
+		"void f( int x, int tmp ) { SWAP( x, tmp ); }\n"
+		"#define check( v ) ((void)0)\n"
+		"#define N 10\n"															// 5
+		"#ifdef BIG\n"
+		"#undef N\n"
+		"#define N 100\n"
+		"#define EXTRA + tmp\n"
+		"#endif\n"																	// 10
+		"#define S( a, b ) { int tmp = a; a = b; b = tmp + N; }\n"
+		"#define T( a ) a + tmp EXTRA\n"
+		"void h( int x, int tmp ) { S( x, tmp ); }\n"
+		"int t = T( tmp );\n"
+		"#define SW( a, b ) { int tmp = a; a = b; b = tmp; }\n"						// 15
+		"#define PICK( n ) SW\n"
+		"#define TWO( a ) a + tmp\n"
+		"#define LOG( f, ... ) out( f, ## __VA_ARGS__ ) + tmp\n"
+		"#define LOG1( ... ) out( 1, ## __VA_ARGS__ ) + tmp\n"
+		"#define V( f, ... ) out( f __VA_OPT__(,) __VA_ARGS__ ) + tmp\n"			// 20
+		"void k( int x, int tmp ) { PICK( 2 )( x, tmp ); }\n"
+		"int u = TWO( tmp ) TWO( y );\n"
+		"int g( int tmp ) { return LOG( tmp, ) + LOG1() + LOG1( 2 ); }\n"
+		"int v( int tmp ) { return V( tmp ) + V( tmp, 2 ); }\n";
+	spit( real, text );
+	auto prep = preprocess( real, text, work.path );
+	REQUIRE( prep );
+	const std::string F = real.string();
+	const std::string & T = text;
+	SourceMap m( *prep, diskReader() );
+	auto P = prepLines( *prep, F );
+	auto at = [&]( int line, const std::string & word, int nth ) { return m.map( F, line, prepCol( P, line, word, nth ) ); };
+	auto body = [&]( int line, const std::string & word, int nth ) {
+		return m.inMacroBody( F, { line, prepCol( P, line, word, nth ) } );
+	};
+
+	// { int tmp = x; x = tmp; tmp = tmp; check( tmp ); }: check is defined
+	// only after the use.
+	CHECK( at( 3, "tmp", 1 ) == origAt( T, 3, "SWAP" ) );
+	CHECK( body( 3, "tmp", 1 ) );
+	CHECK( at( 3, "tmp", 2 ) == origAt( T, 3, "tmp", 1 ) );
+	CHECK_FALSE( body( 3, "tmp", 2 ) );
+	CHECK( at( 3, "tmp", 5 ) == origAt( T, 3, "SWAP" ) );
+	CHECK( body( 3, "tmp", 5 ) );
+	// tmp + 10: the N before the #ifdef BIG.
+	CHECK( at( 13, "tmp", 1 ) == origAt( T, 13, "S" ) );
+	CHECK( body( 13, "tmp", 1 ) );
+	CHECK( at( 13, "tmp", 2 ) == origAt( T, 13, "tmp", 1 ) );
+	CHECK( body( 13, "10", 0 ) );
+	// tmp + tmp EXTRA: EXTRA was never defined.
+	CHECK( at( 14, "tmp", 0 ) == origAt( T, 14, "tmp" ) );
+	CHECK( at( 14, "tmp", 1 ) == origAt( T, 14, "T" ) );
+	CHECK( body( 14, "tmp", 1 ) );
+	// PICK( 2 ) gives SW, which takes ( x, tmp ).
+	CHECK( at( 21, "tmp", 1 ) == origAt( T, 21, "PICK" ) );
+	CHECK( body( 21, "tmp", 1 ) );
+	CHECK( at( 21, "tmp", 2 ) == origAt( T, 21, "tmp", 1 ) );
+	CHECK_FALSE( body( 21, "tmp", 2 ) );
+	CHECK( at( 21, "x", 1 ) == origAt( T, 21, "x", 1 ) );
+	// tmp + tmp y + tmp
+	CHECK( at( 22, "tmp", 0 ) == origAt( T, 22, "tmp" ) );
+	CHECK( at( 22, "tmp", 1 ) == origAt( T, 22, "TWO", 0 ) );
+	CHECK( body( 22, "tmp", 1 ) );
+	CHECK( at( 22, "y", 0 ) == origAt( T, 22, "y" ) );
+	CHECK( at( 22, "tmp", 2 ) == origAt( T, 22, "TWO", 1 ) );
+	// out( tmp, ) + tmp + out( 1 ) + tmp + out( 1, 2 ) + tmp
+	CHECK( at( 23, "tmp", 1 ) == origAt( T, 23, "tmp", 1 ) );
+	CHECK_FALSE( body( 23, "tmp", 1 ) );
+	CHECK( at( 23, "tmp", 2 ) == origAt( T, 23, "LOG" ) );
+	CHECK( body( 23, "tmp", 2 ) );
+	CHECK( at( 23, "tmp", 3 ) == origAt( T, 23, "LOG1", 0 ) );
+	CHECK( at( 23, "tmp", 4 ) == origAt( T, 23, "LOG1", 1 ) );
+	// out( tmp ) + tmp + out( tmp, 2 ) + tmp
+	CHECK( at( 24, "tmp", 1 ) == origAt( T, 24, "tmp", 1 ) );
+	CHECK_FALSE( body( 24, "tmp", 1 ) );
+	CHECK( at( 24, "tmp", 2 ) == origAt( T, 24, "V", 0 ) );
+	CHECK( body( 24, "tmp", 2 ) );
+	CHECK( at( 24, "tmp", 3 ) == origAt( T, 24, "tmp", 2 ) );
+	CHECK( at( 24, "tmp", 4 ) == origAt( T, 24, "V", 1 ) );
+	CHECK( body( 24, "tmp", 4 ) );
+}
+
 TEST_CASE( "sourcemap/cfa: CFA syntax" ) {
 	if ( !haveCfa() ) { MESSAGE( "cfa not on PATH; skipping" ); return; }
 	Case c( "cfa.cfa",

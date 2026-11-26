@@ -114,16 +114,20 @@ reads the file's directives to get the real lines back.
 
 To tell an identifier in a macro's body from the same name passed as an
 argument (`tmp` in `SWAP( x, tmp )` when the body declares its own `tmp`),
-the server redoes the expansion the way cpp does: `#`, `##`, macros in the
-body and in the arguments, and GNU's `, ## __VA_ARGS__`. It uses the
-`#define` cpp had read by that point, from any file in the include graph,
-after any `#undef` or redefinition. It doesn't evaluate `#if`, so when a
-macro is defined in several branches it tries each definition until one
-gives what cpp printed. A name from the body maps to the whole invocation,
-and isn't a reference or a declaration name, because your file doesn't spell
-it there. The expansion can't be redone for a body with `__VA_OPT__` or one
-that uses a macro cpp predefines, such as `__INT_MAX__`. Such an identifier
-then maps to the argument with the same name.
+the server redoes the expansion the way cpp does: `#`, `##`, `__VA_OPT__`,
+macros in the body and in the arguments, and GNU's `, ## __VA_ARGS__`. It
+uses the `#define` cpp had read by that point, from any file in the include
+graph, after any `#undef` or redefinition. It doesn't evaluate `#if`, so for
+a `#define` or `#undef` inside one it also tries the definition before it, or
+none, until one gives what cpp printed. The redo also decides where a use
+ends, so two uses side by side, or a body that ends in a function-like macro
+name and takes the `( ... )` after the use, map right. A name from the body
+maps to the whole invocation, and isn't a reference or a declaration name,
+because your file doesn't spell it there. The expansion can't be redone for
+a body that uses a macro cpp predefines, such as `__INT_MAX__`, or for
+`__VA_OPT__` when the variable arguments are there but expand to nothing,
+where gcc versions may not agree. Such an identifier then maps to the argument
+with the same name.
 
 ## Formatting
 
