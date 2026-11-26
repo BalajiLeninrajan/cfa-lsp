@@ -457,3 +457,30 @@ TEST_CASE( "sourcemap: lines too long for one alignment table" ) {
 	int xo = int( o2.find( "X(399)" ) ) - 21;
 	CHECK( m2.mapRange( "/r/mac.cfa", 2, x, 2, x + 1 ) == Range{ L( 1, xo ), L( 1, xo + 6 ) } );
 }
+
+// The server takes #line directives out of the files it writes for cpp. Each
+// one leaves only its line breaks.
+TEST_CASE( "blankLineDirectives" ) {
+	CHECK( blankLineDirectives( "int a;\n#line 10\nint b;\n" ) == "int a;\n\nint b;\n" );
+	CHECK( blankLineDirectives( "  #  line 3 \"x.c\"\n# 7 \"y.c\" 1 3\n#line N\n#\tline 4\n" ) == "  \n\n\n\n" );
+	CHECK( blankLineDirectives( "#line 5" ) == "" );
+	CHECK( blankLineDirectives( "\r\n#line 5\r\nint a;\r\n" ) == "\r\n\nint a;\r\n" );
+	// Inside #if 0 too: cpp skips it there anyway.
+	CHECK( blankLineDirectives( "#if 0\n#line 5\n#endif\n" ) == "#if 0\n\n#endif\n" );
+	// A continued directive, and a block comment in one, keep their lines.
+	CHECK( blankLineDirectives( "#line \\\n 5\nint a;\n" ) == "\n\nint a;\n" );
+	CHECK( blankLineDirectives( "#line 5 /* a\nb */\nint a;\n" ) == "\n\nint a;\n" );
+	CHECK( blankLineDirectives( "/**/ #line 5\nint a;\n" ) == "/**/ \nint a;\n" );
+	// None of these is a #line.
+	const std::string keep =
+		"/*\n#line 5\n*/\n"
+		"// #line 6\n"
+		"const char * s = \"\\\n#line 7\";\n"
+		"#lineno 8\n"
+		"#pragma line 9\n"
+		"#define line 10\n"
+		"int x; # line 11\n"
+		"#\n"
+		"#include \"line.h\"\n";
+	CHECK( blankLineDirectives( keep ) == keep );
+}

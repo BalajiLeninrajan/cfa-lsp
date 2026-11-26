@@ -538,7 +538,13 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 	const std::string dir = fr.tmp->path();
 	const std::string in = dir + "/in.cfa";
 	const std::string cwd = fs::path( req.path ).parent_path().string();
-	if ( ! writeFile( in, "# 1 \"" + quoteForMarker( req.path ) + "\"\n" + req.text ) ) {
+	// cpp reads the buffer and the unsaved headers without their #line
+	// directives, so its line markers, gcc's messages and the translator's
+	// positions all give the real lines.
+	const std::string text = blankLineDirectives( req.text );
+	std::map<std::string, std::string> buffers;
+	for ( const auto & [path, b] : req.overlays ) buffers[normalize( path )] = blankLineDirectives( b );
+	if ( ! writeFile( in, "# 1 \"" + quoteForMarker( req.path ) + "\"\n" + text ) ) {
 		fr.status = FrontResult::PreprocessFailed;
 		fr.diags.push_back( fileLevel( req.path, "cfa-lsp: cannot write " + in ) );
 		return fr;
@@ -570,13 +576,12 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 			if ( seen ) continue;
 			std::string odir = dir + "/overlay" + std::to_string( overlays.size() );
 			bool used = false;
-			for ( const auto & [path, text] : req.overlays ) {
-				std::string p = normalize( path );
+			for ( const auto & [p, b] : buffers ) {
 				if ( p.size() <= d.size() + 1 || p.compare( 0, d.size(), d ) != 0 || p[d.size()] != '/' ) continue;
 				fs::path target = fs::path( odir ) / p.substr( d.size() + 1 );
 				std::error_code ec;
 				fs::create_directories( target.parent_path(), ec );
-				if ( ec || ! writeFile( target.string(), text ) ) {
+				if ( ec || ! writeFile( target.string(), b ) ) {
 					log::warn( "cannot write overlay ", target.string() );
 					continue;
 				}
@@ -668,7 +673,8 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 		std::map<std::string, std::optional<std::string>> files;
 	};
 	auto cache = std::make_shared<Cache>();
-	SourceMap::Reader reader = [cache, main = req.path, text = req.text, buffers = req.overlays, cwd]( const std::string & p ) -> std::optional<std::string> {
+	// For the files cfa-lsp wrote, the text cpp read.
+	SourceMap::Reader reader = [cache, main = req.path, text, buffers, cwd]( const std::string & p ) -> std::optional<std::string> {
 		std::string path = p;
 		if ( ! path.empty() && path[0] != '/' ) path = ( fs::path( cwd ) / path ).string();
 		path = normalize( path );

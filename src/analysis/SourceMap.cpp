@@ -41,7 +41,9 @@
 // A #line directive in the original makes the markers give line numbers that
 // differ from the real ones. The file's own #line directives say how the two
 // relate, and the preprocessed lines are moved back to their real lines before
-// they are cut into segments (see remapLines).
+// they are cut into segments (see remapLines). The server takes the #line
+// directives out of the files it writes for cpp (blankLineDirectives), so
+// this only matters for headers read from disk.
 //
 // The translator can also give the line in the preprocessed text (pline),
 // which names one preprocessed line exactly: the right piece of a split line
@@ -655,6 +657,15 @@ Directives scanDirectives( std::string_view text ) {
 	return out;
 }
 
+// Whether a directive is #line or `# N`. Unlike parseDirective, this takes
+// any #line, also one whose number comes from a macro.
+bool isLineDirective( std::string_view l ) {
+	size_t i = l.find( '#' ) + 1;
+	while ( i < l.size() && ( l[i] == ' ' || l[i] == '\t' ) ) ++i;
+	if ( i < l.size() && digit( l[i] ) ) return true;
+	return l.compare( i, 4, "line" ) == 0 && ( i + 4 == l.size() || !identChar( l[i + 4] ) );
+}
+
 // Moves the preprocessed lines back to their real lines when the file has
 // #line directives, which make the markers give other numbers.
 void remapLines( FileTable & ft, const std::string & name, const std::vector<LineDirective> & dirs ) {
@@ -1125,6 +1136,25 @@ std::optional<std::vector<int>> SourceMap::outputLines( const std::string & file
 	for ( const PrepLine & p : ft->prep ) out.push_back( p.line );
 	std::sort( out.begin(), out.end() );
 	out.erase( std::unique( out.begin(), out.end() ), out.end() );
+	return out;
+}
+
+std::string blankLineDirectives( std::string_view text ) {
+	std::string out;
+	out.reserve( text.size() );
+	size_t at = 0;
+	LexOptions opts;
+	opts.directives = true;
+	for ( const Token & t : lex( text, opts ) ) {
+		if ( t.kind != TokKind::Directive || !isLineDirective( t.text ) ) continue;
+		out.append( text.substr( at, t.offset - at ) );
+		// A continued directive, or a block comment in it, spans several lines.
+		for ( int i = t.offset; i < t.endOffset; ++i ) {
+			if ( text[i] == '\n' ) out += '\n';
+		}
+		at = t.endOffset;
+	}
+	out.append( text.substr( at ) );
 	return out;
 }
 
