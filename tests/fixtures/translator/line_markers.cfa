@@ -1,0 +1,13 @@
+// Line markers that repeat a line number: a header included twice, and a #line.
+#define X( n ) int n;
+#include "twice.h"
+#undef X
+#define X( n ) int n##_again;
+#include "twice.h"
+int main() {
+    int first = 10 + 0, second = 2;
+#line 8
+    int sum = first
++ second;
+    return alpha + alpha_again + sum;
+}
