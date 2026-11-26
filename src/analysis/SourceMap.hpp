@@ -60,6 +60,13 @@ class SourceMap {
 	// a #define in the file or a header it includes directly; false otherwise.
 	bool inMacroBody( const std::string & file, Point p ) const;
 
+	// The real 1-based line of `file` that the line markers number `line`.
+	// The two differ after a #line directive that cpp obeyed, and gcc's
+	// diagnostics use the markers' numbers. Returns `line` for a file without
+	// such directives, an unreadable or unknown file, and for identity().
+	// Where two lines share a number, the first one wins.
+	int realLine( const std::string & file, int line ) const;
+
 	// Every file named in a line marker (empty for identity()).
 	std::vector<std::string> files() const;
 

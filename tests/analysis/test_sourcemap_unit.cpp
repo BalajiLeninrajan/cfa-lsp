@@ -244,6 +244,127 @@ TEST_CASE( "sourcemap: #line in a comment" ) {
 	SourceMap m( prep, f.reader() );
 	CHECK( m.map( "/r/c.cfa", 4, 4 ) == L( 3, 6 ) );
 	CHECK( m.map( "/r/c.cfa", 6, 4 ) == L( 5, 5 ) );
+	CHECK( m.realLine( "/r/c.cfa", 4 ) == 4 );
+}
+
+// cpp ignores a #line in a branch it skips, and prints no marker for it. The
+// preprocessed texts are what gcc prints without and with -DA.
+TEST_CASE( "sourcemap: #line in a skipped #if branch" ) {
+	Files f;
+	const std::string F = "/r/k.cfa";
+	f.text[F] =
+		"int a;\n"						// 0
+		"#if 0\n"						// 1
+		"#line 500\n"					// 2
+		"#endif\n"						// 3
+		"int   b;\n"					// 4
+		"#ifdef A\n"					// 5
+		"#line 100\n"					// 6
+		"int a1;\n"						// 7
+		"#else\n"						// 8
+		"#line 100\n"					// 9
+		"int  a2;\n"					// 10
+		"#endif\n"						// 11
+		"int   c;\n";					// 12
+
+	SourceMap no( "# 1 \"/r/k.cfa\"\n"
+				  "int a;\n"
+				  "\n\n\n"
+				  "int b;\n"
+				  "# 100 \"/r/k.cfa\"\n"
+				  "int a2;\n"
+				  "\n"
+				  "int c;\n",
+				  f.reader() );
+	CHECK( no.map( F, 5, 4 ) == L( 4, 6 ) );		// b: the #line 500 moved nothing
+	CHECK( no.map( F, 100, 4 ) == L( 10, 5 ) );		// a2: the second #line 100
+	CHECK( no.map( F, 102, 4 ) == L( 12, 6 ) );		// c
+	CHECK( no.outputLines( F ) == ( std::vector<int>{ 0, 4, 10, 12 } ) );
+	CHECK( no.realLine( F, 1 ) == 1 );
+	CHECK( no.realLine( F, 5 ) == 5 );
+	CHECK( no.realLine( F, 100 ) == 11 );
+	CHECK( no.realLine( F, 102 ) == 13 );
+
+	SourceMap yes( "# 1 \"/r/k.cfa\"\n"
+				   "int a;\n"
+				   "\n\n\n"
+				   "int b;\n"
+				   "# 100 \"/r/k.cfa\"\n"
+				   "int a1;\n"
+				   "\n\n\n\n"
+				   "int c;\n",
+				   f.reader() );
+	CHECK( yes.map( F, 5, 4 ) == L( 4, 6 ) );
+	CHECK( yes.map( F, 100, 4 ) == L( 7, 4 ) );		// a1: the first #line 100
+	CHECK( yes.map( F, 105, 4 ) == L( 12, 6 ) );
+	CHECK( yes.outputLines( F ) == ( std::vector<int>{ 0, 4, 7, 12 } ) );
+	CHECK( yes.realLine( F, 100 ) == 8 );
+	CHECK( yes.realLine( F, 105 ) == 13 );
+}
+
+// cpp's own marker after a run of skipped lines can carry the number of a
+// #line in that run; the lines after it match the source better without the
+// #line.
+TEST_CASE( "sourcemap: a skipped #line with the number of cpp's next marker" ) {
+	Files f;
+	const std::string F = "/r/g.cfa";
+	std::string text = "int a;\n#if 0\n#line 14\n";		// 0-2
+	for ( int i = 3; i < 12; ++i ) text += "int skipped" + std::to_string( i ) + ";\n";
+	text += "#endif\n";									// 12
+	text += "int   b;\n";								// 13
+	text += "int   c;\n";								// 14
+	f.text[F] = text;
+	SourceMap m( "# 1 \"/r/g.cfa\"\n"
+				 "int a;\n"
+				 "# 14 \"/r/g.cfa\"\n"
+				 "int b;\n"
+				 "int c;\n",
+				 f.reader() );
+	CHECK( m.map( F, 14, 4 ) == L( 13, 6 ) );
+	CHECK( m.map( F, 15, 4 ) == L( 14, 6 ) );
+	CHECK( m.realLine( F, 14 ) == 14 );
+}
+
+// A #line that names another file, and one that comes back. The skipped one
+// has no marker for the other file at all.
+TEST_CASE( "sourcemap: #line naming another file" ) {
+	Files f;
+	const std::string F = "/r/o.cfa";
+	f.text[F] =
+		"int a;\n"						// 0
+		"#line 10 \"other.y\"\n"		// 1
+		"int b;\n"						// 2
+		"#line 4 \"/r/o.cfa\"\n"		// 3
+		"int  c;\n";					// 4
+	SourceMap m( "# 1 \"/r/o.cfa\"\n"
+				 "int a;\n"
+				 "# 10 \"other.y\"\n"
+				 "int b;\n"
+				 "# 4 \"/r/o.cfa\"\n"
+				 "int c;\n",
+				 f.reader() );
+	CHECK( m.map( F, 4, 4 ) == L( 4, 5 ) );
+	CHECK( m.realLine( F, 1 ) == 1 );
+	CHECK( m.realLine( F, 4 ) == 5 );
+	CHECK( m.outputLines( F ) == ( std::vector<int>{ 0, 4 } ) );
+
+	f.text[F] =
+		"#if 0\n"						// 0
+		"#line 10 \"other.y\"\n"		// 1
+		"#endif\n"						// 2
+		"int  c;\n";					// 3
+	SourceMap n( "# 1 \"/r/o.cfa\"\n\n\n\nint c;\n", f.reader() );
+	CHECK( n.map( F, 4, 4 ) == L( 3, 5 ) );
+	CHECK( n.realLine( F, 4 ) == 4 );
+}
+
+TEST_CASE( "sourcemap: realLine without a map or a file" ) {
+	CHECK( SourceMap::identity().realLine( "/r/x.cfa", 7 ) == 7 );
+	Files f;
+	SourceMap m( "# 1 \"/r/x.cfa\"\nint a;\n", f.reader() );
+	CHECK( m.realLine( "/r/x.cfa", 7 ) == 7 );		// unreadable
+	CHECK( m.realLine( "/r/y.cfa", 7 ) == 7 );		// unknown
+	CHECK( m.realLine( "/r/x.cfa", 0 ) == 0 );
 }
 
 // An identifier in a macro's body that is also an argument: the expansion is

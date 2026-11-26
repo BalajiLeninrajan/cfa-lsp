@@ -41,7 +41,9 @@
 // A #line directive in the original makes the markers give line numbers that
 // differ from the real ones. The file's own #line directives say how the two
 // relate, and the preprocessed lines are moved back to their real lines before
-// they are cut into segments (see remapLines).
+// they are cut into segments (see remapLines). Only the directives cpp obeyed
+// count, not those in a branch it skipped: cpp prints a marker for each one it
+// obeys, and obeyedLines matches the directives to those markers.
 //
 // The translator can also give the line in the preprocessed text (pline),
 // which names one preprocessed line exactly: the right piece of a split line
@@ -82,7 +84,7 @@ struct PrepLine {
 	int presumed;					// the line the markers give (differs after a #line)
 	size_t off, len;				// in the preprocessed text
 	bool cont;						// continues the previous entry's original line
-	int seg = -1, sub = 0;			// where buildFile put it: segment, and piece of its line
+	int seg = -1, sub = 0;			// where alignFile put it: segment, and piece of its line
 };
 
 // A #define (or #undef) in an original file, for redoing an expansion.
@@ -117,15 +119,26 @@ struct Region {
 	bool ours;
 };
 
+// A line marker in the preprocessed text that names this file.
+struct Mark {
+	size_t before;					// how many of the file's PrepLines come before it
+	int number;						// the 1-based line it gives the next line
+	int flags;						// bit k - 1 for flag k
+};
+
 struct FileTable {
 	std::vector<PrepLine> prep;
-	std::once_flag once;
-	bool ok = false;
+	std::vector<Mark> marks;
+	// Reading the file and finding its real lines, then aligning the tokens.
+	std::once_flag linesOnce, alignOnce;
+	bool readable = false;			// the file was read; lineStarts, toks, own and regions are set
+	bool ok = false;				// and aligned; segs is set
 	std::string text;
 	std::vector<int> lineStarts;
 	std::vector<Token> toks;
+	Directives own;
 	std::vector<Segment> segs;
-	std::vector<Region> regions;	// empty without #line directives
+	std::vector<Region> regions;	// empty without #line directives that cpp obeyed
 
 	// The 0-based real line of a 0-based presumed line, from the first region
 	// that has it.
@@ -643,14 +656,126 @@ void parseDirective( const std::string & l, int at, Directives & out ) {
 
 // The directives SourceMap uses: #define and #undef to redo macro expansions,
 // #include to find definitions in headers, and #line. The lexer finds them, so
-// a directive inside a comment is skipped. Conditionals are not evaluated; a
-// definition that doesn't reproduce an expansion isn't used.
+// a directive inside a comment is skipped. Conditionals are not evaluated: a
+// definition that doesn't reproduce an expansion isn't used, and obeyedLines
+// finds the #line directives that cpp obeyed.
 Directives scanDirectives( std::string_view text ) {
 	Directives out;
 	LexOptions opts;
 	opts.directives = true;
 	for ( const Token & t : lex( text, opts ) ) {
 		if ( t.kind == TokKind::Directive ) parseDirective( t.text, t.line, out );
+	}
+	return out;
+}
+
+// The line markers that name a file, for the files of the preprocessed text.
+using MarkLookup = std::function<const std::vector<Mark> *( const std::string & file )>;
+
+// A marker that could come from a #line: not one for entering an included
+// file (flag 1) or returning from one (flag 2).
+bool renames( const Mark & m ) { return ( m.flags & 3 ) == 0; }
+
+// How many tokens of a preprocessed line are also written on 0-based line
+// `line` of the original.
+int overlap( const FileTable & ft, const std::vector<Token> & prepToks, long line ) {
+	if ( line < 0 || line >= ft.lineCount() ) return 0;
+	auto b = std::lower_bound( ft.toks.begin(), ft.toks.end(), (int)line, []( const Token & t, int l ) { return t.line < l; } );
+	auto e = std::upper_bound( b, ft.toks.end(), (int)line, []( int l, const Token & t ) { return l < t.line; } );
+	int n = 0;
+	for ( const Token & t : prepToks ) {
+		for ( auto o = b; o != e; ++o ) {
+			if ( o->text == t.text ) {
+				++n;
+				break;
+			}
+		}
+	}
+	return n;
+}
+
+// The preprocessed lines after marker `mark`, up to the next marker that can
+// renumber them, as (presumed line, tokens). Only the first few are kept; they
+// are enough to tell where the lines came from.
+using Run = std::vector<std::pair<int, std::vector<Token>>>;
+
+Run runAfter( const FileTable & ft, std::string_view prep, size_t mark ) {
+	constexpr size_t MaxRunLines = 50;
+	size_t end = ft.prep.size();
+	for ( size_t k = mark + 1; k < ft.marks.size(); ++k ) {
+		if ( ft.marks[k].flags & 2 ) continue;		// back from an #include: the numbers go on
+		end = ft.marks[k].before;
+		break;
+	}
+	Run run;
+	for ( size_t p = ft.marks[mark].before; p < end && run.size() < MaxRunLines; ++p ) {
+		const PrepLine & pl = ft.prep[p];
+		if ( !pl.cont ) run.emplace_back( pl.presumed, lex( prep.substr( pl.off, pl.len ) ) );
+	}
+	return run;
+}
+
+// How well the run matches the original when region `g` numbers its lines.
+int score( const FileTable & ft, const Run & run, const Region & g ) {
+	int n = 0;
+	for ( const auto & [presumed, toks] : run ) n += overlap( ft, toks, (long)g.actual + ( presumed - g.presumed ) );
+	return n;
+}
+
+// The #line directives of file `name` that cpp obeyed. cpp skips those in a
+// branch of an #if it didn't take, and prints a marker for each one it obeys,
+// with the directive's number. So a directive counts when a marker with its
+// number, after the marker of the last one that counted, is better explained
+// by it than by the other things that print such a marker: cpp itself (the
+// first marker, and one after a run of skipped lines), which keeps the
+// numbering, and a later directive with the same number. The best explanation
+// is the numbering under which the lines after the marker match the original
+// lines best; a tie goes to the directive.
+//
+// A directive that names another file has no lines here to compare, so a
+// marker with its number in that file is enough.
+std::vector<LineDirective> obeyedLines( const FileTable & ft, const std::string & name, std::string_view prep,
+										const std::vector<LineDirective> & dirs, const MarkLookup & marksOf ) {
+	std::vector<LineDirective> out;
+	std::string current = name;					// the name a #line without one keeps
+	std::optional<Region> here = Region{ 0, 0, true };	// how this file's lines are numbered; none under another name
+	std::unordered_map<std::string, size_t> used;	// per file, the markers before this index are taken
+	auto regionOf = []( const LineDirective & d ) { return Region{ d.at + 1, d.number - 1, true }; };
+	for ( size_t i = 0; i < dirs.size(); ++i ) {
+		const LineDirective & d = dirs[i];
+		const std::string target = d.file ? *d.file : current;
+		const std::vector<Mark> * marks = target == name ? &ft.marks : marksOf ? marksOf( target ) : nullptr;
+		if ( !marks ) continue;
+		size_t & from = used[target];
+		if ( target != name ) {
+			for ( size_t k = from; k < marks->size(); ++k ) {
+				if ( !renames( ( *marks )[k] ) || ( *marks )[k].number != d.number ) continue;
+				out.push_back( d );
+				from = k + 1;
+				current = target;
+				here.reset();
+				break;
+			}
+			continue;
+		}
+		const Region mine = regionOf( d );
+		for ( size_t k = from; k < marks->size(); ++k ) {
+			if ( !renames( ( *marks )[k] ) || ( *marks )[k].number != d.number ) continue;
+			const Run run = runAfter( ft, prep, k );
+			const int s = score( ft, run, mine );
+			if ( here && score( ft, run, *here ) > s ) continue;	// cpp's own marker
+			bool later = false;
+			for ( size_t j = i + 1; j < dirs.size() && !later; ++j ) {
+				const LineDirective & e = dirs[j];
+				if ( e.number == d.number && ( e.file ? *e.file : current ) == name ) later = score( ft, run, regionOf( e ) ) > s;
+			}
+			if ( later ) break;
+			out.push_back( d );
+			from = k + 1;
+			current = name;
+			here = mine;
+			break;
+		}
 	}
 	return out;
 }
@@ -693,8 +818,9 @@ void remapLines( FileTable & ft, const std::string & name, const std::vector<Lin
 // The directives of the files an #include names.
 using IncludeLookup = std::function<std::vector<const Directives *>( const std::string & include )>;
 
-void buildFile( FileTable & ft, const std::string & name, std::string_view prep, const SourceMap::Reader & read,
-				const IncludeLookup & included ) {
+// Reads the file and moves its preprocessed lines to their real lines.
+void readLines( FileTable & ft, const std::string & name, std::string_view prep, const SourceMap::Reader & read,
+				const MarkLookup & marksOf ) {
 	std::optional<std::string> text;
 	if ( read ) {
 		try { text = read( name ); } catch ( ... ) { text.reset(); }
@@ -706,8 +832,14 @@ void buildFile( FileTable & ft, const std::string & name, std::string_view prep,
 		if ( ft.text[i] == '\n' ) ft.lineStarts.push_back( (int)i + 1 );
 	}
 	ft.toks = lex( ft.text );
-	const Directives own = scanDirectives( ft.text );
-	remapLines( ft, name, own.lines );
+	ft.own = scanDirectives( ft.text );
+	remapLines( ft, name, obeyedLines( ft, name, prep, ft.own.lines, marksOf ) );
+	ft.readable = true;
+}
+
+// Aligns the tokens of a file that readLines read.
+void alignFile( FileTable & ft, std::string_view prep, const IncludeLookup & included ) {
+	const Directives & own = ft.own;
 
 	// The definition in effect in this file, else any in a header it includes.
 	DefineLookup defines = [&]( const std::string & macro, int line ) {
@@ -881,7 +1013,8 @@ struct SourceMap::Impl {
 	std::unordered_map<std::string, std::vector<const Directives *>> includes;	// by #include name
 
 	void index();
-	const FileTable * table( const std::string & file );
+	FileTable * lines( const std::string & file );	// read, with the real lines found
+	const FileTable * table( const std::string & file );	// and aligned
 	std::vector<const Directives *> included( const std::string & include );
 
 	// Finds the table and the line's tokens; subs is null when the line has
@@ -938,6 +1071,7 @@ void SourceMap::Impl::index() {
 					if ( !slot ) slot = std::make_unique<FileTable>();
 					cur = slot.get();
 				}
+				if ( cur ) cur->marks.push_back( { cur->prep.size(), n, flags } );
 				next = n - 1;
 				sys = flags & 4;
 			} else {
@@ -963,7 +1097,7 @@ void SourceMap::Impl::index() {
 	}
 }
 
-const FileTable * SourceMap::Impl::table( const std::string & file ) {
+FileTable * SourceMap::Impl::lines( const std::string & file ) {
 	FileTable * ft;
 	{
 		std::lock_guard<std::mutex> lock( mu );
@@ -975,8 +1109,21 @@ const FileTable * SourceMap::Impl::table( const std::string & file ) {
 		if ( it == files.end() ) return nullptr;
 		ft = it->second.get();
 	}
-	std::call_once( ft->once, [&] {
-		buildFile( *ft, file, prep, read, [this]( const std::string & include ) { return included( include ); } );
+	std::call_once( ft->linesOnce, [&] {
+		// The tables are fixed once indexed, and their marks with them.
+		readLines( *ft, file, prep, read, [this]( const std::string & f ) -> const std::vector<Mark> * {
+			auto it = files.find( f );
+			return it == files.end() ? nullptr : &it->second->marks;
+		} );
+	} );
+	return ft;
+}
+
+const FileTable * SourceMap::Impl::table( const std::string & file ) {
+	FileTable * ft = lines( file );
+	if ( !ft || !ft->readable ) return ft;
+	std::call_once( ft->alignOnce, [&] {
+		alignFile( *ft, prep, [this]( const std::string & include ) { return included( include ); } );
 	} );
 	return ft;
 }
@@ -1103,6 +1250,13 @@ bool SourceMap::inMacroBody( const std::string & file, Point p ) const {
 	return impl && impl->inMacroBody( file, p );
 }
 
+int SourceMap::realLine( const std::string & file, int line ) const {
+	if ( !impl || line < 1 ) return line;
+	const FileTable * ft = impl->lines( file );
+	if ( !ft || !ft->readable || ft->regions.empty() ) return line;
+	return ft->actualLine( line - 1 ) + 1;
+}
+
 std::vector<std::string> SourceMap::files() const {
 	if ( !impl ) return {};
 	std::lock_guard<std::mutex> lock( impl->mu );
@@ -1117,9 +1271,9 @@ std::vector<std::string> SourceMap::files() const {
 
 std::optional<std::vector<int>> SourceMap::outputLines( const std::string & file ) const {
 	if ( !impl ) return std::nullopt;
-	// Building the table moves the lines after a #line back to their real
+	// Reading the file moves the lines after a #line back to their real
 	// numbers; index() alone leaves the numbers the markers give.
-	const FileTable * ft = impl->table( file );
+	const FileTable * ft = impl->lines( file );
 	if ( !ft ) return std::nullopt;
 	std::vector<int> out;
 	for ( const PrepLine & p : ft->prep ) out.push_back( p.line );

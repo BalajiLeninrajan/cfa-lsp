@@ -128,3 +128,46 @@ TEST_CASE( "compiler output to diagnostics" ) {
 	CHECK( d[4].range.start.line == 6 );
 	CHECK( d[4].source == "cpp" );
 }
+
+// gcc numbers lines as the line markers do, so after a #line its messages
+// give the directive's numbers. With the map of the preprocessed text they go
+// back to the real lines. The #line in the skipped branch moves nothing.
+TEST_CASE( "compiler output after a #line" ) {
+	Toolchain tc;
+	const std::string main = "/p/main.cfa", text =
+		"int a;\n"					// 1
+		"#if 0\n"					// 2
+		"#line 900\n"				// 3
+		"#endif\n"					// 4
+		"#warning before\n"			// 5
+		"#line 100\n"				// 6
+		"int b;\n"					// 7
+		"#warning after\n";			// 8
+	SourceMap sm( "# 1 \"/p/main.cfa\"\n"
+				  "int a;\n"
+				  "\n\n\n\n"
+				  "# 100 \"/p/main.cfa\"\n"
+				  "int b;\n",
+				  [&]( const std::string & p ) -> std::optional<std::string> {
+					  if ( p == main ) return text;
+					  return std::nullopt;
+				  } );
+	std::string out =
+		"/p/main.cfa:5:2: warning: #warning before [-Wcpp]\n"
+		"/p/main.cfa:101:2: warning: #warning after [-Wcpp]\n"
+		"/p/main.cfa:100:1: note: see here\n"
+		"/tmp/t/in.cfa:1:1: error: in the temp copy\n";
+	auto d = diagsFromOutput( out, main, "/tmp/t/in.cfa", "/p", tc, "cpp", &sm );
+	REQUIRE( d.size() == 3 );
+	CHECK( d[0].range.start == Loc{ 4, 1 } );
+	CHECK( d[1].range.start == Loc{ 7, 1 } );
+	REQUIRE( d[1].related.size() == 1 );
+	CHECK( d[1].related[0].range.start.line == 6 );
+	CHECK( d[2].file == main );
+	CHECK( d[2].range.start == Loc{ 0, 0 } );
+
+	// Without the map the numbers stay.
+	d = diagsFromOutput( out, main, "/tmp/t/in.cfa", "/p", tc, "cpp" );
+	REQUIRE( d.size() == 3 );
+	CHECK( d[1].range.start == Loc{ 100, 1 } );
+}

@@ -236,10 +236,10 @@ TempDir::~TempDir() {
 
 std::vector<Diag> diagsFromOutput( const std::string & output, const std::string & realPath,
 								   const std::string & tmpInput, const std::string & cwd,
-								   const Toolchain & tc, const std::string & source ) {
+								   const Toolchain & tc, const std::string & source, const SourceMap * lines ) {
 	std::vector<Diag> out;
 	bool lastKept = false;					// notes belong to the diagnostic before them
-	for ( const RawDiag & r : parseCompilerOutput( output ) ) {
+	for ( RawDiag r : parseCompilerOutput( output ) ) {
 		// An open header is checked as the main file. gcc quotes the pragma: "'#pragma once' in main file".
 		if ( r.message.find( "#pragma once" ) != std::string::npos && r.message.find( "in main file" ) != std::string::npos ) {
 			lastKept = false;
@@ -253,9 +253,13 @@ std::vector<Diag> diagsFromOutput( const std::string & output, const std::string
 			if ( fs::exists( fs::path( cwd ) / file, ec ) ) file = ( fs::path( cwd ) / file ).string();
 		}
 		file = normalize( file );
-		if ( file == normalize( tmpInput ) ) file = realPath;
+		// gcc names the file as the line markers do.
+		const bool temp = file == normalize( tmpInput );
+		auto realLine = [&] { if ( lines && ! temp && ! r.file.empty() ) r.line = lines->realLine( r.file, r.line ); };
+		if ( temp ) file = realPath;
 		if ( r.severity == "note" ) {
 			if ( lastKept && file[0] == '/' ) {
+				realLine();
 				out.back().related.push_back( { file, { { r.line - 1, 0 }, { r.line - 1, 0 } }, r.message } );
 			}
 			continue;
@@ -265,6 +269,7 @@ std::vector<Diag> diagsFromOutput( const std::string & output, const std::string
 		// In libcfa and system headers only errors are kept, for the header
 		// itself: the warnings there aren't the user's to fix.
 		if ( file != realPath && tc.isSystemPath( file ) && ( severity != 1 || file[0] != '/' ) ) continue;
+		realLine();
 		Diag d;
 		d.file = file;
 		d.severity = severity;
@@ -612,12 +617,30 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 			return fr;
 		}
 	}
-	std::vector<Diag> cppDiags = diagsFromOutput( cppErr, req.path, in, cwd, tc, "cpp" );
+	// cpp writes what it has so far when it fails, so the include sites and
+	// the markers up to the error are there.
+	const std::string preprocessed = readFile( o.stdoutPath ).value_or( "" );
+	struct Cache {
+		std::mutex m;
+		std::map<std::string, std::optional<std::string>> files;
+	};
+	auto cache = std::make_shared<Cache>();
+	SourceMap::Reader reader = [cache, main = req.path, text = req.text, buffers = req.overlays, cwd]( const std::string & p ) -> std::optional<std::string> {
+		std::string path = p;
+		if ( ! path.empty() && path[0] != '/' ) path = ( fs::path( cwd ) / path ).string();
+		path = normalize( path );
+		if ( path == main ) return text;
+		if ( auto b = buffers.find( path ); b != buffers.end() ) return b->second;
+		std::lock_guard<std::mutex> lock( cache->m );
+		auto it = cache->files.find( path );
+		if ( it != cache->files.end() ) return it->second;
+		return cache->files[path] = readFile( path );
+	};
+	auto sm = std::make_shared<SourceMap>( preprocessed, reader );
+	std::vector<Diag> cppDiags = diagsFromOutput( cppErr, req.path, in, cwd, tc, "cpp", sm.get() );
 	if ( ! r.ok() ) {
 		fr.status = FrontResult::PreprocessFailed;
-		// cpp writes what it has so far, so the include sites up to the
-		// error are there.
-		fr.diags = withIncludeSummaries( cppDiags, req.path, includeSites( readFile( o.stdoutPath ).value_or( "" ), in, req.path ), tc );
+		fr.diags = withIncludeSummaries( cppDiags, req.path, includeSites( preprocessed, in, req.path ), tc );
 		bool anyError = false;
 		for ( const auto & d : cppDiags ) anyError = anyError || d.severity == 1;
 		if ( ! anyError ) {
@@ -662,29 +685,11 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 	}
 
 	// 3. Load.
-	auto preprocessed = readFile( o.stdoutPath ).value_or( "" );
-	struct Cache {
-		std::mutex m;
-		std::map<std::string, std::optional<std::string>> files;
-	};
-	auto cache = std::make_shared<Cache>();
-	SourceMap::Reader reader = [cache, main = req.path, text = req.text, buffers = req.overlays, cwd]( const std::string & p ) -> std::optional<std::string> {
-		std::string path = p;
-		if ( ! path.empty() && path[0] != '/' ) path = ( fs::path( cwd ) / path ).string();
-		path = normalize( path );
-		if ( path == main ) return text;
-		if ( auto b = buffers.find( path ); b != buffers.end() ) return b->second;
-		std::lock_guard<std::mutex> lock( cache->m );
-		auto it = cache->files.find( path );
-		if ( it != cache->files.end() ) return it->second;
-		return cache->files[path] = readFile( path );
-	};
 	nlohmann::json dump;
 	try {
 		dump = nlohmann::json::parse( *dumpText );
 		preludePaths( dump, tc.preludeFor( fr.flags ) );
-		SourceMap sm( preprocessed, reader );
-		fr.analysis = Analysis::load( dump, sm, reader );
+		fr.analysis = Analysis::load( dump, *sm, reader );
 		lap( "load" );
 	} catch ( const std::exception & e ) {
 		fr.status = FrontResult::LoadFailed;
@@ -735,6 +740,7 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 	// generation, so there can be C even when the translator reported errors.
 	std::error_code ec;
 	fr.cOut = cOut;
+	fr.sourceMap = sm;
 	fr.translatorErrors = anyError;
 	fr.backendReady = ! cOut.empty() && fs::file_size( cOut, ec ) > 0 && ! ec;
 	fr.status = FrontResult::Ok;
@@ -779,20 +785,26 @@ std::vector<Diag> Checker::back( const CheckRequest & req, const FrontResult & f
 			lastKept = false;
 			continue;
 		}
+		const std::string marked = file;	// as the line markers name it
 		if ( ! file.empty() && file[0] != '/' ) {
 			std::error_code ec;
 			if ( fs::exists( fs::path( cwd ) / file, ec ) ) file = ( fs::path( cwd ) / file ).string();
 		}
 		file = normalize( file );
-		if ( file == normalize( dir + "/in.cfa" ) ) file = req.path;
+		const bool temp = file == normalize( dir + "/in.cfa" );
+		if ( temp ) file = req.path;
+		// The lines are numbered as in the markers, which a #line changes.
+		auto realLine = [&] { if ( fr.sourceMap && ! temp ) line = fr.sourceMap->realLine( marked, line ); };
 		if ( raw.severity == "note" ) {
 			if ( lastKept && file[0] == '/' && ! out.empty() ) {
+				realLine();
 				out.back().related.push_back( { file, { { line - 1, 0 }, { line - 1, 0 } }, raw.message } );
 			}
 			continue;
 		}
 		lastKept = false;
 		if ( line <= 0 || ( file != req.path && tc.isSystemPath( file ) ) ) continue;
+		realLine();
 		int sev = severityOf( raw.severity );
 		// C made despite translator errors: gcc's errors there are about
 		// code the translator already rejected.

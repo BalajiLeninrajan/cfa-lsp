@@ -110,7 +110,13 @@ a system-header macro such as `assert` or `isdigit` makes cpp split a line
 into pieces that share one line number, that line says which piece a column
 is in, and for a header included twice it says which copy. A `#line`
 directive in your file changes the line numbers in the markers; the server
-reads the file's directives to get the real lines back.
+reads the file's directives to get the real lines back. Only the directives
+that cpp obeyed count. cpp prints a marker for each one, so a `#line` in a
+branch of an `#if` that cpp skipped has none and moves nothing. To tell a
+`#line` marker from one that cpp prints after a run of skipped lines, the
+server checks which numbering makes the lines after the marker match your
+file. gcc's messages, from `cfa -E` and from the C compile, give the
+numbers from the markers too, and go back to the real lines the same way.
 
 To tell an identifier in a macro's body from the same name passed as an
 argument (`tmp` in `SWAP( x, tmp )` when the body declares its own `tmp`),

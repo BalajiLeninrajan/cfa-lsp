@@ -56,6 +56,78 @@ TEST_CASE( "real cfa: preprocessor errors land on the real file" ) {
 	CHECK( fr.diags[0].message.find( "missing.hfa" ) != std::string::npos );
 }
 
+// cpp numbers lines after a #line by the directive, and skips one in a branch
+// it doesn't take. Its messages land on the real lines.
+TEST_CASE( "real cfa: preprocessor diagnostics after a #line land on the real line" ) {
+	std::string fake = envOr( "CFA_LSP_FAKE_CFA" );
+	if ( findInPath( "cfa" ).empty() || ! executable( fake ) ) {
+		MESSAGE( "needs cfa on PATH and CFA_LSP_FAKE_CFA; skipping" );
+		return;
+	}
+	ToolchainOptions o;
+	o.translator = fake;						// only the cpp stage matters here
+	Checker ch( discoverToolchain( o ) );
+	TempDir proj;
+	std::string main = proj.path() + "/main.cfa";
+	const std::string text =
+		"int a;\n"								// 0
+		"#if 0\n"								// 1
+		"#line 900\n"							// 2
+		"#endif\n"								// 3
+		"#warning before the directive\n"		// 4
+		"#line 100\n"							// 5
+		"int b;\n"								// 6
+		"#warning after the directive\n"		// 7
+		"#error still after it\n"				// 8
+		"int main() {}\n";
+	FrontResult fr = ch.front( requestFor( main, text ), CancelToken() );
+	CHECK( fr.status == FrontResult::PreprocessFailed );
+	int before = -1, after = -1, error = -1;
+	for ( const Diag & d : fr.diags ) {
+		INFO( d.file << ":" << d.range.start.line << ": " << d.message );
+		if ( d.file != main ) continue;
+		if ( d.message.find( "before the directive" ) != std::string::npos ) before = d.range.start.line;
+		if ( d.message.find( "after the directive" ) != std::string::npos ) after = d.range.start.line;
+		if ( d.message.find( "still after it" ) != std::string::npos ) error = d.range.start.line;
+	}
+	CHECK( before == 4 );
+	CHECK( after == 7 );
+	CHECK( error == 8 );
+}
+
+// gcc reads the translator's C, whose line markers give the numbers of the
+// #line too.
+TEST_CASE( "real cfa and translator: backend diagnostics after a #line land on the real line" ) {
+	std::string translator = envOr( "CFA_LSP_TRANSLATOR" );
+	if ( findInPath( "cfa" ).empty() || ! executable( translator ) ) {
+		MESSAGE( "needs cfa and CFA_LSP_TRANSLATOR; skipping" );
+		return;
+	}
+	ToolchainOptions o;
+	o.translator = translator;
+	Checker ch( discoverToolchain( o ) );
+	TempDir proj;
+	std::string main = proj.path() + "/main.cfa";
+	CheckRequest req = requestFor( main,
+		"int main() {\n"						// 0
+		"#ifdef NOT_DEFINED\n"					// 1
+		"#line 900\n"							// 2
+		"#endif\n"								// 3
+		"#line 100\n"							// 4
+		"\tint unused;\n"						// 5
+		"\treturn 0;\n"							// 6
+		"}\n" );
+	FrontResult fr = ch.front( req, CancelToken() );
+	REQUIRE( fr.status == FrontResult::Ok );
+	REQUIRE( fr.backendReady );
+	int line = -1;
+	for ( const Diag & d : ch.back( req, fr, CancelToken() ) ) {
+		INFO( d.file << ":" << d.range.start.line << ": " << d.message );
+		if ( d.file == main && d.message.find( "unused variable 'unused'" ) != std::string::npos ) line = d.range.start.line;
+	}
+	CHECK( line == 5 );
+}
+
 TEST_CASE( "real cfa: the file's directory is searched for quoted includes only" ) {
 	std::string fake = envOr( "CFA_LSP_FAKE_CFA" );
 	if ( findInPath( "cfa" ).empty() || ! executable( fake ) ) {

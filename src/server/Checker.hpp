@@ -85,6 +85,7 @@ struct FrontResult {
 	std::shared_ptr<TempDir> tmp;
 	std::string cOut;
 	FlagSet flags;
+	std::shared_ptr<const SourceMap> sourceMap;	// for the real lines after a #line
 };
 
 class Checker {
@@ -115,9 +116,12 @@ class Checker {
 };
 
 // Turns compiler output into Diags: maps `tmpInput` to `realPath`, resolves
-// relative names against `cwd`, drops system files and noise.
+// relative names against `cwd`, drops system files and noise. With `lines`
+// (the map of the preprocessed text gcc read), the line numbers that a #line
+// directive gave go back to the real lines.
 std::vector<Diag> diagsFromOutput( const std::string & output, const std::string & realPath,
 								   const std::string & tmpInput, const std::string & cwd,
-								   const Toolchain & tc, const std::string & source );
+								   const Toolchain & tc, const std::string & source,
+								   const SourceMap * lines = nullptr );
 
 } // namespace cfalsp

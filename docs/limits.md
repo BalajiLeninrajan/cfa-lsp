@@ -40,6 +40,8 @@
   `$` are hidden unless the prefix has a `$`.
 - Type and signature text comes from the translator's pretty printer, so it
   can differ from what you wrote (`Fib &f`, assertions left out).
+- Without the translator, where a check runs the whole cfa driver, its
+  messages after a `#line` directive give the directive's line numbers.
 - If the translator fails an internal assertion or crashes, the check reports
   `internal translator error` on line 1, and unless the crash came after
   resolution the previous results stay in use.
