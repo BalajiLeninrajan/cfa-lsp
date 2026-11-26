@@ -140,13 +140,16 @@ struct FileTable {
 	std::vector<Segment> segs;
 	std::vector<Region> regions;	// empty without #line directives that cpp obeyed
 
-	// The 0-based real line of a 0-based presumed line, from the first region
-	// that has it.
-	int actualLine( int presumed ) const {
+	// The 0-based real lines a 0-based presumed line can be, in region order.
+	// There is more than one after a #line that numbers backwards. Without a
+	// region that has it, the line itself.
+	std::vector<int> actualLines( int presumed ) const {
+		std::vector<int> out;
 		for ( size_t k = 0; k < regions.size(); ++k ) {
-			if ( inRegion( k, presumed ) ) return regions[k].actual + ( presumed - regions[k].presumed );
+			if ( inRegion( k, presumed ) ) out.push_back( regions[k].actual + ( presumed - regions[k].presumed ) );
 		}
-		return presumed;
+		if ( out.empty() ) out.push_back( presumed );
+		return out;
 	}
 	bool inRegion( size_t k, int presumed ) const {
 		const Region & g = regions[k];
@@ -837,6 +840,45 @@ void readLines( FileTable & ft, const std::string & name, std::string_view prep,
 	ft.readable = true;
 }
 
+// How well a diagnostic's message fits a source line: one for each name the
+// message quotes ('x', or in gcc's curly quotes) that the line holds, and one
+// when the message is cpp's "#warning text" or "#error text" and the line is
+// that directive.
+int fits( std::string_view text, std::string_view message ) {
+	auto ident = []( char c ) { return std::isalnum( (unsigned char)c ) || c == '_'; };
+	// `q` is in `text` and doesn't start or end inside a longer name there.
+	auto holds = [&]( std::string_view q ) {
+		for ( size_t at = text.find( q ); at != std::string_view::npos; at = text.find( q, at + 1 ) ) {
+			size_t end = at + q.size();
+			if ( ident( q.front() ) && at > 0 && ident( text[at - 1] ) ) continue;
+			if ( ident( q.back() ) && end < text.size() && ident( text[end] ) ) continue;
+			return true;
+		}
+		return false;
+	};
+	int n = 0;
+	auto quoted = [&]( std::string_view open, std::string_view close ) {
+		for ( size_t b = message.find( open ); b != std::string_view::npos; ) {
+			size_t e = message.find( close, b + open.size() );
+			if ( e == std::string_view::npos ) break;
+			std::string_view q = message.substr( b + open.size(), e - b - open.size() );
+			if ( !q.empty() && holds( q ) ) ++n;
+			b = message.find( open, e + close.size() );
+		}
+	};
+	quoted( "'", "'" );
+	quoted( "\xe2\x80\x98", "\xe2\x80\x99" );
+	for ( std::string_view word : { std::string_view( "warning" ), std::string_view( "error" ) } ) {
+		if ( message.size() <= word.size() + 1 || message[0] != '#' || message.substr( 1, word.size() ) != word ) continue;
+		std::string_view rest = message.substr( 1 + word.size() );
+		rest.remove_prefix( std::min( rest.find_first_not_of( ' ' ), rest.size() ) );
+		size_t h = text.find_first_not_of( " \t" );
+		size_t w = text.find( word );
+		if ( h != std::string_view::npos && text[h] == '#' && w != std::string_view::npos && text.find( rest, w ) != std::string_view::npos ) ++n;
+	}
+	return n;
+}
+
 // Aligns the tokens of a file that readLines read.
 void alignFile( FileTable & ft, std::string_view prep, const IncludeLookup & included ) {
 	const Directives & own = ft.own;
@@ -1174,11 +1216,23 @@ SourceMap::Impl::Line SourceMap::Impl::line( const std::string & file, int line1
 		}
 	}
 	if ( line1 < 1 ) return l;
-	l.line = l.ft->actualLine( line1 - 1 );
-	for ( const Segment & seg : l.ft->segs ) {
-		int k = l.line - seg.first;
-		if ( k >= 0 && k < (int)seg.lines.size() && !seg.lines[k].empty() ) {
-			l.subs = &seg.lines[k];
+	auto subsOf = [&]( int line ) -> const SubLines * {
+		for ( const Segment & seg : l.ft->segs ) {
+			int k = line - seg.first;
+			if ( k >= 0 && k < (int)seg.lines.size() && !seg.lines[k].empty() ) return &seg.lines[k];
+		}
+		return nullptr;
+	};
+	// Of the lines with this number (more than one after a #line that numbers
+	// backwards), the first that has tokens in the preprocessed text.
+	const std::vector<int> cands = l.ft->actualLines( line1 - 1 );
+	l.line = cands[0];
+	l.subs = subsOf( l.line );
+	for ( int c : cands ) {
+		const SubLines * s = subsOf( c );
+		if ( s && std::any_of( s->begin(), s->end(), []( const std::vector<Mapped> & m ) { return !m.empty(); } ) ) {
+			l.line = c;
+			l.subs = s;
 			break;
 		}
 	}
@@ -1250,11 +1304,23 @@ bool SourceMap::inMacroBody( const std::string & file, Point p ) const {
 	return impl && impl->inMacroBody( file, p );
 }
 
-int SourceMap::realLine( const std::string & file, int line ) const {
+int SourceMap::realLine( const std::string & file, int line, std::string_view message ) const {
 	if ( !impl || line < 1 ) return line;
 	const FileTable * ft = impl->lines( file );
 	if ( !ft || !ft->readable || ft->regions.empty() ) return line;
-	return ft->actualLine( line - 1 ) + 1;
+	// A #line that numbers backwards gives an earlier line the same number,
+	// and the message picks between them.
+	int best = -1, bestFit = INT_MIN;
+	for ( int actual : ft->actualLines( line - 1 ) ) {
+		const int f = actual >= 0 && actual < ft->lineCount()
+						  ? fits( std::string_view( ft->text ).substr( ft->lineStarts[actual], ft->lineLength( actual ) ), message )
+						  : -1;
+		if ( f > bestFit ) {
+			best = actual;
+			bestFit = f;
+		}
+	}
+	return best + 1;
 }
 
 std::vector<std::string> SourceMap::files() const {

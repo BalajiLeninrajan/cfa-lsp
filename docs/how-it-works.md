@@ -116,7 +116,11 @@ branch of an `#if` that cpp skipped has none and moves nothing. To tell a
 `#line` marker from one that cpp prints after a run of skipped lines, the
 server checks which numbering makes the lines after the marker match your
 file. gcc's messages, from `cfa -E` and from the C compile, give the
-numbers from the markers too, and go back to the real lines the same way.
+numbers from the markers too, and go back to the real lines the same way, as
+does the line of an `#include` whose header has errors. A `#line` that
+numbers backwards gives two lines the same number. A message then goes to
+the line that holds the name it quotes, or the `#warning` or `#error` it
+reports, and otherwise to the earlier line.
 
 To tell an identifier in a macro's body from the same name passed as an
 argument (`tmp` in `SWAP( x, tmp )` when the body declares its own `tmp`),

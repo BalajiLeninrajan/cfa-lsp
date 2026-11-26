@@ -131,13 +131,14 @@ TEST_CASE( "compiler output to diagnostics" ) {
 
 // gcc numbers lines as the line markers do, so after a #line its messages
 // give the directive's numbers. With the map of the preprocessed text they go
-// back to the real lines. The #line in the skipped branch moves nothing.
+// back to the real lines. The #line in the skipped branch moves nothing; if it
+// counted, it would put "#warning before" on line 6.
 TEST_CASE( "compiler output after a #line" ) {
 	Toolchain tc;
 	const std::string main = "/p/main.cfa", text =
 		"int a;\n"					// 1
 		"#if 0\n"					// 2
-		"#line 900\n"				// 3
+		"#line 3\n"					// 3
 		"#endif\n"					// 4
 		"#warning before\n"			// 5
 		"#line 100\n"				// 6
@@ -170,4 +171,40 @@ TEST_CASE( "compiler output after a #line" ) {
 	d = diagsFromOutput( out, main, "/tmp/t/in.cfa", "/p", tc, "cpp" );
 	REQUIRE( d.size() == 3 );
 	CHECK( d[1].range.start == Loc{ 100, 1 } );
+}
+
+// A #line that numbers backwards gives two lines each of its numbers. What
+// gcc's message quotes, or the #warning it reports, picks the line.
+TEST_CASE( "compiler output after a #line that numbers backwards" ) {
+	Toolchain tc;
+	const std::string main = "/p/main.cfa", text =
+		"int a;\n"							// 1
+		"#warning first\n"					// 2
+		"#line 1\n"							// 3
+		"#warning second\n"					// 4, numbered 1
+		"int main() { int unused; }\n";		// 5, numbered 2
+	SourceMap sm( "# 1 \"/p/main.cfa\"\n"
+				  "int a;\n"
+				  "\n"
+				  "# 1 \"/p/main.cfa\"\n"
+				  "\n"
+				  "int main() { int unused; }\n",
+				  [&]( const std::string & p ) -> std::optional<std::string> {
+					  if ( p == main ) return text;
+					  return std::nullopt;
+				  } );
+	std::string out =
+		"/p/main.cfa:2:2: warning: #warning first [-Wcpp]\n"
+		"/p/main.cfa:1:2: warning: #warning second [-Wcpp]\n"
+		"/p/main.cfa:2:18: warning: unused variable 'unused' [-Wunused-variable]\n"
+		"/p/main.cfa:2:5: note: 'main' is here\n"
+		"/p/main.cfa:2:1: warning: nothing quoted\n";
+	auto d = diagsFromOutput( out, main, "/tmp/t/in.cfa", "/p", tc, "cpp", &sm );
+	REQUIRE( d.size() == 4 );
+	CHECK( d[0].range.start.line == 1 );
+	CHECK( d[1].range.start.line == 3 );
+	CHECK( d[2].range.start.line == 4 );
+	REQUIRE( d[2].related.size() == 1 );
+	CHECK( d[2].related[0].range.start.line == 4 );
+	CHECK( d[3].range.start.line == 1 );		// no clue: the first line with the number
 }

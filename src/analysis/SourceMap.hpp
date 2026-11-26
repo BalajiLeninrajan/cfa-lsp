@@ -4,6 +4,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "Types.hpp"
@@ -64,8 +65,10 @@ class SourceMap {
 	// The two differ after a #line directive that cpp obeyed, and gcc's
 	// diagnostics use the markers' numbers. Returns `line` for a file without
 	// such directives, an unreadable or unknown file, and for identity().
-	// Where two lines share a number, the first one wins.
-	int realLine( const std::string & file, int line ) const;
+	// A #line that numbers backwards gives two lines the same number. Then
+	// the line that holds what `message` (gcc's text for the diagnostic)
+	// quotes wins, or the #warning or #error it reports, else the first.
+	int realLine( const std::string & file, int line, std::string_view message = {} ) const;
 
 	// Every file named in a line marker (empty for identity()).
 	std::vector<std::string> files() const;

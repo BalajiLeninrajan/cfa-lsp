@@ -42,6 +42,8 @@
   can differ from what you wrote (`Fib &f`, assertions left out).
 - Without the translator, where a check runs the whole cfa driver, its
   messages after a `#line` directive give the directive's line numbers.
+- After a `#line` that numbers backwards, a gcc message that quotes no name
+  found on either line with its number goes to the earlier line.
 - If the translator fails an internal assertion or crashes, the check reports
   `internal translator error` on line 1, and unless the crash came after
   resolution the previous results stay in use.

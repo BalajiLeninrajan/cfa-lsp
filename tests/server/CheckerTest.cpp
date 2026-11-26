@@ -57,7 +57,8 @@ TEST_CASE( "real cfa: preprocessor errors land on the real file" ) {
 }
 
 // cpp numbers lines after a #line by the directive, and skips one in a branch
-// it doesn't take. Its messages land on the real lines.
+// it doesn't take. Its messages land on the real lines. If the skipped #line
+// counted, "#warning before" would land on line 5.
 TEST_CASE( "real cfa: preprocessor diagnostics after a #line land on the real line" ) {
 	std::string fake = envOr( "CFA_LSP_FAKE_CFA" );
 	if ( findInPath( "cfa" ).empty() || ! executable( fake ) ) {
@@ -72,7 +73,7 @@ TEST_CASE( "real cfa: preprocessor diagnostics after a #line land on the real li
 	const std::string text =
 		"int a;\n"								// 0
 		"#if 0\n"								// 1
-		"#line 900\n"							// 2
+		"#line 3\n"								// 2
 		"#endif\n"								// 3
 		"#warning before the directive\n"		// 4
 		"#line 100\n"							// 5
@@ -96,7 +97,7 @@ TEST_CASE( "real cfa: preprocessor diagnostics after a #line land on the real li
 }
 
 // gcc reads the translator's C, whose line markers give the numbers of the
-// #line too.
+// #line too. If the skipped #line counted, `early` would land on line 5.
 TEST_CASE( "real cfa and translator: backend diagnostics after a #line land on the real line" ) {
 	std::string translator = envOr( "CFA_LSP_TRANSLATOR" );
 	if ( findInPath( "cfa" ).empty() || ! executable( translator ) ) {
@@ -108,24 +109,88 @@ TEST_CASE( "real cfa and translator: backend diagnostics after a #line land on t
 	Checker ch( discoverToolchain( o ) );
 	TempDir proj;
 	std::string main = proj.path() + "/main.cfa";
-	CheckRequest req = requestFor( main,
+	// The 0-based line of gcc's "unused variable 'name'" in main.
+	auto unusedLine = [&]( const std::string & text, const std::string & name ) {
+		CheckRequest req = requestFor( main, text );
+		FrontResult fr = ch.front( req, CancelToken() );
+		REQUIRE( fr.status == FrontResult::Ok );
+		REQUIRE( fr.backendReady );
+		int line = -1;
+		for ( const Diag & d : ch.back( req, fr, CancelToken() ) ) {
+			INFO( d.file << ":" << d.range.start.line << ": " << d.message );
+			if ( d.file == main && d.message.find( "unused variable '" + name + "'" ) != std::string::npos ) line = d.range.start.line;
+		}
+		return line;
+	};
+	const std::string text =
 		"int main() {\n"						// 0
 		"#ifdef NOT_DEFINED\n"					// 1
-		"#line 900\n"							// 2
+		"#line 3\n"								// 2
 		"#endif\n"								// 3
-		"#line 100\n"							// 4
-		"\tint unused;\n"						// 5
-		"\treturn 0;\n"							// 6
-		"}\n" );
-	FrontResult fr = ch.front( req, CancelToken() );
-	REQUIRE( fr.status == FrontResult::Ok );
-	REQUIRE( fr.backendReady );
-	int line = -1;
-	for ( const Diag & d : ch.back( req, fr, CancelToken() ) ) {
-		INFO( d.file << ":" << d.range.start.line << ": " << d.message );
-		if ( d.file == main && d.message.find( "unused variable 'unused'" ) != std::string::npos ) line = d.range.start.line;
+		"\tint early;\n"						// 4
+		"#line 100\n"							// 5
+		"\tint unused;\n"						// 6
+		"\treturn 0;\n"							// 7
+		"}\n";
+	CHECK( unusedLine( text, "early" ) == 4 );
+	CHECK( unusedLine( text, "unused" ) == 6 );
+
+	// Numbered backwards, gcc's line 2 is both line 1 and line 4. The name
+	// gcc quotes is on line 4.
+	const std::string back =
+		"int a;\n"								// 0
+		"int b;\n"								// 1
+		"#line 1\n"								// 2
+		"int main() {\n"						// 3, numbered 1
+		"\tint unused;\n"						// 4, numbered 2
+		"\treturn 0;\n"							// 5
+		"}\n";
+	CHECK( unusedLine( back, "unused" ) == 4 );
+}
+
+// The summary of an included file's errors goes on the real #include line,
+// and so do cpp's messages after a #line that numbers backwards.
+TEST_CASE( "real cfa: include summaries after a #line land on the real line" ) {
+	std::string fake = envOr( "CFA_LSP_FAKE_CFA" );
+	if ( findInPath( "cfa" ).empty() || ! executable( fake ) ) {
+		MESSAGE( "needs cfa on PATH and CFA_LSP_FAKE_CFA; skipping" );
+		return;
 	}
-	CHECK( line == 5 );
+	ToolchainOptions o;
+	o.translator = fake;						// only the cpp stage matters here
+	Checker ch( discoverToolchain( o ) );
+	TempDir proj;
+	std::string main = proj.path() + "/main.cfa";
+	std::ofstream( proj.path() + "/bad.hfa" ) << "#error boom\n";
+	auto lineOf = []( const FrontResult & fr, const std::string & file, const std::string & text ) {
+		int line = -1;
+		for ( const Diag & d : fr.diags ) {
+			INFO( d.file << ":" << d.range.start.line << ": " << d.message );
+			if ( d.file == file && d.message.find( text ) != std::string::npos ) line = d.range.start.line;
+		}
+		return line;
+	};
+
+	FrontResult fr = ch.front( requestFor( main,
+		"int a;\n"								// 0
+		"#line 100\n"							// 1
+		"#include \"bad.hfa\"\n"				// 2, numbered 100
+		"int main() {}\n" ), CancelToken() );
+	CHECK( fr.status == FrontResult::PreprocessFailed );
+	CHECK( lineOf( fr, main, "in included file bad.hfa" ) == 2 );
+	CHECK( lineOf( fr, proj.path() + "/bad.hfa", "boom" ) == 0 );
+
+	fr = ch.front( requestFor( main,
+		"int a;\n"								// 0, numbered 1
+		"#warning first\n"						// 1, numbered 2
+		"#line 1\n"								// 2
+		"#warning second\n"						// 3, numbered 1
+		"#include \"bad.hfa\"\n"				// 4, numbered 2
+		"int main() {}\n" ), CancelToken() );
+	CHECK( fr.status == FrontResult::PreprocessFailed );
+	CHECK( lineOf( fr, main, "#warning first" ) == 1 );
+	CHECK( lineOf( fr, main, "#warning second" ) == 3 );
+	CHECK( lineOf( fr, main, "in included file bad.hfa" ) == 4 );
 }
 
 TEST_CASE( "real cfa: the file's directory is searched for quoted includes only" ) {

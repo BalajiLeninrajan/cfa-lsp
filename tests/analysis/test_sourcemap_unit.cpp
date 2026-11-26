@@ -367,6 +367,38 @@ TEST_CASE( "sourcemap: realLine without a map or a file" ) {
 	CHECK( m.realLine( "/r/x.cfa", 0 ) == 0 );
 }
 
+// After a #line that numbers backwards, two lines share each number. The
+// message picks one: a name it quotes, whole, or the #warning it reports.
+TEST_CASE( "sourcemap: realLine after a #line that numbers backwards" ) {
+	Files f;
+	const std::string F = "/r/w.cfa";
+	f.text[F] =
+		"int a;\n"							// 0, numbered 1
+		"#warning first\n"					// 1, numbered 2
+		"#line 1\n"							// 2
+		"#warning second\n"					// 3, numbered 1
+		"int main() { int unused; }\n";		// 4, numbered 2
+	SourceMap m( "# 1 \"/r/w.cfa\"\n"
+				 "int a;\n"
+				 "\n"
+				 "# 1 \"/r/w.cfa\"\n"
+				 "\n"
+				 "int main() { int unused; }\n",
+				 f.reader() );
+	// Without a pline, the translator's position goes to the line with tokens.
+	CHECK( m.map( F, 2, 17 ) == L( 4, 17 ) );
+	CHECK( m.map( F, 1, 4 ) == L( 0, 4 ) );
+	CHECK( m.realLine( F, 2 ) == 2 );								// no message: the first
+	CHECK( m.realLine( F, 2, "unused variable 'unused'" ) == 5 );
+	CHECK( m.realLine( F, 2, "\xe2\x80\x98unused\xe2\x80\x99 is unused" ) == 5 );
+	CHECK( m.realLine( F, 2, "'main' is here" ) == 5 );
+	CHECK( m.realLine( F, 2, "#warning first" ) == 2 );
+	CHECK( m.realLine( F, 1, "#warning second" ) == 4 );
+	CHECK( m.realLine( F, 1, "'a' declared here" ) == 1 );
+	CHECK( m.realLine( F, 1, "'warn' is not a name here" ) == 1 );	// "warn" is only part of "warning"
+	CHECK( m.realLine( F, 1, "'second'" ) == 4 );
+}
+
 // An identifier in a macro's body that is also an argument: the expansion is
 // redone from the #define, so the body's tmp maps to the whole invocation and
 // the argument's to the argument.

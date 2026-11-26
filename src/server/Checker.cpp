@@ -163,11 +163,19 @@ std::optional<int> includeLineByName( const std::string & text, const std::strin
 }
 
 // Where each file was included, with the temp input renamed to the real file.
-IncludeSites includeSites( const std::string & preprocessed, const std::string & tmpInput, const std::string & mainPath ) {
+// The markers number the main file's #include lines as a #line says, so with
+// `lines` (the map of `preprocessed`) they go back to the real lines. Only the
+// main file's are used (see includeLineInMain).
+IncludeSites includeSites( const std::string & preprocessed, const std::string & tmpInput, const std::string & mainPath,
+						   const SourceMap * lines ) {
 	IncludeSites sites;
 	for ( auto & [file, site] : findIncludeSites( preprocessed ) ) {
-		std::string parent = normalize( site.first ) == normalize( tmpInput ) ? mainPath : normalize( site.first );
-		sites[normalize( file )] = { parent, site.second };
+		const bool temp = normalize( site.first ) == normalize( tmpInput );
+		std::string parent = temp ? mainPath : normalize( site.first );
+		int line = site.second;
+		// The #include line names the file, as a message would quote it.
+		if ( lines && ! temp && parent == mainPath ) line = lines->realLine( site.first, line, "'" + baseName( file ) + "'" );
+		sites[normalize( file )] = { parent, line };
 	}
 	return sites;
 }
@@ -255,7 +263,7 @@ std::vector<Diag> diagsFromOutput( const std::string & output, const std::string
 		file = normalize( file );
 		// gcc names the file as the line markers do.
 		const bool temp = file == normalize( tmpInput );
-		auto realLine = [&] { if ( lines && ! temp && ! r.file.empty() ) r.line = lines->realLine( r.file, r.line ); };
+		auto realLine = [&] { if ( lines && ! temp && ! r.file.empty() ) r.line = lines->realLine( r.file, r.line, r.message ); };
 		if ( temp ) file = realPath;
 		if ( r.severity == "note" ) {
 			if ( lastKept && file[0] == '/' ) {
@@ -640,7 +648,7 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 	std::vector<Diag> cppDiags = diagsFromOutput( cppErr, req.path, in, cwd, tc, "cpp", sm.get() );
 	if ( ! r.ok() ) {
 		fr.status = FrontResult::PreprocessFailed;
-		fr.diags = withIncludeSummaries( cppDiags, req.path, includeSites( preprocessed, in, req.path ), tc );
+		fr.diags = withIncludeSummaries( cppDiags, req.path, includeSites( preprocessed, in, req.path, sm.get() ), tc );
 		bool anyError = false;
 		for ( const auto & d : cppDiags ) anyError = anyError || d.severity == 1;
 		if ( ! anyError ) {
@@ -730,7 +738,7 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 		if ( x.severity == 1 ) anyError = true;
 		all.push_back( std::move( x ) );
 	}
-	IncludeSites sites = includeSites( preprocessed, in, req.path );
+	IncludeSites sites = includeSites( preprocessed, in, req.path, sm.get() );
 	for ( const auto & [f, site] : sites ) {
 		if ( ! f.empty() && f[0] == '/' && f != req.path && f != normalize( in ) && ! tc.isSystemPath( f ) ) fr.files.push_back( f );
 	}
@@ -794,7 +802,7 @@ std::vector<Diag> Checker::back( const CheckRequest & req, const FrontResult & f
 		const bool temp = file == normalize( dir + "/in.cfa" );
 		if ( temp ) file = req.path;
 		// The lines are numbered as in the markers, which a #line changes.
-		auto realLine = [&] { if ( fr.sourceMap && ! temp ) line = fr.sourceMap->realLine( marked, line ); };
+		auto realLine = [&] { if ( fr.sourceMap && ! temp ) line = fr.sourceMap->realLine( marked, line, raw.message ); };
 		if ( raw.severity == "note" ) {
 			if ( lastKept && file[0] == '/' && ! out.empty() ) {
 				realLine();
