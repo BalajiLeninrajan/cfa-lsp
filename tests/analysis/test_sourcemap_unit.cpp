@@ -567,6 +567,35 @@ TEST_CASE( "sourcemap: definitions cpp hadn't read yet, and ones in dead #if bra
 	CHECK( m.inMacroBody( F, { 16, 14 } ) );
 }
 
+// A header whose only #if is an #ifdef has no include guard, so the #undef and
+// #define inside it may not have happened.
+TEST_CASE( "sourcemap: an #if around a header that isn't an include guard" ) {
+	Files f;
+	f.text["/r/big.h"] = "#ifdef BIG\n#undef N\n#define N 100\n#endif\n";
+	f.text["/r/main.cfa"] =
+		"#define N 10\n"
+		"#define S( a, b ) { int tmp = a; a = b; b = tmp + N; }\n"
+		"#include \"big.h\"\n"
+		"void h( int x, int tmp ) { S( x, tmp ); }\n";
+	std::string prep =
+		"# 0 \"/r/main.cfa\"\n"
+		"# 0 \"<built-in>\"\n"
+		"# 0 \"<command-line>\"\n"
+		"# 1 \"/r/main.cfa\"\n"
+		"\n"
+		"\n"
+		"# 1 \"/r/big.h\" 1\n"
+		"# 4 \"/r/main.cfa\" 2\n"
+		"void h( int x, int tmp ) { { int tmp = x; x = tmp; tmp = tmp + 10; }; }\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/main.cfa";
+	CHECK( m.map( F, 4, 33 ) == L( 3, 27 ) );
+	CHECK( m.inMacroBody( F, { 4, 33 } ) );
+	CHECK( m.map( F, 4, 46 ) == L( 3, 33 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 4, 46 } ) );
+	CHECK( m.inMacroBody( F, { 4, 63 } ) );
+}
+
 // The alignment can give a macro use the wrong tokens: two uses side by side,
 // a body that ends in a function-like macro name, which takes the ( ... )
 // after the use, or a use whose arguments it matched one by one. The redo
@@ -616,6 +645,96 @@ TEST_CASE( "sourcemap: macro uses the alignment cuts in the wrong place" ) {
 	CHECK( m.inMacroBody( F, { 8, 57 } ) );
 	CHECK( m.map( F, 8, 77 ) == L( 7, 49 ) );
 	CHECK( m.inMacroBody( F, { 8, 77 } ) );
+}
+
+// When the alignment cuts a use and the macro has more than one definition,
+// the first one that matches the start of what cpp printed isn't enough: a
+// shorter or empty body can match the start of a longer one. An empty body
+// still wins when the tokens after the use are the source's own.
+TEST_CASE( "sourcemap: cut uses of macros with more than one definition" ) {
+	Files f;
+	f.text["/r/alt.cfa"] =
+		"#define LONG\n"									// 0
+		"#ifdef LONG\n"
+		"#define TWO( a ) a + tmp + tmp\n"
+		"#else\n"
+		"#define TWO( a ) a + tmp\n"
+		"#endif\n"											// 5
+		"#ifndef NDEBUG\n"
+		"#define CHECK( x ) check( x );\n"
+		"#else\n"
+		"#define CHECK( x )\n"
+		"#endif\n"											// 10
+		"#define OFF_ON\n"
+		"#ifndef OFF_ON\n"
+		"#define OFF( x ) check( x );\n"
+		"#else\n"
+		"#define OFF( x )\n"								// 15
+		"#endif\n"
+		"int u = TWO( tmp ) TWO( y );\n"
+		"void f( int y ) { CHECK( y ) CHECK( y ) }\n"
+		"void g( int y ) { OFF( y ) check( y ); }\n";
+	std::string prep =
+		"# 1 \"/r/alt.cfa\"\n"
+		"# 18 \"/r/alt.cfa\"\n"
+		"int u = tmp + tmp + tmp y + tmp + tmp;\n"
+		"void f( int y ) { check( y ); check( y ); }\n"
+		"void g( int y ) { check( y ); }\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/alt.cfa";
+	// The first TWO gave "tmp + tmp + tmp", not "tmp + tmp".
+	CHECK( m.map( F, 18, 8 ) == L( 17, 13 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 18, 8 } ) );
+	CHECK( m.map( F, 18, 14 ) == L( 17, 8 ) );
+	CHECK( m.inMacroBody( F, { 18, 14 } ) );
+	CHECK( m.map( F, 18, 20 ) == L( 17, 8 ) );
+	CHECK( m.inMacroBody( F, { 18, 20 } ) );
+	CHECK( m.map( F, 18, 24 ) == L( 17, 24 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 18, 24 } ) );
+	CHECK( m.map( F, 18, 28 ) == L( 17, 19 ) );
+	CHECK( m.inMacroBody( F, { 18, 28 } ) );
+	CHECK( m.map( F, 18, 34 ) == L( 17, 19 ) );
+	// The first CHECK gave "check( y );", though the empty CHECK fits too.
+	CHECK( m.map( F, 19, 18 ) == L( 18, 18 ) );
+	CHECK( m.inMacroBody( F, { 19, 18 } ) );
+	CHECK( m.map( F, 19, 25 ) == L( 18, 25 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 19, 25 } ) );
+	CHECK( m.map( F, 19, 30 ) == L( 18, 29 ) );
+	CHECK( m.inMacroBody( F, { 19, 30 } ) );
+	CHECK( m.map( F, 19, 37 ) == L( 18, 36 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 19, 37 } ) );
+	// OFF gave nothing; "check( y );" is the source's.
+	CHECK( m.map( F, 20, 18 ) == L( 19, 27 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 20, 18 } ) );
+	CHECK( m.map( F, 20, 25 ) == L( 19, 34 ) );
+}
+
+// A macro that expands to its own name, as glibc's stdin, stdout and stderr
+// do, leaves the name the source spells in an argument.
+TEST_CASE( "sourcemap: a macro that expands to its own name" ) {
+	Files f;
+	f.text["/r/self.cfa"] =
+		"#define stdout stdout\n"
+		"#define OUT stdout\n"
+		"#define CHECK( e ) if ( ( e ) != 0 ) abort()\n"
+		"void f() { CHECK( fflush( stdout ) ); }\n"
+		"void g() { CHECK( fflush( OUT ) ); }\n";
+	std::string prep =
+		"# 1 \"/r/self.cfa\"\n"
+		"\n\n\n"
+		"void f() { if ( ( fflush( stdout ) ) != 0 ) abort(); }\n"
+		"void g() { if ( ( fflush( stdout ) ) != 0 ) abort(); }\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/self.cfa";
+	CHECK( m.map( F, 4, 18 ) == L( 3, 18 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 4, 18 } ) );
+	CHECK( m.map( F, 4, 26 ) == L( 3, 26 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 4, 26 } ) );
+	CHECK( m.map( F, 4, 44 ) == L( 3, 11 ) );
+	CHECK( m.inMacroBody( F, { 4, 44 } ) );
+	// Here stdout is OUT's body.
+	CHECK( m.map( F, 5, 26 ) == L( 4, 26 ) );
+	CHECK( m.inMacroBody( F, { 5, 26 } ) );
 }
 
 TEST_CASE( "sourcemap: __VA_OPT__" ) {

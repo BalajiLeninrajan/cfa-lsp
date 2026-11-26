@@ -274,10 +274,12 @@ class Expander {
 
 	// Expands the macro use that starts at O[ob], with as many of the tokens
 	// before O[oe] as it takes, and compares the result with the start of
-	// P[pb, pe). On a match, returns how many tokens it gave, with from as
-	// above and the use's end in O as `stop`. Returns 0 when it doesn't match,
-	// O[ob] isn't a macro, or the use gives no tokens.
-	size_t prefix( size_t ob, size_t oe, std::vector<Origin> & from, size_t & stop );
+	// P[pb, pe). Of the combinations of definitions that match, and after
+	// which the rest can still align, takes the one that gives the most
+	// tokens. On a match, from is as above (empty when the use gives nothing)
+	// and `stop` is the use's end in O. False when nothing matches or O[ob]
+	// isn't a macro.
+	bool prefix( size_t ob, size_t oe, std::vector<Origin> & from, size_t & stop );
 
   private:
 	static constexpr int MaxAttempts = 16;			// combinations of definitions to try
@@ -307,8 +309,9 @@ class Expander {
 
 	const Define * lookup( const std::string & name );
 	int idOf( const std::string & name );
-	template<typename Fits>
-	bool search( size_t ob, size_t oe, std::vector<Origin> & from, Fits fits );
+	bool followed( size_t p, size_t o, size_t oe );
+	template<typename Take>
+	void search( size_t ob, size_t oe, Take take );
 	bool emit( XTok t, std::vector<XTok> & out, bool top );
 	bool expand( std::vector<XTok> ts, std::vector<XTok> & out, bool top, int depth );
 	bool subst( const Define & d, const Args & args, bool omitted, const HideSet & hs, const Origin & inv,
@@ -331,9 +334,11 @@ int Expander::idOf( const std::string & name ) {
 	return ids.try_emplace( name, (int)ids.size() ).first->second;
 }
 
-// Tries combinations of definitions until the expansion of O[ob, oe) fits.
-template<typename Fits>
-bool Expander::search( size_t ob, size_t oe, std::vector<Origin> & from, Fits fits ) {
+// Tries combinations of definitions, the likeliest first, and passes each
+// expansion of O[ob, oe) that cpp's output starts with to take(), until it
+// returns true.
+template<typename Take>
+void Expander::search( size_t ob, size_t oe, Take take ) {
 	std::vector<XTok> in;
 	for ( size_t o = ob; o < oe; ++o ) {
 		XTok t;
@@ -347,35 +352,66 @@ bool Expander::search( size_t ob, size_t oe, std::vector<Origin> & from, Fits fi
 		work = 0;
 		stopAt = SIZE_MAX;
 		std::vector<XTok> out;
-		if ( expand( in, out, true, 0 ) && fits( out ) ) {
-			from.clear();
-			for ( const XTok & t : out ) from.push_back( t.from );
-			return true;
-		}
+		if ( expand( in, out, true, 0 ) && take( out ) ) return;
 		// The next combination of definitions, the first name met changing fastest.
 		size_t k = 0;
 		for ( ; k < choices.size(); ++k ) {
 			if ( ++choices[k]->pick < choices[k]->defs.size() ) break;
 			choices[k]->pick = 0;
 		}
-		if ( k == choices.size() ) return false;
+		if ( k == choices.size() ) return;
 	}
-	return false;
+}
+
+std::vector<Origin> origins( const std::vector<XTok> & out ) {
+	std::vector<Origin> from;
+	for ( const XTok & t : out ) from.push_back( t.from );
+	return from;
 }
 
 bool Expander::run( size_t ob, size_t oe, std::vector<Origin> & from ) {
 	prefixMode = false;
-	return search( ob, oe, from, [&]( const std::vector<XTok> & out ) { return out.size() == pe - pb; } );
+	bool found = false;
+	search( ob, oe, [&]( const std::vector<XTok> & out ) {
+		if ( out.size() != pe - pb ) return false;
+		from = origins( out );
+		return found = true;
+	} );
+	return found;
 }
 
-size_t Expander::prefix( size_t ob, size_t oe, std::vector<Origin> & from, size_t & stop ) {
+// Whether the rest can align after a use that gave P[pb, p) and ends at O[o]:
+// cpp printed nothing more, the tokens after O[oe] aren't known, or P[p] is
+// O[o] itself or can come from a macro use at O[o].
+bool Expander::followed( size_t p, size_t o, size_t oe ) {
+	if ( p == pe || o >= oe ) return true;
+	if ( O[o].text == P[p].tok.text ) return true;
+	if ( O[o].kind != TokKind::Identifier ) return false;
+	if ( madeUpByCpp( O[o].text ) ) return true;
+	for ( const Define * d : defines( O[o].text, P[pb].pline ) ) {
+		if ( d ) return true;
+	}
+	return false;
+}
+
+bool Expander::prefix( size_t ob, size_t oe, std::vector<Origin> & from, size_t & stop ) {
 	prefixMode = true;
 	first = ob;
-	// The first expansion that cpp's output starts with is taken, even when
-	// it gives nothing (then there is nothing to map).
-	if ( !search( ob, oe, from, []( const std::vector<XTok> & ) { return true; } ) ) return 0;
-	stop = std::min( stopAt, oe );
-	return from.size();
+	// The first match isn't enough: when two uses sit side by side, a shorter
+	// body (or an empty one) can match the start of what the first use gave.
+	// So every combination is tried. A longer match that leaves a token the
+	// source can't account for, as when an empty use is followed by the
+	// tokens a longer body would give, is passed over.
+	bool found = false;
+	search( ob, oe, [&]( const std::vector<XTok> & out ) {
+		size_t end = std::min( stopAt, oe );
+		if ( ( found && out.size() <= from.size() ) || !followed( pb + out.size(), end, oe ) ) return false;
+		from = origins( out );
+		stop = end;
+		found = true;
+		return false;
+	} );
+	return found;
 }
 
 // Appends a finished token. At the top, it has to be the next one cpp printed.
@@ -708,10 +744,9 @@ std::pair<size_t, size_t> Aligner::macro( size_t pb, size_t pe, size_t ob, size_
 	constexpr size_t MaxFollow = 64;				// tokens after O[oe] the use may take
 	size_t stop = oe;
 	if ( pb < pmax ) {
-		size_t n = Expander( O, P, pb, pmax, defines ).prefix( ob, std::min( omax, oe + MaxFollow ), from, stop );
-		if ( n > 0 ) {
-			redone( pb, pb + n, ob, stop, from );
-			return { pb + n, stop };
+		if ( Expander( O, P, pb, pmax, defines ).prefix( ob, std::min( omax, oe + MaxFollow ), from, stop ) ) {
+			redone( pb, pb + from.size(), ob, stop, from );
+			return { pb + from.size(), stop };
 		}
 	}
 	guess( pb, pe, ob, oe );
@@ -726,7 +761,9 @@ void Aligner::redone( size_t pb, size_t pe, size_t ob, size_t oe, const std::vec
 		m.start = m.outerStart = invStart;
 		m.end = m.outerEnd = invEnd;
 		const Origin & f = from[p - pb];
-		m.body = f.body;
+		// A macro that expands to its own name (glibc's #define stdout
+		// stdout) leaves the name the source spells there.
+		m.body = f.body && !( f.b >= 0 && f.e == f.b + 1 && O[f.b].text == P[p].tok.text );
 		// An identifier maps to the argument it was copied from, or for
 		// one from a body, to the invocation in an argument that made it.
 		if ( P[p].tok.kind == TokKind::Identifier && f.b >= 0 ) {
@@ -1081,20 +1118,56 @@ void parseDirective( const std::string & l, int at, Directives & out ) {
 	out.defines.push_back( std::move( d ) );
 }
 
+// The name an include guard's #ifndef X, #if !defined X or #if !defined( X )
+// tests, given the directive's text after the word; empty for anything else.
+std::string guardName( std::string_view rest, bool ifndef ) {
+	size_t i = 0;
+	auto blanks = [&] { while ( i < rest.size() && ( rest[i] == ' ' || rest[i] == '\t' || rest[i] == '\r' ) ) ++i; };
+	auto name = [&] {
+		blanks();
+		size_t b = i;
+		while ( i < rest.size() && identChar( rest[i] ) ) ++i;
+		return std::string( rest.substr( b, i - b ) );
+	};
+	auto punct = [&]( char c ) {
+		blanks();
+		if ( i == rest.size() || rest[i] != c ) return false;
+		++i;
+		return true;
+	};
+	std::string n;
+	if ( ifndef ) {
+		n = name();
+	} else {
+		if ( !punct( '!' ) || name() != "defined" ) return {};
+		bool paren = punct( '(' );
+		n = name();
+		if ( paren && !punct( ')' ) ) return {};
+	}
+	blanks();
+	// Only a comment may follow.
+	if ( i < rest.size() && rest.compare( i, 2, "//" ) != 0 && rest.compare( i, 2, "/*" ) != 0 ) return {};
+	return n;
+}
+
 // The directives SourceMap uses: #define and #undef to redo macro expansions,
 // and #line. The lexer finds them, so a directive inside a comment is skipped.
 // Conditionals are not evaluated, but a #define or #undef inside one is marked
-// `conditional`: it may not have happened. An #if around everything else in
-// the file, with no #else, is taken to be an include guard and doesn't count.
+// `conditional`: it may not have happened. An include guard doesn't count: an
+// #ifndef X (or #if !defined X) whose next directive is #define X, around
+// everything else in the file, with no #else.
 Directives scanDirectives( std::string_view text ) {
 	Directives out;
 	LexOptions opts;
 	opts.directives = true;
 	int depth = 0;
 	std::vector<int> depths;			// per entry of out.defines
-	// The first #if at depth 0, if no #define or #undef comes before it: open
-	// while depth > 0, and a guard unless it has an #else or anything follows it.
-	enum { None, Open, Closed, NotGuard } guard = None;
+	// The first #if at depth 0, if no #define or #undef comes before it.
+	// Tested when it asks whether a name is undefined, Open once the next
+	// directive defines that name, and a guard (Closed) at its #endif, unless
+	// it has an #else or anything follows it.
+	enum { None, Tested, Open, Closed, NotGuard } guard = None;
+	std::string guarded;
 	for ( const Token & t : lex( text, opts ) ) {
 		if ( t.kind != TokKind::Directive ) continue;
 		const std::string & l = t.text;
@@ -1103,8 +1176,16 @@ Directives scanDirectives( std::string_view text ) {
 		size_t k = i;
 		while ( k < l.size() && identChar( l[k] ) ) ++k;
 		const std::string_view word = std::string_view( l ).substr( i, k - i );
+		const bool tested = guard == Tested;
+		if ( tested ) guard = NotGuard;
 		if ( word == "if" || word == "ifdef" || word == "ifndef" ) {
-			if ( depth == 0 ) guard = guard == None ? Open : NotGuard;
+			if ( depth == 0 ) {
+				if ( guard == None && word != "ifdef" ) {
+					guarded = guardName( std::string_view( l ).substr( k ), word == "ifndef" );
+					if ( !guarded.empty() ) guard = Tested;
+				}
+				if ( guard != Tested ) guard = NotGuard;
+			}
 			++depth;
 		} else if ( word == "endif" ) {
 			if ( depth > 0 && --depth == 0 && guard == Open ) guard = Closed;
@@ -1114,7 +1195,9 @@ Directives scanDirectives( std::string_view text ) {
 			size_t before = out.defines.size();
 			parseDirective( l, t.line, out );
 			if ( out.defines.size() > before ) {
-				if ( depth == 0 ) guard = guard == None ? NotGuard : guard == Closed ? NotGuard : guard;
+				const Define & d = out.defines.back();
+				if ( tested && !d.undef && d.name == guarded ) guard = Open;
+				if ( depth == 0 ) guard = NotGuard;
 				depths.push_back( depth );
 			}
 		}
