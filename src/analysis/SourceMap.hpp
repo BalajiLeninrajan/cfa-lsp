@@ -57,7 +57,7 @@ class SourceMap {
 	// Whether the token at `p` came from the body of a macro rather than from
 	// the source or a macro argument, so the source has no token for it, only
 	// the invocation. Known only when SourceMap could redo the expansion from
-	// a #define in the file or a header it includes directly; false otherwise.
+	// the #defines cpp had read by then; false otherwise.
 	bool inMacroBody( const std::string & file, Point p ) const;
 
 	// Every file named in a line marker (empty for identity()).

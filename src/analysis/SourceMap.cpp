@@ -4,6 +4,7 @@
 #include <cctype>
 #include <climits>
 #include <cstdint>
+#include <iterator>
 #include <mutex>
 #include <string_view>
 #include <unordered_map>
@@ -33,10 +34,18 @@
 // parenthesised arguments, if any) as a macro invocation that produced any
 // number of preprocessed tokens, or skip a token on either side (dead #if
 // code, _Pragma, anything unexplained). Tokens produced by a macro map to the
-// invocation; identifiers in the expansion that also appear in the invocation
-// (usually arguments) map to that occurrence instead. When such an identifier
-// could also have come from the macro's body, the expansion is redone from the
-// #define (see Aligner::redo) to tell the two apart.
+// invocation, and identifiers copied from its arguments map to the argument.
+// To tell the two apart, the expansion is redone from the #defines in effect
+// where cpp printed it (see Expander), which also says which tokens came from
+// a macro's body. When it can't be redone, an identifier that the invocation
+// also has is taken to be that occurrence.
+//
+// The #defines in effect come from every file cpp read, in the order it read
+// them: the line markers say when cpp entered and left each file and how far
+// it had got, which places each #define and #undef among the preprocessed
+// lines (see Impl::buildEnv). Conditionals are not evaluated, so a macro
+// defined in more than one branch has several definitions, and the redo tries
+// them until one gives what cpp printed.
 //
 // A #line directive in the original makes the markers give line numbers that
 // differ from the real ones. The file's own #line directives say how the two
@@ -63,7 +72,7 @@ struct Mapped {
 	Loc start, end;					// original span
 	Loc outerStart, outerEnd;		// the whole macro invocation for expanded tokens
 	int origTok = -1;				// original token index for exact matches
-	bool body = false;				// copied from a macro's body (see Aligner::redo)
+	bool body = false;				// made by a macro's body, not copied from the source (see Expander)
 };
 
 // The tokens of one original line, split by preprocessed line. There is more
@@ -82,15 +91,17 @@ struct PrepLine {
 	int presumed;					// the line the markers give (differs after a #line)
 	size_t off, len;				// in the preprocessed text
 	bool cont;						// continues the previous entry's original line
+	int pline;						// 1-based line in the preprocessed text
 	int seg = -1, sub = 0;			// where buildFile put it: segment, and piece of its line
 };
 
 // A #define (or #undef) in an original file, for redoing an expansion.
 struct Define {
+	std::string name;
 	int line = 0;					// 0-based line of the directive
 	bool undef = false;
 	bool function = false;
-	bool usable = true;				// false when the body uses # or ## or __VA_OPT__
+	bool usable = true;				// false when the body uses __VA_OPT__
 	std::vector<std::string> params;	// __VA_ARGS__ for "..."
 	bool variadic = false;			// the last parameter takes the remaining arguments
 	std::vector<Token> body;
@@ -104,10 +115,20 @@ struct LineDirective {
 };
 
 struct Directives {
-	std::unordered_map<std::string, std::vector<Define>> defines;	// in file order
-	std::vector<std::string> includes;	// names as written in #include
+	std::vector<Define> defines;	// #define and #undef, in file order
 	std::vector<LineDirective> lines;
 };
+
+// The line the markers give 0-based line `actual` of a file with these #line
+// directives (0-based too).
+int presumedLine( const std::vector<LineDirective> & lines, int actual ) {
+	int p = actual;
+	for ( const LineDirective & d : lines ) {
+		if ( d.at >= actual ) break;
+		p = d.number - 1 + ( actual - d.at - 1 );
+	}
+	return p;
+}
 
 // From original line `actual` on, line actual + k is presumed line
 // presumed + k, for lines up to the next region. `ours` is false while a
@@ -160,14 +181,375 @@ struct PTok {
 	Token tok;						// col/endCol are offsets in the preprocessed line
 	int line;						// 0-based original line
 	int sub;						// index into the line's SubLines
+	int pline;						// 1-based line in the preprocessed text
 };
 
 Loc startOf( const Token & t ) { return { t.line, t.col }; }
 Loc endOf( const Token & t ) { return { t.endLine, t.endCol }; }
 
-// The definitions a macro named `name` invoked on 0-based line `line` may have,
-// likeliest first.
-using DefineLookup = std::function<std::vector<const Define *>( const std::string & name, int line )>;
+// The definitions macro `name` may have had when cpp printed preprocessed line
+// `pline`, likeliest first. A null entry stands for "not defined" (after an
+// #undef that may have been in a dead #if branch).
+using DefineLookup = std::function<std::vector<const Define *>( const std::string & name, int pline )>;
+
+// Tokenizes a macro body or a pasted token. A "#" first on the line would
+// start a directive, so the text is lexed after a token that is then dropped.
+std::vector<Token> lexBody( std::string_view text ) {
+	std::vector<Token> ts = lex( "0 " + std::string( text ) );
+	if ( !ts.empty() ) ts.erase( ts.begin() );
+	return ts;
+}
+
+// Builtin macros whose value cpp makes up. In a redone expansion each one
+// matches whatever single token cpp printed for it.
+bool madeUpByCpp( const std::string & name ) {
+	static const char * const names[] = { "__LINE__", "__FILE__", "__BASE_FILE__", "__FILE_NAME__", "__COUNTER__",
+										  "__INCLUDE_LEVEL__", "__DATE__", "__TIME__", "__TIMESTAMP__" };
+	for ( const char * n : names ) {
+		if ( name == n ) return true;
+	}
+	return false;
+}
+
+// Where a token of a redone expansion came from, as original tokens [b, e).
+// A token copied from the source (an argument, or the invocation itself) is
+// that one token. One that a macro's body made (`body`) has the invocation
+// that expanded it, or b = -1 when the source doesn't spell that invocation
+// whole; the outermost invocation then stands for it.
+struct Origin {
+	int b = -1, e = -1;
+	bool body = false;
+};
+
+// The smallest run of original tokens holding both, or none.
+Origin span( const Origin & x, const Origin & y ) {
+	if ( x.b < 0 || y.b < 0 ) return {};
+	return { std::min( x.b, y.b ), std::max( x.e, y.e ), false };
+}
+
+// A macro's ids, sorted: the macros a token may no longer expand (C's rule
+// that a macro is not expanded again inside its own expansion).
+using HideSet = std::vector<int>;
+
+HideSet unite( const HideSet & x, const HideSet & y ) {
+	HideSet out;
+	std::set_union( x.begin(), x.end(), y.begin(), y.end(), std::back_inserter( out ) );
+	return out;
+}
+
+HideSet intersect( const HideSet & x, const HideSet & y ) {
+	HideSet out;
+	std::set_intersection( x.begin(), x.end(), y.begin(), y.end(), std::back_inserter( out ) );
+	return out;
+}
+
+// A token while redoing an expansion.
+struct XTok {
+	std::string text;
+	TokKind kind = TokKind::Other;
+	bool space = false;				// whitespace before it, which # turns into one space
+	bool any = false;				// made up by cpp (__LINE__): matches any one token
+	bool mark = false;				// a placemarker: an empty argument next to ##
+	Origin from;
+	HideSet hide;
+};
+
+// Redoes cpp's expansion of some original tokens, as C11 6.10.3 says (Prosser's
+// algorithm, with hide sets), plus GNU's ", ## __VA_ARGS__". Arguments are
+// expanded before they are substituted, except next to # and ##, and the
+// result is scanned again together with the tokens after it. Every token
+// carries where it came from, and the result has to be exactly what cpp
+// printed, so a wrong guess about the definitions fails instead of mapping
+// tokens to the wrong place.
+class Expander {
+  public:
+	Expander( const std::vector<Token> & O, const std::vector<PTok> & P, size_t pb, size_t pe, const DefineLookup & defines )
+		: O( O ), P( P ), pb( pb ), pe( pe ), defines( defines ) {}
+
+	// Expands O[ob, oe) and compares the result with P[pb, pe). On a match,
+	// from[i] is where P[pb + i] came from.
+	bool run( size_t ob, size_t oe, std::vector<Origin> & from );
+
+  private:
+	static constexpr int MaxAttempts = 16;			// combinations of definitions to try
+	static constexpr size_t MaxWork = 200000;		// tokens scanned per attempt
+	static constexpr size_t MaxTokens = 100000;		// in an expanded argument
+	static constexpr int MaxDepth = 100;			// arguments within arguments
+
+	struct Name {
+		std::vector<const Define *> defs;			// likeliest first; empty when never defined
+		size_t pick = 0;							// the one this attempt uses
+	};
+
+	const std::vector<Token> & O;
+	const std::vector<PTok> & P;
+	const size_t pb, pe;
+	const DefineLookup & defines;
+	std::unordered_map<std::string, Name> names;
+	std::vector<Name *> choices;					// names with more than one definition, in the order met
+	std::unordered_map<std::string, int> ids;
+	size_t work = 0;
+
+	const Define * lookup( const std::string & name );
+	int idOf( const std::string & name );
+	bool emit( XTok t, std::vector<XTok> & out, bool top );
+	bool expand( std::vector<XTok> ts, std::vector<XTok> & out, bool top, int depth );
+	bool subst( const Define & d, const std::vector<std::vector<XTok>> & args, const HideSet & hs, const Origin & inv,
+				std::vector<XTok> & os, int depth );
+};
+
+const Define * Expander::lookup( const std::string & name ) {
+	auto [it, added] = names.try_emplace( name );
+	if ( added ) {
+		it->second.defs = defines( name, P[pb].pline );
+		if ( it->second.defs.size() > 1 ) choices.push_back( &it->second );
+	}
+	const Name & n = it->second;
+	return n.defs.empty() ? nullptr : n.defs[n.pick];
+}
+
+int Expander::idOf( const std::string & name ) {
+	return ids.try_emplace( name, (int)ids.size() ).first->second;
+}
+
+bool Expander::run( size_t ob, size_t oe, std::vector<Origin> & from ) {
+	std::vector<XTok> in;
+	for ( size_t o = ob; o < oe; ++o ) {
+		XTok t;
+		t.text = O[o].text;
+		t.kind = O[o].kind;
+		t.space = o > ob && O[o - 1].endOffset < O[o].offset;
+		t.from = { (int)o, (int)o + 1, false };
+		in.push_back( std::move( t ) );
+	}
+	for ( int attempt = 0; attempt < MaxAttempts; ++attempt ) {
+		work = 0;
+		std::vector<XTok> out;
+		if ( expand( in, out, true, 0 ) && out.size() == pe - pb ) {
+			from.clear();
+			for ( const XTok & t : out ) from.push_back( t.from );
+			return true;
+		}
+		// The next combination of definitions, the first name met changing fastest.
+		size_t k = 0;
+		for ( ; k < choices.size(); ++k ) {
+			if ( ++choices[k]->pick < choices[k]->defs.size() ) break;
+			choices[k]->pick = 0;
+		}
+		if ( k == choices.size() ) return false;
+	}
+	return false;
+}
+
+// Appends a finished token. At the top, it has to be the next one cpp printed.
+bool Expander::emit( XTok t, std::vector<XTok> & out, bool top ) {
+	if ( top ) {
+		size_t p = pb + out.size();
+		if ( p >= pe || ( !t.any && P[p].tok.text != t.text ) ) return false;
+	} else if ( out.size() >= MaxTokens ) {
+		return false;
+	}
+	out.push_back( std::move( t ) );
+	return true;
+}
+
+bool Expander::expand( std::vector<XTok> ts, std::vector<XTok> & out, bool top, int depth ) {
+	if ( depth > MaxDepth ) return false;
+	std::reverse( ts.begin(), ts.end() );			// a stack: the next token is at the back
+	auto isPunct = []( const XTok & t, const char * p ) { return t.kind == TokKind::Punct && t.text == p; };
+	while ( !ts.empty() ) {
+		if ( ++work > MaxWork ) return false;
+		XTok t = std::move( ts.back() );
+		ts.pop_back();
+		if ( t.kind != TokKind::Identifier || t.any ) {
+			if ( !emit( std::move( t ), out, top ) ) return false;
+			continue;
+		}
+		const int id = idOf( t.text );
+		const Define * d = std::binary_search( t.hide.begin(), t.hide.end(), id ) ? nullptr : lookup( t.text );
+		if ( !d && madeUpByCpp( t.text ) && !std::binary_search( t.hide.begin(), t.hide.end(), id ) ) {
+			t.any = true;
+			t.from.body = true;
+		}
+		if ( !d || ( d->function && ( ts.empty() || !isPunct( ts.back(), "(" ) ) ) ) {
+			if ( !emit( std::move( t ), out, top ) ) return false;
+			continue;
+		}
+		if ( !d->usable ) return false;
+
+		HideSet hs = t.hide;
+		Origin inv = t.from;
+		std::vector<std::vector<XTok>> args;
+		if ( d->function ) {
+			ts.pop_back();							// (
+			const size_t n = d->params.size();
+			args.emplace_back();
+			int nest = 0;
+			bool closed = false;
+			while ( !ts.empty() ) {
+				XTok a = std::move( ts.back() );
+				ts.pop_back();
+				if ( isPunct( a, "(" ) ) {
+					++nest;
+				} else if ( isPunct( a, ")" ) ) {
+					if ( nest == 0 ) {
+						hs = intersect( t.hide, a.hide );
+						inv = span( t.from, a.from );
+						closed = true;
+						break;
+					}
+					--nest;
+				} else if ( isPunct( a, "," ) && nest == 0 && !( d->variadic && args.size() == n ) ) {
+					args.emplace_back();
+					continue;
+				}
+				args.back().push_back( std::move( a ) );
+			}
+			if ( !closed ) return false;			// cpp: unterminated argument list
+			if ( n == 0 ) {
+				if ( args.size() != 1 || !args[0].empty() ) return false;
+				args.clear();
+			} else if ( args.size() + 1 == n && d->variadic ) {
+				args.emplace_back();				// GNU: no variable arguments at all
+			} else if ( args.size() != n ) {
+				return false;
+			}
+		}
+		hs = unite( hs, { id } );
+		inv.body = true;
+		if ( inv.b < 0 ) inv.e = -1;
+		std::vector<XTok> os;
+		if ( !subst( *d, args, hs, inv, os, depth ) ) return false;
+		if ( !os.empty() ) os.front().space = t.space;
+		for ( size_t k = os.size(); k-- > 0; ) ts.push_back( std::move( os[k] ) );
+	}
+	return true;
+}
+
+// The string literal # makes of an argument: its spelling with each run of
+// whitespace between tokens as one space, and " and \ escaped in literals.
+XTok stringize( const std::vector<XTok> & arg, const Origin & inv ) {
+	XTok s;
+	s.kind = TokKind::String;
+	s.from = inv;
+	s.text = "\"";
+	bool first = true;
+	for ( const XTok & a : arg ) {
+		if ( a.mark ) continue;
+		if ( a.any ) s.any = true;
+		if ( !first && a.space ) s.text += ' ';
+		first = false;
+		bool literal = a.kind == TokKind::String || a.kind == TokKind::Char;
+		for ( char c : a.text ) {
+			if ( literal && ( c == '"' || c == '\\' ) ) s.text += '\\';
+			s.text += c;
+		}
+	}
+	s.text += '"';
+	return s;
+}
+
+// a ## b. False when the two don't make one token, which cpp rejects.
+bool paste( XTok & lhs, const XTok & rhs, const Origin & inv ) {
+	if ( rhs.mark ) return true;
+	if ( lhs.mark ) {
+		bool space = lhs.space;
+		lhs = rhs;
+		lhs.space = space;
+		return true;
+	}
+	std::string text = lhs.text + rhs.text;
+	std::vector<Token> ts = lexBody( text );
+	if ( ts.size() != 1 || ts[0].text != text ) return false;
+	lhs.text = std::move( text );
+	lhs.kind = ts[0].kind;
+	lhs.any = false;
+	lhs.from = inv;
+	lhs.hide = intersect( lhs.hide, rhs.hide );
+	return true;
+}
+
+// The body of `d` with its parameters replaced, as `os`.
+bool Expander::subst( const Define & d, const std::vector<std::vector<XTok>> & args, const HideSet & hs, const Origin & inv,
+					  std::vector<XTok> & os, int depth ) {
+	const std::vector<Token> & B = d.body;
+	const size_t n = d.params.size();
+	auto isPunct = [&]( size_t i, const char * p ) { return i < B.size() && B[i].kind == TokKind::Punct && B[i].text == p; };
+	auto param = [&]( size_t i ) -> size_t {
+		if ( !d.function || i >= B.size() || B[i].kind != TokKind::Identifier ) return n;
+		return std::find( d.params.begin(), d.params.end(), B[i].text ) - d.params.begin();
+	};
+	auto spaced = [&]( size_t i ) { return i > 0 && B[i - 1].endOffset < B[i].offset; };
+	auto fromBody = [&]( size_t i ) {
+		XTok t;
+		t.text = B[i].text;
+		t.kind = B[i].kind;
+		t.space = spaced( i );
+		t.from = inv;
+		return t;
+	};
+	// An argument's first token is spaced as the parameter was.
+	auto append = [&]( const std::vector<XTok> & a, size_t i ) {
+		size_t at = os.size();
+		os.insert( os.end(), a.begin(), a.end() );
+		if ( at < os.size() ) os[at].space = spaced( i );
+	};
+	std::vector<std::optional<std::vector<XTok>>> expanded( n );
+	for ( size_t i = 0; i < B.size(); ++i ) {
+		if ( d.function && isPunct( i, "#" ) ) {
+			size_t k = param( i + 1 );
+			if ( k == n ) return false;				// cpp rejects such a #define
+			os.push_back( stringize( args[k], inv ) );
+			os.back().space = spaced( i );
+			++i;
+			continue;
+		}
+		if ( isPunct( i, "##" ) ) {
+			if ( os.empty() || i + 1 == B.size() ) return false;
+			size_t k = param( ++i );
+			if ( k == n ) {
+				if ( !paste( os.back(), fromBody( i ), inv ) ) return false;
+			} else if ( d.variadic && k + 1 == n && !os.back().mark && os.back().kind == TokKind::Punct && os.back().text == "," ) {
+				// GNU: the comma goes when there are no variable arguments.
+				if ( args[k].empty() ) os.pop_back();
+				else append( args[k], i );
+			} else if ( !args[k].empty() ) {
+				if ( !paste( os.back(), args[k].front(), inv ) ) return false;
+				os.insert( os.end(), args[k].begin() + 1, args[k].end() );
+			}
+			continue;
+		}
+		size_t k = param( i );
+		if ( k == n ) {
+			os.push_back( fromBody( i ) );
+		} else if ( isPunct( i + 1, "##" ) ) {
+			if ( args[k].empty() ) {
+				XTok m;
+				m.mark = true;
+				m.from = inv;
+				os.push_back( std::move( m ) );
+			} else {
+				append( args[k], i );
+			}
+		} else {
+			if ( !expanded[k] ) {
+				std::vector<XTok> e;
+				if ( !expand( args[k], e, false, depth + 1 ) ) return false;
+				expanded[k] = std::move( e );
+			}
+			append( *expanded[k], i );
+		}
+	}
+	size_t kept = 0;
+	for ( size_t i = 0; i < os.size(); ++i ) {
+		if ( os[i].mark ) continue;
+		os[i].hide = unite( os[i].hide, hs );
+		if ( kept != i ) os[kept] = std::move( os[i] );
+		++kept;
+	}
+	os.resize( kept );
+	return true;
+}
 
 class Aligner {
   public:
@@ -189,8 +571,7 @@ class Aligner {
 	void alignLong( size_t pb, size_t pe, size_t ob, size_t oe, size_t gb, size_t ge );
 	void exact( size_t p, size_t o );
 	void macro( size_t pb, size_t pe, size_t ob, size_t oe );
-	bool redo( size_t pb, size_t pe, size_t ob, size_t oe, std::vector<int> & from );
-	bool expandAs( const Define & d, std::vector<std::pair<size_t, size_t>> args, size_t pb, size_t pe, std::vector<int> & from );
+	bool redo( size_t pb, size_t pe, size_t ob, size_t oe, std::vector<Origin> & from );
 	void unmatched( size_t p, size_t o, size_t ob, size_t oe );
 };
 
@@ -203,17 +584,19 @@ void Aligner::exact( size_t p, size_t o ) {
 
 void Aligner::macro( size_t pb, size_t pe, size_t ob, size_t oe ) {
 	Loc invStart = startOf( O[ob] ), invEnd = endOf( O[oe - 1] );
-	std::vector<int> from;
+	std::vector<Origin> from;
 	if ( redo( pb, pe, ob, oe, from ) ) {
 		for ( size_t p = pb; p < pe; ++p ) {
 			Mapped & m = res[p];
 			m.start = m.outerStart = invStart;
 			m.end = m.outerEnd = invEnd;
-			int o = from[p - pb];
-			if ( o < 0 ) m.body = true;
-			else if ( P[p].tok.kind == TokKind::Identifier ) {
-				m.start = startOf( O[o] );
-				m.end = endOf( O[o] );
+			const Origin & f = from[p - pb];
+			m.body = f.body;
+			// An identifier maps to the argument it was copied from, or for
+			// one from a body, to the invocation in an argument that made it.
+			if ( P[p].tok.kind == TokKind::Identifier && f.b >= 0 ) {
+				m.start = startOf( O[f.b] );
+				m.end = endOf( O[f.e - 1] );
 			}
 		}
 		return;
@@ -238,73 +621,13 @@ void Aligner::macro( size_t pb, size_t pe, size_t ob, size_t oe ) {
 	}
 }
 
-// Redoes the expansion of the invocation O[ob, oe) from its #define, so the
-// tokens copied from the body can be told from those of the arguments. Only
-// worth it when an identifier of the expansion P[pb, pe) is also written in
-// the arguments. Returns false unless some definition reproduces the
-// expansion exactly; then from[i] is the original token that P[pb + i] was
-// copied from, or -1 for a token of the body.
-bool Aligner::redo( size_t pb, size_t pe, size_t ob, size_t oe, std::vector<int> & from ) {
-	if ( !defines || oe - ob < 3 || O[ob].kind != TokKind::Identifier || O[ob + 1].text != "(" || O[oe - 1].text != ")" ) return false;
-	bool shared = false;
-	for ( size_t p = pb; p < pe && !shared; ++p ) {
-		if ( P[p].tok.kind != TokKind::Identifier ) continue;
-		for ( size_t o = ob + 2; o + 1 < oe && !shared; ++o ) shared = O[o].kind == TokKind::Identifier && O[o].text == P[p].tok.text;
-	}
-	if ( !shared ) return false;
-	// The arguments, split at commas outside parentheses as cpp does.
-	std::vector<std::pair<size_t, size_t>> args;
-	size_t b = ob + 2;
-	int depth = 0;
-	for ( size_t o = ob + 2; o + 1 < oe; ++o ) {
-		if ( O[o].kind != TokKind::Punct ) continue;
-		if ( O[o].text == "(" ) ++depth;
-		else if ( O[o].text == ")" ) --depth;
-		else if ( O[o].text == "," && depth == 0 ) {
-			args.emplace_back( b, o );
-			b = o + 1;
-		}
-	}
-	args.emplace_back( b, oe - 1 );
-	for ( const Define * d : defines( O[ob].text, O[ob].line ) ) {
-		if ( d->function && d->usable && expandAs( *d, args, pb, pe, from ) ) return true;
-	}
-	return false;
-}
-
-// Substitutes the arguments into the body of `d` and compares the result with
-// P[pb, pe). Arguments are not macro-expanded first, so an argument that
-// contains a macro doesn't match, and neither does a body that uses one.
-bool Aligner::expandAs( const Define & d, std::vector<std::pair<size_t, size_t>> args, size_t pb, size_t pe, std::vector<int> & from ) {
-	const size_t n = d.params.size();
-	if ( n == 0 ) {
-		if ( args.size() != 1 || args[0].first != args[0].second ) return false;	// F() passes no tokens
-		args.clear();
-	} else if ( d.variadic ) {
-		if ( args.size() + 1 < n ) return false;
-		const size_t last = args.back().second;
-		if ( args.size() + 1 == n ) args.emplace_back( last, last );		// no variable arguments
-		args[n - 1].second = last;
-		args.resize( n );
-	} else if ( args.size() != n ) {
-		return false;
-	}
-	from.clear();
-	auto next = [&]( const std::string & text ) { return pb + from.size() < pe && P[pb + from.size()].tok.text == text; };
-	for ( const Token & t : d.body ) {
-		size_t k = n;
-		if ( t.kind == TokKind::Identifier ) k = std::find( d.params.begin(), d.params.end(), t.text ) - d.params.begin();
-		if ( k == n ) {
-			if ( !next( t.text ) ) return false;
-			from.push_back( -1 );
-			continue;
-		}
-		for ( size_t o = args[k].first; o < args[k].second; ++o ) {
-			if ( !next( O[o].text ) ) return false;
-			from.push_back( (int)o );
-		}
-	}
-	return pb + from.size() == pe;
+// Redoes the expansion of the invocation O[ob, oe) from the #defines in
+// effect, so the tokens copied from the arguments can be told from those a
+// macro's body made. Returns false unless that gives exactly P[pb, pe); then
+// from[i] is where P[pb + i] came from.
+bool Aligner::redo( size_t pb, size_t pe, size_t ob, size_t oe, std::vector<Origin> & from ) {
+	if ( !defines || pb == pe || O[ob].kind != TokKind::Identifier ) return false;
+	return Expander( O, P, pb, pe, defines ).run( ob, oe, from );
 }
 
 // A preprocessed token with no original counterpart gets an empty span at the
@@ -494,7 +817,7 @@ void alignSegment( FileTable & ft, std::string_view prep, size_t b, size_t e, co
 		sub = pl.cont ? sub + 1 : 0;
 		pl.seg = (int)ft.segs.size();
 		pl.sub = sub;
-		for ( Token & t : lex( prep.substr( pl.off, pl.len ) ) ) P.push_back( { std::move( t ), pl.line, sub } );
+		for ( Token & t : lex( prep.substr( pl.off, pl.len ) ) ) P.push_back( { std::move( t ), pl.line, sub, pl.pline } );
 	}
 	std::vector<Mapped> res( P.size() );
 	for ( size_t p = 0; p < P.size(); ++p ) {
@@ -579,28 +902,18 @@ void parseDirective( const std::string & l, int at, Directives & out ) {
 		return;
 	}
 
-	if ( word == "include" || word == "include_next" || word == "import" ) {
-		i = k;
-		blanks();
-		if ( i < l.size() && ( l[i] == '"' || l[i] == '<' ) ) {
-			size_t e = l.find( l[i] == '"' ? '"' : '>', i + 1 );
-			if ( e != std::string::npos && e > i + 1 ) out.includes.push_back( l.substr( i + 1, e - i - 1 ) );
-		}
-		return;
-	}
-
 	if ( word != "define" && word != "undef" ) return;
 	i = k;
 	blanks();
 	size_t nb = i;
 	while ( i < l.size() && identChar( l[i] ) ) ++i;
 	if ( i == nb || !identStart( l[nb] ) ) return;
-	std::string name = l.substr( nb, i - nb );
 	Define d;
+	d.name = l.substr( nb, i - nb );
 	d.line = at;
 	if ( word == "undef" ) {
 		d.undef = true;
-		out.defines[name].push_back( std::move( d ) );
+		out.defines.push_back( std::move( d ) );
 		return;
 	}
 	if ( i < l.size() && l[i] == '(' ) {
@@ -636,15 +949,17 @@ void parseDirective( const std::string & l, int at, Directives & out ) {
 		++i;											// the )
 	}
 	std::string_view rest = std::string_view( l ).substr( std::min( i, l.size() ) );
-	d.usable = rest.find( '#' ) == std::string_view::npos && rest.find( "__VA_OPT__" ) == std::string_view::npos;
-	if ( d.usable ) d.body = lex( rest );
-	out.defines[name].push_back( std::move( d ) );
+	d.body = lexBody( rest );
+	for ( const Token & t : d.body ) {
+		if ( t.text == "__VA_OPT__" ) d.usable = false;
+	}
+	out.defines.push_back( std::move( d ) );
 }
 
 // The directives SourceMap uses: #define and #undef to redo macro expansions,
-// #include to find definitions in headers, and #line. The lexer finds them, so
-// a directive inside a comment is skipped. Conditionals are not evaluated; a
-// definition that doesn't reproduce an expansion isn't used.
+// and #line. The lexer finds them, so a directive inside a comment is skipped.
+// Conditionals are not evaluated; a definition that doesn't reproduce an
+// expansion isn't used.
 Directives scanDirectives( std::string_view text ) {
 	Directives out;
 	LexOptions opts;
@@ -690,11 +1005,8 @@ void remapLines( FileTable & ft, const std::string & name, const std::vector<Lin
 	}
 }
 
-// The directives of the files an #include names.
-using IncludeLookup = std::function<std::vector<const Directives *>( const std::string & include )>;
-
 void buildFile( FileTable & ft, const std::string & name, std::string_view prep, const SourceMap::Reader & read,
-				const IncludeLookup & included ) {
+				const DefineLookup & defines ) {
 	std::optional<std::string> text;
 	if ( read ) {
 		try { text = read( name ); } catch ( ... ) { text.reset(); }
@@ -706,35 +1018,7 @@ void buildFile( FileTable & ft, const std::string & name, std::string_view prep,
 		if ( ft.text[i] == '\n' ) ft.lineStarts.push_back( (int)i + 1 );
 	}
 	ft.toks = lex( ft.text );
-	const Directives own = scanDirectives( ft.text );
-	remapLines( ft, name, own.lines );
-
-	// The definition in effect in this file, else any in a header it includes.
-	DefineLookup defines = [&]( const std::string & macro, int line ) {
-		std::vector<const Define *> out;
-		auto it = own.defines.find( macro );
-		if ( it != own.defines.end() ) {
-			const Define * before = nullptr;
-			for ( const Define & d : it->second ) {
-				if ( d.line < line ) before = &d;
-			}
-			if ( before ) {
-				if ( !before->undef ) out.push_back( before );
-				return out;
-			}
-		}
-		if ( !included ) return out;
-		for ( const std::string & inc : own.includes ) {
-			for ( const Directives * ds : included( inc ) ) {
-				auto jt = ds->defines.find( macro );
-				if ( jt == ds->defines.end() ) continue;
-				for ( const Define & d : jt->second ) {
-					if ( !d.undef ) out.push_back( &d );
-				}
-			}
-		}
-		return out;
-	};
+	remapLines( ft, name, scanDirectives( ft.text ).lines );
 
 	for ( size_t b = 0; b < ft.prep.size(); ) {
 		size_t e = b + 1;
@@ -804,7 +1088,7 @@ int boundaryScore( const std::vector<Mapped> & ts, int col, bool isEnd ) {
 
 bool spelled( const std::vector<Mapped> & ts, int b, int e ) {
 	for ( const Mapped & m : ts ) {
-		if ( m.col < e && m.endCol > b && ( m.origTok >= 0 || m.start != m.outerStart ) ) return true;
+		if ( m.col < e && m.endCol > b && ( m.origTok >= 0 || ( m.start != m.outerStart && !m.body ) ) ) return true;
 	}
 	return false;
 }
@@ -875,14 +1159,28 @@ struct SourceMap::Impl {
 	};
 	std::vector<PhysLine> phys;
 
-	// Directives of headers, read when a macro's definition is looked for.
-	std::mutex dirMu;
+	// One stretch of cpp reading a file, from the marker that enters it to the
+	// one that leaves it for good. Each mark (pline, line) says that by
+	// preprocessed line pline, cpp had read the file's lines above 0-based
+	// `line` (as the markers number them).
+	struct Visit {
+		std::string file;
+		std::vector<std::pair<int, int>> marks;
+		int end = INT_MAX;				// the pline where cpp left the file
+	};
+	std::vector<Visit> visits;			// in the order cpp entered them
+
+	// Every #define and #undef cpp read, by macro name, with the pline by
+	// which it had read it, in that order. Built the first time a macro
+	// expansion is redone.
+	std::once_flag envOnce;
 	std::unordered_map<std::string, std::unique_ptr<Directives>> directives;	// by file
-	std::unordered_map<std::string, std::vector<const Directives *>> includes;	// by #include name
+	std::unordered_map<std::string, std::vector<std::pair<int, const Define *>>> env;
 
 	void index();
 	const FileTable * table( const std::string & file );
-	std::vector<const Directives *> included( const std::string & include );
+	void buildEnv();
+	std::vector<const Define *> definitions( const std::string & name, int pline );
 
 	// Finds the table and the line's tokens; subs is null when the line has
 	// none (or the file is unknown), and the caller falls back. With a known
@@ -924,6 +1222,20 @@ void SourceMap::Impl::index() {
 	// Whether the last marker, and the marker before the last code line, said
 	// "system header" (flag 3).
 	bool sys = false, lastSys = false;
+	// The visits cpp is in, innermost last, each with the pline of the marker
+	// that entered the file it includes.
+	std::vector<std::pair<size_t, int>> stack;
+	auto enter = [&]( const std::string & f ) {
+		stack.push_back( { visits.size(), 0 } );
+		visits.push_back( { f, {}, INT_MAX } );
+	};
+	auto leave = [&]( int pline ) {
+		visits[stack.back().first].end = pline;
+		stack.pop_back();
+	};
+	auto mark = [&]( int pline, int line ) {
+		if ( !stack.empty() ) visits[stack.back().first].marks.push_back( { pline, line } );
+	};
 	int pline = 1;
 	for ( size_t pos = 0; pos < prep.size(); ++pline ) {
 		size_t nl = prep.find( '\n', pos );
@@ -937,20 +1249,41 @@ void SourceMap::Impl::index() {
 					auto & slot = files[*f];
 					if ( !slot ) slot = std::make_unique<FileTable>();
 					cur = slot.get();
+					if ( flags & 1 ) {
+						// An #include: the includer stops just above it.
+						if ( !stack.empty() ) stack.back().second = pline;
+						enter( *f );
+					} else if ( flags & 2 ) {
+						// Back from an #include on the line above n: the lines above
+						// that were read when the include started.
+						if ( !stack.empty() ) leave( pline );
+						if ( !stack.empty() && visits[stack.back().first].file == *f ) {
+							mark( stack.back().second, n - 2 );
+						} else {
+							if ( !stack.empty() ) leave( pline );
+							enter( *f );
+						}
+					} else if ( stack.empty() || visits[stack.back().first].file != *f ) {
+						if ( !stack.empty() ) leave( pline );
+						enter( *f );
+					}
 				}
+				mark( pline, n - 1 );
 				next = n - 1;
 				sys = flags & 4;
 			} else {
+				mark( pline, next );
 				++next;
 				last = nullptr;
 			}
 		} else {
+			mark( pline, next );
 			if ( cur && next >= 0 && l.find_first_not_of( " \t\r\f\v" ) != std::string_view::npos ) {
 				// cpp continues a line after a marker that repeats its number
 				// when the tokens switch between system-header macros and the
 				// file. A repeated number without that switch is a #line.
 				bool cont = last == cur && cur->prep.back().presumed == next && sys != lastSys;
-				cur->prep.push_back( { next, next, pos, l.size(), cont } );
+				cur->prep.push_back( { next, next, pos, l.size(), cont, pline } );
 				phys.push_back( { pline, cur, (int)cur->prep.size() - 1 } );
 				last = cur;
 			} else {
@@ -976,32 +1309,56 @@ const FileTable * SourceMap::Impl::table( const std::string & file ) {
 		ft = it->second.get();
 	}
 	std::call_once( ft->once, [&] {
-		buildFile( *ft, file, prep, read, [this]( const std::string & include ) { return included( include ); } );
+		buildFile( *ft, file, prep, read, [this]( const std::string & name, int pline ) { return definitions( name, pline ); } );
 	} );
 	return ft;
 }
 
-// The files named in line markers that an #include of `include` may have
-// meant, by the end of their path.
-std::vector<const Directives *> SourceMap::Impl::included( const std::string & include ) {
-	std::lock_guard<std::mutex> lock( dirMu );
-	auto cached = includes.find( include );
-	if ( cached != includes.end() ) return cached->second;
-	std::vector<const Directives *> out;
-	for ( const auto & [name, table] : files ) {		// fixed once indexed
-		if ( name.empty() || name[0] == '<' ) continue;
-		if ( name != include && !( name.size() > include.size() && name.ends_with( include ) && name[name.size() - include.size() - 1] == '/' ) ) continue;
-		auto & slot = directives[name];
+// Places each #define and #undef of each visit at the first mark past it. A
+// header included twice is read twice, so its directives count twice.
+void SourceMap::Impl::buildEnv() {
+	for ( const Visit & v : visits ) {
+		if ( v.file.empty() || v.file[0] == '<' ) continue;
+		auto & slot = directives[v.file];
 		if ( !slot ) {
 			std::optional<std::string> text;
 			if ( read ) {
-				try { text = read( name ); } catch ( ... ) { text.reset(); }
+				try { text = read( v.file ); } catch ( ... ) { text.reset(); }
 			}
 			slot = std::make_unique<Directives>( text ? scanDirectives( *text ) : Directives() );
 		}
-		out.push_back( slot.get() );
+		size_t c = 0;
+		for ( const Define & d : slot->defines ) {
+			int line = presumedLine( slot->lines, d.line );
+			while ( c < v.marks.size() && v.marks[c].second <= line ) ++c;
+			env[d.name].push_back( { c < v.marks.size() ? v.marks[c].first : v.end, &d } );
+		}
 	}
-	return includes[include] = out;
+	for ( auto & [name, events] : env ) {
+		std::stable_sort( events.begin(), events.end(), []( const auto & x, const auto & y ) { return x.first < y.first; } );
+	}
+}
+
+// The definitions of `name` read by preprocessed line `pline`, latest first.
+// Earlier ones are there in case the later ones were in dead #if branches; an
+// #undef stops the list, except when it is the latest (null: not defined).
+std::vector<const Define *> SourceMap::Impl::definitions( const std::string & name, int pline ) {
+	std::call_once( envOnce, [this] { buildEnv(); } );
+	std::vector<const Define *> out;
+	auto it = env.find( name );
+	if ( it == env.end() ) return out;
+	const auto & events = it->second;
+	auto e = std::upper_bound( events.begin(), events.end(), pline, []( int t, const auto & ev ) { return t < ev.first; } );
+	while ( e != events.begin() ) {
+		const Define * d = ( --e )->second;
+		if ( d->undef ) {
+			if ( !out.empty() ) break;
+			out.push_back( nullptr );
+		} else if ( std::find( out.begin(), out.end(), d ) == out.end() ) {
+			out.push_back( d );
+		}
+	}
+	return out;
 }
 
 SourceMap::Impl::Line SourceMap::Impl::line( const std::string & file, int line1, int pline ) {

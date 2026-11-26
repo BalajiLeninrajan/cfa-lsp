@@ -178,6 +178,47 @@ TEST_CASE( "a name from a macro's body that is also its argument is not a ref" )
 	CHECK( r[0].range == Range{ { 3, 14 }, { 3, 15 } } );
 }
 
+TEST_CASE( "a declaration name that only a macro's body spells has no name range" ) {
+	// DECL's body spells counter, so the source has no name for it; VAR's
+	// argument spells count. The macros are in a header of a header.
+	const std::map<std::string, std::string> src = {
+		{ "/d/inner.h", "#define DECL int counter = 0\n" },
+		{ "/d/decl.h", "#include \"inner.h\"\n#define VAR( n ) int n = 1\n" },
+		{ "/d/main.cfa", "#include \"decl.h\"\n"
+						 "DECL;\n"
+						 "VAR( count );\n"
+						 "int other = 2;\n" } };
+	const char * prep =
+		"# 1 \"/d/main.cfa\"\n"
+		"# 1 \"/d/decl.h\" 1\n"
+		"# 1 \"/d/inner.h\" 1\n"
+		"# 2 \"/d/decl.h\" 2\n"
+		"# 2 \"/d/main.cfa\" 2\n"
+		"int counter = 0;\n"
+		"int count = 1;\n"
+		"int other = 2;\n";
+	SourceMap::Reader read = [src]( const std::string & path ) -> std::optional<std::string> {
+		auto it = src.find( path );
+		if ( it == src.end() ) return std::nullopt;
+		return it->second;
+	};
+	json dump = { { "format", 1 }, { "complete", true }, { "diagnostics", json::array() },
+				  { "decls", { decl( 1, "counter", "/d/main.cfa", 2, 4 ), decl( 2, "count", "/d/main.cfa", 3, 4 ),
+							   decl( 3, "other", "/d/main.cfa", 4, 4 ) } },
+				  { "refs", json::array() }, { "exprs", json::array() }, { "scopes", json::array() } };
+	SourceMap map( prep, read );
+	auto a = Analysis::load( dump, map, read );
+	// On DECL, hover shows the macro, not a counter declared all over it.
+	auto h = a->hover( "/d/main.cfa", { 1, 1 } );
+	REQUIRE( h );
+	CHECK( h->markdown.find( "#define DECL int counter = 0" ) != std::string::npos );
+	h = a->hover( "/d/main.cfa", { 2, 6 } );
+	REQUIRE( h );
+	CHECK( h->markdown.find( "count" ) != std::string::npos );
+	CHECK( h->markdown.find( "#define" ) == std::string::npos );
+	CHECK( h->range == Range{ { 2, 5 }, { 2, 10 } } );
+}
+
 TEST_CASE( "definition on an #include line opens the file" ) {
 	auto a = load();
 	auto d = a->definition( "/m/main.cfa", { 0, 12 } );
