@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "Lexer.hpp"
@@ -683,20 +684,19 @@ using MarkLookup = std::function<const std::vector<Mark> *( const std::string & 
 bool renames( const Mark & m ) { return ( m.flags & 3 ) == 0; }
 
 // How many tokens of a preprocessed line are also written on 0-based line
-// `line` of the original.
+// `line` of the original. Only the first MaxScoredTokens of each count: enough
+// to tell lines apart, and a generated line of thousands of tokens stays cheap.
+constexpr size_t MaxScoredTokens = 256;
+
 int overlap( const FileTable & ft, const std::vector<Token> & prepToks, long line ) {
 	if ( line < 0 || line >= ft.lineCount() ) return 0;
 	auto b = std::lower_bound( ft.toks.begin(), ft.toks.end(), (int)line, []( const Token & t, int l ) { return t.line < l; } );
 	auto e = std::upper_bound( b, ft.toks.end(), (int)line, []( int l, const Token & t ) { return l < t.line; } );
+	if ( e - b > (long)MaxScoredTokens ) e = b + MaxScoredTokens;
+	std::unordered_set<std::string_view> have;
+	for ( auto o = b; o != e; ++o ) have.insert( o->text );
 	int n = 0;
-	for ( const Token & t : prepToks ) {
-		for ( auto o = b; o != e; ++o ) {
-			if ( o->text == t.text ) {
-				++n;
-				break;
-			}
-		}
-	}
+	for ( size_t k = 0; k < prepToks.size() && k < MaxScoredTokens; ++k ) n += have.count( prepToks[k].text ) ? 1 : 0;
 	return n;
 }
 
@@ -734,9 +734,19 @@ int score( const FileTable & ft, const Run & run, const Region & g ) {
 // number, after the marker of the last one that counted, is better explained
 // by it than by the other things that print such a marker: cpp itself (the
 // first marker, and one after a run of skipped lines), which keeps the
-// numbering, and a later directive with the same number. The best explanation
-// is the numbering under which the lines after the marker match the original
-// lines best; a tie goes to the directive.
+// numbering, and a later directive with the same number.
+//
+// Where the marker sits rules some of them out. cpp prints a directive's
+// marker where it reads the directive, so the lines before the marker must lie
+// above the directive under the current numbering. cpp's own markers keep the
+// numbering going forward, so they can't put the next line at or above the
+// last one. A marker cpp prints around a system-header macro in the middle of
+// a line is followed by the rest of that line, and explains nothing.
+//
+// What is left is decided by the numbering under which the lines after the
+// marker match the original lines best. A marker that only the directive
+// explains wins over an earlier one where another explanation ties with it;
+// failing that, the first tie goes to the directive.
 //
 // A directive that names another file has no lines here to compare, so a
 // marker with its number in that file is enough.
@@ -745,8 +755,10 @@ std::vector<LineDirective> obeyedLines( const FileTable & ft, const std::string 
 	std::vector<LineDirective> out;
 	std::string current = name;					// the name a #line without one keeps
 	std::optional<Region> here = Region{ 0, 0, true };	// how this file's lines are numbered; none under another name
+	size_t start = 0;							// this file's PrepLines before this index are numbered by older regions
 	std::unordered_map<std::string, size_t> used;	// per file, the markers before this index are taken
 	auto regionOf = []( const LineDirective & d ) { return Region{ d.at + 1, d.number - 1, true }; };
+	auto under = []( const Region & g, int presumed ) { return (long)g.actual + ( presumed - g.presumed ); };
 	for ( size_t i = 0; i < dirs.size(); ++i ) {
 		const LineDirective & d = dirs[i];
 		const std::string target = d.file ? *d.file : current;
@@ -765,24 +777,44 @@ std::vector<LineDirective> obeyedLines( const FileTable & ft, const std::string 
 			continue;
 		}
 		const Region mine = regionOf( d );
-		for ( size_t k = from; k < marks->size(); ++k ) {
-			if ( !renames( ( *marks )[k] ) || ( *marks )[k].number != d.number ) continue;
+		size_t pick = SIZE_MAX, tie = SIZE_MAX;
+		for ( size_t k = from; k < marks->size() && pick == SIZE_MAX; ++k ) {
+			const Mark & m = ( *marks )[k];
+			if ( !renames( m ) || m.number != d.number ) continue;
+			if ( m.before < ft.prep.size() && ft.prep[m.before].cont ) continue;	// inside a line
+			// The real line of the last line before the marker, under the
+			// current numbering.
+			long last = -1;
+			if ( here && m.before > start ) last = under( *here, ft.prep[m.before - 1].presumed );
+			if ( last >= d.at ) continue;
 			const Run run = runAfter( ft, prep, k );
 			const int s = score( ft, run, mine );
-			if ( here && score( ft, run, *here ) > s ) continue;	// cpp's own marker
+			bool shared = false;
+			if ( here && ( run.empty() || under( *here, run.front().first ) > last ) ) {
+				const int h = score( ft, run, *here );
+				if ( h > s ) continue;			// cpp's own marker
+				shared = h == s;
+			}
 			bool later = false;
 			for ( size_t j = i + 1; j < dirs.size() && !later; ++j ) {
 				const LineDirective & e = dirs[j];
-				if ( e.number == d.number && ( e.file ? *e.file : current ) == name ) later = score( ft, run, regionOf( e ) ) > s;
+				if ( e.number != d.number || ( e.file ? *e.file : current ) != name ) continue;
+				const int t = score( ft, run, regionOf( e ) );
+				later = t > s;
+				shared = shared || t == s;
 			}
 			if ( later ) break;
-			out.push_back( d );
-			out.back().before = ( *marks )[k].before;
-			from = k + 1;
-			current = name;
-			here = mine;
-			break;
+			if ( !shared ) pick = k;
+			else if ( tie == SIZE_MAX ) tie = k;
 		}
+		if ( pick == SIZE_MAX ) pick = tie;
+		if ( pick == SIZE_MAX ) continue;
+		out.push_back( d );
+		out.back().before = ( *marks )[pick].before;
+		start = ( *marks )[pick].before;
+		from = pick + 1;
+		current = name;
+		here = mine;
 	}
 	return out;
 }

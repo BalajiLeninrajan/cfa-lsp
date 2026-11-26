@@ -325,6 +325,115 @@ TEST_CASE( "sourcemap: a skipped #line with the number of cpp's next marker" ) {
 	CHECK( m.realLine( F, 14 ) == 14 );
 }
 
+// cpp prints markers with the line's own number around a system-header macro
+// in the middle of a line. They don't make a skipped #line with that number
+// count.
+TEST_CASE( "sourcemap: a skipped #line with the number of a mid-line marker" ) {
+	Files f;
+	const std::string F = "/r/n.cfa";
+	f.text[F] =
+		"#if 0\n"							// 0
+		"#line 5\n"							// 1
+		"#endif\n"							// 2
+		"int a;\n"							// 3
+		"void f() { int * p = NULL; }\n"	// 4
+		"int   b;\n"						// 5
+		"#error here\n";					// 6
+	SourceMap m( "# 1 \"/r/n.cfa\"\n"
+				 "\n\n\n"
+				 "int a;\n"
+				 "void f() { int * p =\n"
+				 "# 5 \"/r/n.cfa\" 3\n"
+				 " 0\n"
+				 "# 5 \"/r/n.cfa\"\n"
+				 " ; }\n"
+				 "int b;\n",
+				 f.reader() );
+	CHECK( m.map( F, 6, 4 ) == L( 5, 6 ) );
+	CHECK( m.realLine( F, 7, "#error here" ) == 7 );
+	CHECK( m.outputLines( F ) == ( std::vector<int>{ 3, 4, 5 } ) );
+}
+
+// A #line that numbers backwards over a macro call: under the old numbering
+// the line after the marker matches the code above the directive better than
+// the call it came from. It still counts, since cpp's own markers never number
+// backwards. gcc's output.
+TEST_CASE( "sourcemap: a backwards #line before a macro call" ) {
+	Files f;
+	const std::string F = "/r/m.cfa";
+	f.text[F] =
+		"#define DECL(n) int n = 0;\n"		// 0
+		"void f() {\n"						// 1
+		"\tint q = 0; q++;\n"				// 2
+		"\tint r = 0; r++;\n"				// 3
+		"#line 3\n"							// 4
+		"\tDECL(a)\n"						// 5, numbered 3
+		"}\n";								// 6
+	SourceMap m( "# 1 \"/r/m.cfa\"\n"
+				 "\n"
+				 "void f() {\n"
+				 " int q = 0; q++;\n"
+				 " int r = 0; r++;\n"
+				 "# 3 \"/r/m.cfa\"\n"
+				 " int a = 0;\n"
+				 "}\n",
+				 f.reader() );
+	CHECK( m.realLine( F, 3, "unused variable 'a'" ) == 6 );
+	CHECK( m.realLine( F, 3, "unused variable 'q'" ) == 3 );
+	CHECK( m.map( F, { 3, 5, 7 } ).line == 5 );
+	CHECK( m.map( F, { 3, 5, 4 } ).line == 2 );
+	CHECK( m.outputLines( F ) == ( std::vector<int>{ 1, 2, 3, 5, 6 } ) );
+}
+
+// A skipped #line whose number cpp's own marker carries later, after a live
+// #line: the lines before that marker lie below the skipped directive, so
+// the marker can't be its. gcc's output without -DA.
+TEST_CASE( "sourcemap: a skipped #line before a live one" ) {
+	Files f;
+	const std::string F = "/r/t.cfa";
+	std::string text =
+		"#ifdef A\n"						// 0
+		"#line 100\n"						// 1
+		"#else\n"							// 2
+		"#line 90\n"						// 3
+		"#endif\n"							// 4
+		"int  x;\n";						// 5, numbered 91
+	for ( int i = 6; i < 14; ++i ) text += "\n";
+	text += "int  y;\n";					// 14, numbered 100
+	f.text[F] = text;
+	SourceMap m( "# 1 \"/r/t.cfa\"\n"
+				 "# 90 \"/r/t.cfa\"\n"
+				 "\n"
+				 "int x;\n"
+				 "# 100 \"/r/t.cfa\"\n"
+				 "int y;\n",
+				 f.reader() );
+	CHECK( m.map( F, 91, 4 ) == L( 5, 5 ) );
+	CHECK( m.map( F, 100, 4 ) == L( 14, 5 ) );
+	CHECK( m.realLine( F, 91 ) == 6 );
+	CHECK( m.realLine( F, 100 ) == 15 );
+	CHECK( m.outputLines( F ) == ( std::vector<int>{ 5, 14 } ) );
+}
+
+// The same line twice around a #line 1. cpp's first marker also says 1 and
+// fits as well; the directive's own marker is the one after the first line.
+TEST_CASE( "sourcemap: a #line 1 that repeats the first line" ) {
+	Files f;
+	const std::string F = "/r/d.cfa";
+	f.text[F] =
+		"int a;\n"							// 0
+		"#line 1\n"							// 1
+		"int  a;\n";						// 2
+	SourceMap m( "# 1 \"/r/d.cfa\"\n"
+				 "int a;\n"
+				 "# 1 \"/r/d.cfa\"\n"
+				 "int a;\n",
+				 f.reader() );
+	CHECK( m.map( F, { 1, 4, 2 } ) == L( 0, 4 ) );
+	CHECK( m.map( F, { 1, 4, 4 } ) == L( 2, 5 ) );
+	CHECK( m.outputLines( F ) == ( std::vector<int>{ 0, 2 } ) );
+}
+
 // A #line that names another file, and one that comes back. The skipped one
 // has no marker for the other file at all.
 TEST_CASE( "sourcemap: #line naming another file" ) {

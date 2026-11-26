@@ -94,6 +94,28 @@ TEST_CASE( "real cfa: preprocessor diagnostics after a #line land on the real li
 	CHECK( before == 4 );
 	CHECK( after == 7 );
 	CHECK( error == 8 );
+
+	// cpp prints `# 7 "main.cfa" 3` and `# 7 "main.cfa"` around NULL's
+	// expansion. If the skipped #line 7 took one of them, the #error would
+	// land on line 6.
+	fr = ch.front( requestFor( main,
+		"#include <stdio.h>\n"					// 0
+		"#include <errno.h>\n"					// 1
+		"#if 0\n"								// 2
+		"#line 7\n"								// 3
+		"#endif\n"								// 4
+		"int a;\n"								// 5
+		"void f() { int * p = NULL; }\n"		// 6
+		"int b;\n"								// 7
+		"#error after a system macro\n"			// 8
+		"int main() {}\n" ), CancelToken() );
+	CHECK( fr.status == FrontResult::PreprocessFailed );
+	error = -1;
+	for ( const Diag & d : fr.diags ) {
+		INFO( d.file << ":" << d.range.start.line << ": " << d.message );
+		if ( d.file == main && d.message.find( "after a system macro" ) != std::string::npos ) error = d.range.start.line;
+	}
+	CHECK( error == 8 );
 }
 
 // gcc reads the translator's C, whose line markers give the numbers of the

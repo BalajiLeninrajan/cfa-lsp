@@ -114,8 +114,10 @@ reads the file's directives to get the real lines back. Only the directives
 that cpp obeyed count. cpp prints a marker for each one, so a `#line` in a
 branch of an `#if` that cpp skipped has none and moves nothing. To tell a
 `#line` marker from one that cpp prints after a run of skipped lines, the
-server checks which numbering makes the lines after the marker match your
-file. gcc's messages, from `cfa -E` and from the C compile, give the
+server checks that the marker comes after the lines above the directive, and
+which numbering makes the lines after the marker match your file. cpp's own
+markers never number backwards, so a marker that does is the directive's.
+gcc's messages, from `cfa -E` and from the C compile, give the
 numbers from the markers too, and go back to the real lines the same way, as
 does the line of an `#include` whose header has errors. A `#line` that
 numbers backwards gives two lines the same number. A message then goes to
