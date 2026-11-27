@@ -541,13 +541,14 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 	// cpp reads the buffer and the unsaved headers without their #line
 	// directives, so its line markers, gcc's messages and the translator's
 	// positions all give the real lines.
-	const std::string text = blankLineDirectives( req.text );
+	std::string text = blankLineDirectives( req.text );
 	std::map<std::string, std::string> buffers, unblanked;
 	for ( const auto & [path, b] : req.overlays ) {
 		buffers[normalize( path )] = blankLineDirectives( b );
 		unblanked[normalize( path )] = b;
 	}
-	if ( ! writeFile( in, "# 1 \"" + quoteForMarker( req.path ) + "\"\n" + text ) ) {
+	const std::string marker = "# 1 \"" + quoteForMarker( req.path ) + "\"\n";
+	if ( ! writeFile( in, marker + text ) ) {
 		fr.status = FrontResult::PreprocessFailed;
 		fr.diags.push_back( fileLevel( req.path, "cfa-lsp: cannot write " + in ) );
 		return fr;
@@ -615,9 +616,10 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 	lap( "cfa -E" );
 	// The unsaved headers cpp read from an overlay. cpp can find one on disk
 	// instead, for example when the header next to it includes it, and then
-	// it obeys the #line directives in that copy.
+	// it obeys the #line directives in that copy. The same goes for the main
+	// file, when it includes itself or a header includes it back.
 	std::set<std::string> fromOverlay;
-	if ( ! overlays.empty() ) {
+	if ( ! overlays.empty() || text != req.text ) {
 		std::string raw = readFile( o.stdoutPath ).value_or( "" );
 		auto resolve = [&cwd]( std::string p ) {
 			if ( ! p.empty() && p[0] != '/' ) p = ( fs::path( cwd ) / p ).string();
@@ -632,8 +634,18 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 		// A header with no include guard can be read from both. SourceMap has
 		// one text for it, so it gets its #line directives back in the
 		// overlay too, and cpp runs again with them, as it did before the
-		// server blanked any.
+		// server blanked any. A main file read from disk too gets them back
+		// in in.cfa the same way.
 		bool again = false;
+		if ( text != req.text && fromDisk.count( normalize( req.path ) ) ) {
+			text = req.text;
+			if ( ! writeFile( in, marker + text ) ) {
+				fr.status = FrontResult::PreprocessFailed;
+				fr.diags.push_back( fileLevel( req.path, "cfa-lsp: cannot write " + in ) );
+				return fr;
+			}
+			again = true;
+		}
 		for ( const std::string & p : fromDisk ) {
 			if ( ! fromOverlay.count( p ) || buffers[p] == unblanked[p] ) continue;
 			fromOverlay.erase( p );
@@ -652,7 +664,7 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 			raw = readFile( o.stdoutPath ).value_or( "" );
 		}
 		// The translator reads in.i itself.
-		if ( ! writeFile( o.stdoutPath, unOverlay( std::move( raw ) ) ) && r.ok() ) {
+		if ( ! overlays.empty() && ! writeFile( o.stdoutPath, unOverlay( std::move( raw ) ) ) && r.ok() ) {
 			fr.status = FrontResult::PreprocessFailed;
 			fr.diags.push_back( fileLevel( req.path, "cfa-lsp: cannot write " + o.stdoutPath ) );
 			return fr;

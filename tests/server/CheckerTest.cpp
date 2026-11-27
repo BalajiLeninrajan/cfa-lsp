@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -323,6 +324,67 @@ TEST_CASE( "real cfa and translator: an unsaved header read from its overlay and
 	REQUIRE( def.size() == 1 );
 	CHECK( def[0].file == b );
 	CHECK( def[0].range.start.line == 6 );
+}
+
+// cpp can read the main file from disk too, when a header includes it back
+// or it includes __FILE__. That copy obeys its #line directives, so cpp runs
+// again on the buffer with them, and SourceMap maps both copies from it.
+TEST_CASE( "real cfa and translator: a main file cpp also reads from disk keeps its #line mapping" ) {
+	std::string translator = envOr( "CFA_LSP_TRANSLATOR" );
+	if ( findInPath( "cfa" ).empty() || ! executable( translator ) ) {
+		MESSAGE( "needs cfa and CFA_LSP_TRANSLATOR; skipping" );
+		return;
+	}
+	ToolchainOptions o;
+	o.translator = translator;
+	Checker ch( discoverToolchain( o ) );
+	TempDir proj;
+	// The references to the name at `at` lie on exactly `lines` of `file`.
+	auto refsOn = []( const FrontResult & fr, const std::string & file, Loc at, std::set<int> lines ) {
+		std::set<int> got;
+		for ( const Location & l : fr.analysis->references( file, at, true ) ) {
+			CHECK( l.file == file );
+			got.insert( l.range.start.line );
+		}
+		CHECK( got == lines );
+	};
+	SUBCASE( "a header includes it back" ) {
+		std::string main = proj.path() + "/a.hfa", b = proj.path() + "/b.hfa";
+		const std::string text =
+			"#pragma once\n"							// 0
+			"int fa( int );\n"							// 1
+			"#line 50\n"								// 2
+			"int fb( int );\n"							// 3
+			"#include \"b.hfa\"\n"						// 4
+			"extern __typeof__( fa( 1 ) + fb( 2 ) ) t;\n";	// 5
+		std::ofstream( main ) << text;
+		std::ofstream( b ) << "#pragma once\n#include \"a.hfa\"\n";
+		CheckRequest req = requestFor( main, text );
+		req.backend = false;
+		FrontResult fr = ch.front( req, CancelToken() );
+		REQUIRE( fr.analysis );
+		refsOn( fr, main, { 3, 4 }, { 3, 5 } );
+		refsOn( fr, main, { 5, 39 }, { 5 } );
+	}
+	SUBCASE( "it includes __FILE__" ) {
+		std::string main = proj.path() + "/self.cfa";
+		const std::string text =
+			"int fa( int );\n"							// 0
+			"#line 50\n"								// 1
+			"int fb( int );\n"							// 2
+			"#ifndef SELF\n"							// 3
+			"#define SELF\n"							// 4
+			"#include __FILE__\n"						// 5
+			"extern __typeof__( fa( 1 ) + fb( 2 ) ) t;\n"	// 6
+			"#endif\n";
+		std::ofstream( main ) << text;
+		CheckRequest req = requestFor( main, text );
+		req.backend = false;
+		FrontResult fr = ch.front( req, CancelToken() );
+		REQUIRE( fr.analysis );
+		refsOn( fr, main, { 2, 4 }, { 2, 6 } );
+		refsOn( fr, main, { 6, 39 }, { 6 } );
+	}
 }
 
 // The summary of an included file's errors goes on the real #include line.
