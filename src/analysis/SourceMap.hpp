@@ -82,4 +82,13 @@ class SourceMap {
 	std::unique_ptr<Impl> impl;				// null for identity()
 };
 
+// `text` with each #line directive (`#line N ["file"]` and the `# N ["file"]`
+// form) cut down to its line breaks, so the line count stays the same and cpp
+// numbers every line as it is. Found the way SourceMap finds them, so one in a
+// comment or string stays. One that cpp would report as malformed, one whose
+// number comes from a macro and a linemarker with flags stay too, and
+// SourceMap reads those as before. The server does this to the files it
+// writes for cpp.
+std::string blankLineDirectives( std::string_view text );
+
 } // namespace cfalsp

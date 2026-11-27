@@ -57,7 +57,9 @@
 // A #line directive in the original makes the markers give line numbers that
 // differ from the real ones. The file's own #line directives say how the two
 // relate, and the preprocessed lines are moved back to their real lines before
-// they are cut into segments (see remapLines).
+// they are cut into segments (see remapLines). The server takes most #line
+// directives out of the files it writes for cpp (blankLineDirectives), so
+// this matters for headers cpp reads from disk and the directives left in.
 //
 // The translator can also give the line in the preprocessed text (pline),
 // which names one preprocessed line exactly: the right piece of a split line
@@ -1097,6 +1099,55 @@ void parseDefinition( std::string_view l, std::string & name, std::optional<Defi
 	def = std::move( d );
 }
 
+// Whether directive `l` is one cpp obeys without a message and that only sets
+// the line and file: `#line N ["file"]` or `# N ["file"]`, with N from 1 to
+// INT_MAX, a plain string, and nothing after it but comments. cpp reports a
+// malformed one, a number from a macro is unknown here, and a linemarker's
+// flags change the include stack or make the rest a system header, so these
+// stay for cpp to read.
+bool plainLineDirective( std::string_view l ) {
+	size_t i = l.find( '#' ) + 1;
+	bool ok = true;
+	// cpp reads a comment as a space.
+	auto blanks = [&] {
+		for ( ;; ) {
+			while ( i < l.size() && ( l[i] == ' ' || l[i] == '\t' || l[i] == '\r' || l[i] == '\f' || l[i] == '\v' ) ) ++i;
+			if ( l.compare( i, 2, "//" ) == 0 ) {
+				i = l.size();
+			} else if ( l.compare( i, 2, "/*" ) == 0 ) {
+				size_t e = l.find( "*/", i + 2 );
+				ok = ok && e != std::string_view::npos;
+				i = e == std::string_view::npos ? l.size() : e + 2;
+			} else {
+				return;
+			}
+		}
+	};
+	blanks();
+	if ( l.compare( i, 4, "line" ) == 0 && ( i + 4 == l.size() || !identChar( l[i + 4] ) ) ) {
+		i += 4;
+		blanks();
+	}
+	size_t nb = i;
+	long n = 0;
+	while ( i < l.size() && digit( l[i] ) && n <= INT_MAX ) n = n * 10 + ( l[i++] - '0' );
+	if ( i == nb || n < 1 || n > INT_MAX ) return false;
+	if ( i < l.size() && ( identChar( l[i] ) || l[i] == '.' || l[i] == '\'' ) ) return false;
+	blanks();
+	if ( i < l.size() && l[i] == '"' ) {
+		for ( ++i; i < l.size() && l[i] != '"'; ++i ) {
+			if ( l[i] == '\n' ) return false;
+			if ( l[i] != '\\' ) continue;
+			if ( i + 1 >= l.size() || ( l[i + 1] != '\\' && l[i + 1] != '"' ) ) return false;
+			++i;
+		}
+		if ( i >= l.size() ) return false;
+		++i;
+		blanks();
+	}
+	return ok && i >= l.size();
+}
+
 // Moves the preprocessed lines back to their real lines when the file has
 // #line directives, which make the markers give other numbers.
 void remapLines( FileTable & ft, const std::string & name, const std::vector<LineDirective> & dirs ) {
@@ -1760,6 +1811,25 @@ std::optional<std::vector<int>> SourceMap::outputLines( const std::string & file
 	for ( const PrepLine & p : ft->prep ) out.push_back( p.line );
 	std::sort( out.begin(), out.end() );
 	out.erase( std::unique( out.begin(), out.end() ), out.end() );
+	return out;
+}
+
+std::string blankLineDirectives( std::string_view text ) {
+	std::string out;
+	out.reserve( text.size() );
+	size_t at = 0;
+	LexOptions opts;
+	opts.directives = true;
+	for ( const Token & t : lex( text, opts ) ) {
+		if ( t.kind != TokKind::Directive || !plainLineDirective( t.text ) ) continue;
+		out.append( text.substr( at, t.offset - at ) );
+		// A continued directive, or a block comment in it, spans several lines.
+		for ( int i = t.offset; i < t.endOffset; ++i ) {
+			if ( text[i] == '\n' ) out += '\n';
+		}
+		at = t.endOffset;
+	}
+	out.append( text.substr( at ) );
 	return out;
 }
 
