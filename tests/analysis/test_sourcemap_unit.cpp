@@ -459,10 +459,14 @@ TEST_CASE( "sourcemap: lines too long for one alignment table" ) {
 }
 
 // The server takes #line directives out of the files it writes for cpp. Each
-// one leaves only its line breaks.
+// one leaves only its line breaks. One that cpp would report, or that does
+// more than set the line, stays.
 TEST_CASE( "blankLineDirectives" ) {
 	CHECK( blankLineDirectives( "int a;\n#line 10\nint b;\n" ) == "int a;\n\nint b;\n" );
-	CHECK( blankLineDirectives( "  #  line 3 \"x.c\"\n# 7 \"y.c\" 1 3\n#line N\n#\tline 4\n" ) == "  \n\n\n\n" );
+	CHECK( blankLineDirectives( "  #  line 3 \"x.c\"\n# 7 \"y.c\"\n#\tline 4\n# 5\n" ) == "  \n\n\n\n" );
+	// cpp reads a comment as a space, and needs no space before the name.
+	CHECK( blankLineDirectives( "#/**/line 4\n#line 5 /* c */ \"x\" // d\n#line 6\"x.c\"\n" ) == "\n\n\n" );
+	CHECK( blankLineDirectives( "#line 7 \"a\\\\b\\\"c\"\n#line 2147483647\n" ) == "\n\n" );
 	CHECK( blankLineDirectives( "#line 5" ) == "" );
 	CHECK( blankLineDirectives( "\r\n#line 5\r\nint a;\r\n" ) == "\r\n\nint a;\r\n" );
 	// Inside #if 0 too: cpp skips it there anyway.
@@ -483,4 +487,27 @@ TEST_CASE( "blankLineDirectives" ) {
 		"#\n"
 		"#include \"line.h\"\n";
 	CHECK( blankLineDirectives( keep ) == keep );
+	// cpp reports these, or they do more than set the line, or the number
+	// comes from a macro. They stay for cpp to read.
+	const std::string cppReads =
+		"#line 10 foo.c\n"
+		"#line abc\n"
+		"#line\n"
+		"#line 0\n"
+		"#line 4294967296\n"
+		"#line 0x10\n"
+		"#line 1e2\n"
+		"#line 5.0\n"
+		"#line 5 L\"x\"\n"
+		"#line 5 \"a\\qb\"\n"
+		"#line 5 \"a\n"
+		"#line 5 \"x.c\" extra\n"
+		"#line 5 \"x\" 3\n"
+		"# 3 \"x.c\" 2\n"
+		"# 7 \"y.c\" 1 3\n"
+		"# 5 x\n"
+		"#line N\n"
+		"#line N \"x.c\"\n"
+		"#line 5 /* runs to the end\n";
+	CHECK( blankLineDirectives( cppReads ) == cppReads );
 }

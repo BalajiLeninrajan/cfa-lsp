@@ -44,10 +44,15 @@
   directives. After one, `__LINE__` and `__FILE__` give the real line and
   file in the check, not the values the directive sets. Compiling the file
   still gives the directive's values.
-- A header read from disk keeps its `#line` directives. The server maps the
-  translator's positions after one back to the real lines, but treats one in
-  an `#if 0` block as if cpp had obeyed it, and gcc's messages in that header
-  after a `#line` give the directive's numbers.
+- A header read from disk keeps its `#line` directives, and so does an
+  unsaved header that cpp finds on disk and not in its overlay. The buffer
+  also keeps a `#line` whose number comes from a macro, and a `# N "file"`
+  linemarker with flags. The server maps the translator's positions after
+  one of these back to the real lines, but treats one in an `#if 0` block as
+  if cpp had obeyed it, ignores one whose number comes from a macro, and
+  gcc's messages after one give the directive's numbers.
+- The server doesn't read a directive spelled with the `%:` digraph, so a
+  `%:line` stays in the buffer and moves the lines after it.
 - If the translator fails an internal assertion or crashes, the check reports
   `internal translator error` on line 1, and unless the crash came after
   resolution the previous results stay in use.

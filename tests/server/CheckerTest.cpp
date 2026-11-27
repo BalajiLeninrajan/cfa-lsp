@@ -124,6 +124,22 @@ TEST_CASE( "real cfa: preprocessor diagnostics after a #line land on the real li
 	CHECK( lineOf( fr, "#warning first" ) == 1 );
 	CHECK( lineOf( fr, "#warning second" ) == 3 );
 	CHECK( lineOf( fr, "#warning third" ) == 5 );
+
+	// A #line that cpp reports as malformed stays, so the check shows cpp's
+	// error as a build of the file would.
+	fr = ch.front( requestFor( main,
+		"int a;\n"								// 0
+		"#line 10 foo.c\n"						// 1
+		"int main() {}\n" ), CancelToken() );
+	CHECK( fr.status == FrontResult::PreprocessFailed );
+	CHECK( lineOf( fr, "is not a valid filename" ) == 1 );
+	fr = ch.front( requestFor( main,
+		"int a;\n"								// 0
+		"int b;\n"								// 1
+		"#line abc\n"							// 2
+		"int main() {}\n" ), CancelToken() );
+	CHECK( fr.status == FrontResult::PreprocessFailed );
+	CHECK( lineOf( fr, "is not a positive integer" ) == 2 );
 }
 
 // gcc reads the translator's C, whose line markers come from the translator's
@@ -227,6 +243,44 @@ TEST_CASE( "real cfa and translator: references after a #line are on the real li
 	CHECK( defLine( 10, "b(" ) == 6 );
 	CHECK( defLine( 13, "c(" ) == 8 );
 	CHECK( defLine( 15, "d(" ) == 13 );
+}
+
+// An unsaved header that cpp finds on disk, not in its overlay, keeps its
+// #line directives for cpp, so SourceMap maps them from the buffer as before.
+TEST_CASE( "real cfa and translator: an unsaved header cpp reads from disk keeps its #line mapping" ) {
+	std::string translator = envOr( "CFA_LSP_TRANSLATOR" );
+	if ( findInPath( "cfa" ).empty() || ! executable( translator ) ) {
+		MESSAGE( "needs cfa and CFA_LSP_TRANSLATOR; skipping" );
+		return;
+	}
+	ToolchainOptions o;
+	o.translator = translator;
+	Checker ch( discoverToolchain( o ) );
+	TempDir proj;
+	std::string main = proj.path() + "/main.cfa", a = proj.path() + "/a.h", b = proj.path() + "/b.h",
+		c = proj.path() + "/c.h";
+	const std::string bText = "int b1;\n#line 100\nint bv;\n";
+	const std::string cText = "int c1;\n#line 50\nint cv;\n";
+	// a.h includes b.h from its own directory, so cpp reads b.h from disk.
+	// main.cfa's c.h comes from the overlay.
+	std::ofstream( a ) << "#include \"b.h\"\n";
+	std::ofstream( b ) << bText;
+	std::ofstream( c ) << cText;
+	const std::string use = "int f() { return bv + cv; }";
+	CheckRequest req = requestFor( main, "#include \"a.h\"\n#include \"c.h\"\n" + use + "\n" );
+	req.backend = false;
+	req.overlays[b] = bText;
+	req.overlays[c] = cText;
+	FrontResult fr = ch.front( req, CancelToken() );
+	REQUIRE( fr.analysis );
+	auto def = fr.analysis->definition( main, { 2, (int)use.find( "bv" ) } );
+	REQUIRE( def.size() == 1 );
+	CHECK( def[0].file == b );
+	CHECK( def[0].range.start.line == 2 );
+	def = fr.analysis->definition( main, { 2, (int)use.find( "cv" ) } );
+	REQUIRE( def.size() == 1 );
+	CHECK( def[0].file == c );
+	CHECK( def[0].range.start.line == 2 );
 }
 
 // The summary of an included file's errors goes on the real #include line.

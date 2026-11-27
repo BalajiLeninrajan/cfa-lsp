@@ -11,7 +11,9 @@ the buffer:
    like a libcfa header doesn't hide that one from `#include <x.hfa>`.
    Each `#line` directive in the buffer becomes an empty line in that file,
    so cpp's line markers, gcc's messages and the translator's positions give
-   the real lines.
+   the real lines. A `#line` that cpp would report as malformed, one whose
+   number comes from a macro and a `# N "file"` linemarker with flags stay
+   as written.
 2. It runs the forked translator: `cfa-cpp --lsp out.json --lsp-focus
    /real/path.cfa [--lsp-c-out out.c] ... in.i`. The translator runs its
    passes as usual, records errors instead of stopping at the first one, and
@@ -34,8 +36,9 @@ When an open header has unsaved edits, checks of the files that include it
 read the buffer: the server writes it to an overlay directory and puts that
 directory on the include path right before the directory it shadows (the
 file's own, then each `-iquote` and `-I` directory). Its `#line` directives
-become empty lines too. Editing such a header re-checks the open files that
-include it.
+become empty lines too. cpp can still find the header on disk, for example
+when a header next to it includes it, and that copy keeps its directives.
+Editing such a header re-checks the open files that include it.
 
 Requests are answered right away from the last good result, in the order
 they arrive. A request cancelled with `$/cancelRequest` before its turn comes
@@ -114,9 +117,9 @@ a system-header macro such as `assert` or `isdigit` makes cpp split a line
 into pieces that share one line number, that line says which piece a column
 is in, and for a header included twice it says which copy. The buffers the
 server writes for cpp have no `#line` directives (see step 1 above), but a
-header read from disk can't be changed that way. Its `#line` directives
-change the line numbers in the markers, and the server reads them to get the
-real lines back.
+header read from disk can't be changed that way. Its `#line` directives, and
+the ones step 1 leaves in, change the line numbers in the markers, and the
+server reads them to get the real lines back.
 
 To tell an identifier in a macro's body from the same name passed as an
 argument (`tmp` in `SWAP( x, tmp )` when the body declares its own `tmp`),
