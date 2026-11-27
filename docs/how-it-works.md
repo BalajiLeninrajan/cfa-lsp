@@ -38,6 +38,8 @@ directory on the include path right before the directory it shadows (the
 file's own, then each `-iquote` and `-I` directory). Its `#line` directives
 become empty lines too. cpp can still find the header on disk, for example
 when a header next to it includes it, and that copy keeps its directives.
+If cpp read a header from both places, the server writes the overlay again
+with the directives and runs `cfa -E` again.
 Editing such a header re-checks the open files that include it.
 
 Requests are answered right away from the last good result, in the order

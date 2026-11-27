@@ -45,7 +45,8 @@
   file in the check, not the values the directive sets. Compiling the file
   still gives the directive's values.
 - A header read from disk keeps its `#line` directives, and so does an
-  unsaved header that cpp finds on disk and not in its overlay. The buffer
+  unsaved header that cpp finds on disk. When cpp reads it from the overlay
+  too, the overlay copy keeps them as well. The buffer
   also keeps a `#line` whose number comes from a macro, and a `# N "file"`
   linemarker with flags. The server maps the translator's positions after
   one of these back to the real lines, but treats one in an `#if 0` block as

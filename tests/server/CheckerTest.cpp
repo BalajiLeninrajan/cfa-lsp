@@ -283,6 +283,48 @@ TEST_CASE( "real cfa and translator: an unsaved header cpp reads from disk keeps
 	CHECK( def[0].range.start.line == 2 );
 }
 
+// A header with no include guard that cpp reads from its overlay and from
+// disk keeps its #line directives in both, so SourceMap's one text for it
+// maps both copies.
+TEST_CASE( "real cfa and translator: an unsaved header read from its overlay and from disk keeps its #line mapping" ) {
+	std::string translator = envOr( "CFA_LSP_TRANSLATOR" );
+	if ( findInPath( "cfa" ).empty() || ! executable( translator ) ) {
+		MESSAGE( "needs cfa and CFA_LSP_TRANSLATOR; skipping" );
+		return;
+	}
+	ToolchainOptions o;
+	o.translator = translator;
+	Checker ch( discoverToolchain( o ) );
+	TempDir proj;
+	std::string main = proj.path() + "/main.cfa", a = proj.path() + "/a.h", b = proj.path() + "/b.h";
+	const std::string bText =
+		"extern int b0;\n"						// 0
+		"#line 100\n"							// 1
+		"#ifndef ONCE\n"						// 2
+		"#define ONCE\n"						// 3
+		"extern int first;\n"					// 4
+		"#else\n"								// 5
+		"extern int second;\n"					// 6
+		"#endif\n";
+	// main.cfa gets b.h from the overlay, then a.h gets it from disk.
+	std::ofstream( a ) << "#include \"b.h\"\n";
+	std::ofstream( b ) << bText;
+	const std::string use = "int f() { return first + second; }";
+	CheckRequest req = requestFor( main, "#include \"b.h\"\n#include \"a.h\"\n" + use + "\n" );
+	req.backend = false;
+	req.overlays[b] = bText;
+	FrontResult fr = ch.front( req, CancelToken() );
+	REQUIRE( fr.analysis );
+	auto def = fr.analysis->definition( main, { 2, (int)use.find( "first" ) } );
+	REQUIRE( def.size() == 1 );
+	CHECK( def[0].file == b );
+	CHECK( def[0].range.start.line == 4 );
+	def = fr.analysis->definition( main, { 2, (int)use.find( "second" ) } );
+	REQUIRE( def.size() == 1 );
+	CHECK( def[0].file == b );
+	CHECK( def[0].range.start.line == 6 );
+}
+
 // The summary of an included file's errors goes on the real #include line.
 // An unsaved header loses its #line directives too.
 TEST_CASE( "real cfa: include summaries after a #line land on the real line" ) {

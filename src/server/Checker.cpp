@@ -566,6 +566,7 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 	// holds one, a copy of it under an overlay directory searched first. The
 	// overlay paths in cpp's output are put back to the real ones.
 	OverlayDirs overlays;
+	std::map<std::string, std::vector<std::string>> copies;	// each unsaved header's overlay files
 	if ( ! req.overlays.empty() ) {
 		std::vector<std::string> search = { dirKey( cwd ) };
 		for ( size_t i = 0; i < fr.flags.cpp.size(); i += 1 ) {
@@ -588,6 +589,7 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 					log::warn( "cannot write overlay ", target.string() );
 					continue;
 				}
+				copies[p].push_back( target.string() );
 				used = true;
 			}
 			if ( used ) overlays.push_back( { d, odir } );
@@ -611,17 +613,43 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 		return fr;
 	}
 	lap( "cfa -E" );
-	std::string cppErr = unOverlay( readFile( o.stderrPath ).value_or( "" ) );
 	// The unsaved headers cpp read from an overlay. cpp can find one on disk
 	// instead, for example when the header next to it includes it, and then
 	// it obeys the #line directives in that copy.
 	std::set<std::string> fromOverlay;
 	if ( ! overlays.empty() ) {
 		std::string raw = readFile( o.stdoutPath ).value_or( "" );
+		auto resolve = [&cwd]( std::string p ) {
+			if ( ! p.empty() && p[0] != '/' ) p = ( fs::path( cwd ) / p ).string();
+			return normalize( p );
+		};
+		std::set<std::string> fromDisk;
 		for ( const auto & site : findIncludeSites( raw ) ) {
-			for ( const auto & ov : overlays ) {
-				if ( site.first.rfind( ov.second + "/", 0 ) == 0 ) fromOverlay.insert( normalize( unOverlay( site.first ) ) );
+			bool overlaid = false;
+			for ( const auto & ov : overlays ) overlaid = overlaid || site.first.rfind( ov.second + "/", 0 ) == 0;
+			( overlaid ? fromOverlay : fromDisk ).insert( resolve( overlaid ? unOverlay( site.first ) : site.first ) );
+		}
+		// A header with no include guard can be read from both. SourceMap has
+		// one text for it, so it gets its #line directives back in the
+		// overlay too, and cpp runs again with them, as it did before the
+		// server blanked any.
+		bool again = false;
+		for ( const std::string & p : fromDisk ) {
+			if ( ! fromOverlay.count( p ) || buffers[p] == unblanked[p] ) continue;
+			fromOverlay.erase( p );
+			for ( const std::string & c : copies[p] ) {
+				if ( ! writeFile( c, unblanked[p] ) ) log::warn( "cannot write overlay ", c );
 			}
+			again = true;
+		}
+		if ( again ) {
+			r = runProcess( cppCommand( req, fr.flags, in, overlays ), o, &cancel );
+			if ( r.status == RunResult::Cancelled ) {
+				fr.status = FrontResult::Cancelled;
+				return fr;
+			}
+			lap( "cfa -E again" );
+			raw = readFile( o.stdoutPath ).value_or( "" );
 		}
 		// The translator reads in.i itself.
 		if ( ! writeFile( o.stdoutPath, unOverlay( std::move( raw ) ) ) && r.ok() ) {
@@ -630,6 +658,7 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 			return fr;
 		}
 	}
+	std::string cppErr = unOverlay( readFile( o.stderrPath ).value_or( "" ) );
 	std::vector<Diag> cppDiags = diagsFromOutput( cppErr, req.path, in, cwd, tc, "cpp" );
 	if ( ! r.ok() ) {
 		fr.status = FrontResult::PreprocessFailed;
