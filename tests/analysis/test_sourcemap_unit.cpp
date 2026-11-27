@@ -60,7 +60,7 @@ TEST_CASE( "sourcemap: whitespace, comments and line markers" ) {
 		"# 1 \"/tmp/t.cfa\"\n"
 		"# 1 \"/r/main.cfa\"\n"
 		"# 1 \"/r/h.hfa\" 1\n"
-		"\n"
+		"#define N 10\n"
 		"int y;\n"
 		"# 2 \"/r/main.cfa\" 2\n"
 		"           int x = 10;\n"
@@ -159,7 +159,7 @@ TEST_CASE( "sourcemap: header included twice" ) {
 		"# 1 \"/r/t.h\" 1\n"			// 2
 		"int v = T;\n"					// 3
 		"# 2 \"/r/m.c\" 2\n"			// 4
-		"\n"							// 5
+		"#define T 1000\n"				// 5
 		"# 1 \"/r/t.h\" 1\n"			// 6
 		"int v = 1000;\n"				// 7
 		"# 4 \"/r/m.c\" 2\n";			// 8
@@ -261,6 +261,8 @@ TEST_CASE( "sourcemap: macro body identifier that is also an argument" ) {
 	std::string prep =
 		"# 1 \"/r/w.cfa\"\n"
 		"# 1 \"/r/swap.h\" 1\n"
+		"#define SWAP(a,b) { int tmp = a; a = b; b = tmp; }\n"
+		"\n"
 		"# 2 \"/r/w.cfa\" 2\n"
 		"void f( int x, int tmp ) {\n"
 		" { int tmp = x; x = tmp; tmp = tmp; };\n"
@@ -294,12 +296,645 @@ TEST_CASE( "sourcemap: macro body identifier that is also an argument" ) {
 	CHECK( m.map( F, 4, 31 ) == L( 3, 1 ) );				// = tmp: the body's
 	CHECK( m.inMacroBody( F, { 4, 31 } ) );
 
-	// Without the definition the argument is the only guess.
-	Files g = f;
-	g.text["/r/swap.h"] = "";
-	SourceMap n( prep, g.reader() );
+	// Without the definitions cpp printed, the argument is the only guess.
+	SourceMap n( SourceMap::withoutDefinitions( prep ), f.reader() );
 	CHECK( n.map( F, 3, 7 ) == tmp );
 	CHECK_FALSE( n.inMacroBody( F, { 3, 7 } ) );
+}
+
+// `cfa -E -dD` prints each #define and #undef where cpp read it, so the
+// definition in effect is the last one above the use, from any file: here a
+// header included by a header, an #undef and a new definition, and the live
+// branch of an #if.
+TEST_CASE( "sourcemap: macro definitions cpp printed, in order" ) {
+	Files f;
+	f.text["/r/inner.h"] = "#define SWAP( a, b ) { int tmp = a; a = b; b = tmp; }\n";
+	f.text["/r/outer.h"] = "#include \"inner.h\"\n#define F( a ) a + tmp\n";
+	f.text["/r/g.cfa"] =
+		"#include \"outer.h\"\n"						// 0
+		"int x = F( tmp );\n"
+		"#undef F\n"
+		"#define F( a ) tmp + a\n"
+		"int y = F( tmp );\n"
+		"#ifndef NOPE\n"								// 5
+		"#define G( a ) tmp - a\n"
+		"#else\n"
+		"#define G( a ) a + tmp\n"
+		"#endif\n"
+		"int z = G( tmp );\n"							// 10
+		"void f( int x, int tmp ) { SWAP( x, tmp ); }\n";
+	std::string prep =
+		"# 1 \"/r/g.cfa\"\n"
+		"# 1 \"/r/outer.h\" 1\n"
+		"# 1 \"/r/inner.h\" 1\n"
+		"#define SWAP(a,b) { int tmp = a; a = b; b = tmp; }\n"
+		"# 2 \"/r/outer.h\" 2\n"
+		"#define F(a) a + tmp\n"
+		"# 2 \"/r/g.cfa\" 2\n"
+		"int x = tmp + tmp;\n"
+		"#undef F\n"
+		"#define F(a) tmp + a\n"
+		"int y = tmp + tmp;\n"
+		"\n"
+		"#define G(a) tmp - a\n"
+		"\n\n\n"
+		"int z = tmp - tmp;\n"
+		"void f( int x, int tmp ) { { int tmp = x; x = tmp; tmp = tmp; }; }\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/g.cfa";
+	// "int x = tmp + tmp;" from outer.h's F: the argument, then the body.
+	CHECK( m.map( F, 2, 8 ) == L( 1, 11 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 2, 8 } ) );
+	CHECK( m.map( F, 2, 14 ) == L( 1, 8 ) );
+	CHECK( m.map( F, 2, 17, true ) == L( 1, 16 ) );
+	CHECK( m.inMacroBody( F, { 2, 14 } ) );
+	// After #undef and the new #define: the body, then the argument.
+	CHECK( m.map( F, 5, 8 ) == L( 4, 8 ) );
+	CHECK( m.inMacroBody( F, { 5, 8 } ) );
+	CHECK( m.map( F, 5, 14 ) == L( 4, 11 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 5, 14 } ) );
+	// cpp left out the G in the #else.
+	CHECK( m.map( F, 11, 8 ) == L( 10, 8 ) );
+	CHECK( m.inMacroBody( F, { 11, 8 } ) );
+	CHECK( m.map( F, 11, 14 ) == L( 10, 11 ) );
+	// SWAP from inner.h, which g.cfa doesn't include itself.
+	// "void f( int x, int tmp ) { { int tmp = x; x = tmp; tmp = tmp; }; }"
+	CHECK( m.map( F, 12, 33 ) == L( 11, 27 ) );
+	CHECK( m.inMacroBody( F, { 12, 33 } ) );
+	CHECK( m.map( F, 12, 46 ) == L( 11, 36 ) );
+	CHECK( m.map( F, 12, 51 ) == L( 11, 36 ) );
+	CHECK( m.map( F, 12, 57 ) == L( 11, 27 ) );
+	CHECK( m.inMacroBody( F, { 12, 57 } ) );
+	CHECK( m.map( F, 12, 19 ) == L( 11, 19 ) );				// the parameter, outside the macro
+	// Only the file asked about is read: the definitions come from cpp.
+	CHECK( *f.reads == std::multiset<std::string>{ F } );
+}
+
+TEST_CASE( "sourcemap: macro bodies with #, ## and GNU's , ## __VA_ARGS__" ) {
+	Files f;
+	f.text["/r/ops.cfa"] =
+		"#define SHOW( v ) show( #v, v, tmp )\n"
+		"#define FIELD( n ) n ## _len + n + len\n"
+		"#define LOG( f, ... ) out( f, ## __VA_ARGS__ ) + out\n"
+		"#define N tmp\n"
+		"#define GLUE( a ) a ## 1 + a + tmp\n"
+		"#define STR( x ) #x\n"
+		"#define XSTR( x ) STR( x )\n"
+		"#define AT( s ) at( s, __LINE__, __FILE__ ) + at\n"
+		"SHOW( tmp ); SHOW( a  +  \"q\\n\" );\n"			// 8
+		"FIELD( len );\n"
+		"LOG( out ); LOG( out, 1, 2 );\n"					// 10
+		"GLUE( N );\n"
+		"STR( N ); XSTR( N ); XSTR( a  +b );\n"
+		"AT( at );\n";
+	std::string prep =
+		"# 1 \"/r/ops.cfa\"\n"
+		"#define SHOW(v) show( #v, v, tmp )\n"
+		"#define FIELD(n) n ## _len + n + len\n"
+		"#define LOG(f,...) out( f, ## __VA_ARGS__ ) + out\n"
+		"#define N tmp\n"
+		"#define GLUE(a) a ## 1 + a + tmp\n"
+		"#define STR(x) #x\n"
+		"#define XSTR(x) STR( x )\n"
+		"#define AT(s) at( s, __LINE__, __FILE__ ) + at\n"
+		"show( \"tmp\", tmp, tmp ); show( \"a + \\\"q\\\\n\\\"\", a + \"q\\n\", tmp );\n"
+		"len_len + len + len;\n"
+		"out( out ) + out; out( out, 1, 2 ) + out;\n"
+		"N1 + tmp + tmp;\n"
+		"\"N\"; \"tmp\"; \"a +b\";\n"
+		"at( at, 14, \"/r/ops.cfa\" ) + at;\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/ops.cfa";
+	// show( "tmp", tmp, tmp ): # spells the argument; v is the argument and
+	// the last tmp the body's.
+	CHECK( m.map( F, 9, 6 ) == L( 8, 0 ) );
+	CHECK( m.inMacroBody( F, { 9, 6 } ) );
+	CHECK( m.map( F, 9, 13 ) == L( 8, 6 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 9, 13 } ) );
+	CHECK( m.map( F, 9, 18 ) == L( 8, 0 ) );
+	CHECK( m.inMacroBody( F, { 9, 18 } ) );
+	// # keeps one space for each run of blanks and escapes the literal.
+	CHECK( m.inMacroBody( F, { 9, 31 } ) );
+	CHECK( m.map( F, 9, 47 ) == L( 8, 19 ) );					// a
+	CHECK( m.map( F, 9, 58 ) == L( 8, 13 ) );
+	// "len_len + len + len": the pasted name is the body's, like the last len.
+	CHECK( m.map( F, 10, 0 ) == L( 9, 0 ) );
+	CHECK( m.inMacroBody( F, { 10, 0 } ) );
+	CHECK( m.map( F, 10, 10 ) == L( 9, 7 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 10, 10 } ) );
+	CHECK( m.map( F, 10, 16 ) == L( 9, 0 ) );
+	CHECK( m.inMacroBody( F, { 10, 16 } ) );
+	// The comma goes without variable arguments and stays with them.
+	CHECK( m.map( F, 11, 0 ) == L( 10, 0 ) );
+	CHECK( m.map( F, 11, 5 ) == L( 10, 5 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 11, 5 } ) );
+	CHECK( m.map( F, 11, 13 ) == L( 10, 0 ) );
+	CHECK( m.inMacroBody( F, { 11, 13 } ) );
+	CHECK( m.map( F, 11, 23 ) == L( 10, 17 ) );
+	CHECK( m.map( F, 11, 37 ) == L( 10, 12 ) );
+	CHECK( m.inMacroBody( F, { 11, 37 } ) );
+	// "N1 + tmp + tmp": next to ## the argument N is not expanded; elsewhere
+	// it is, so that tmp is N's body, written at N.
+	CHECK( m.inMacroBody( F, { 12, 0 } ) );
+	CHECK( m.mapRange( F, 12, 5, 12, 8 ) == Range{ L( 11, 6 ), L( 11, 7 ) } );
+	CHECK( m.inMacroBody( F, { 12, 5 } ) );
+	CHECK( m.map( F, 12, 11 ) == L( 11, 0 ) );
+	CHECK( m.inMacroBody( F, { 12, 11 } ) );
+	// "N"; "tmp"; "a +b";: XSTR expands its argument before STR spells it.
+	CHECK( m.inMacroBody( F, { 13, 0 } ) );
+	CHECK( m.inMacroBody( F, { 13, 5 } ) );
+	CHECK( m.map( F, 13, 5 ) == L( 12, 10 ) );
+	CHECK( m.inMacroBody( F, { 13, 12 } ) );
+	// __LINE__ and __FILE__ match whatever cpp printed.
+	CHECK( m.map( F, 14, 4 ) == L( 13, 4 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 14, 4 } ) );
+	CHECK( m.inMacroBody( F, { 14, 8 } ) );
+	CHECK( m.map( F, 14, 29 ) == L( 13, 0 ) );
+	CHECK( m.inMacroBody( F, { 14, 29 } ) );
+}
+
+TEST_CASE( "sourcemap: nested macros, rescanning and macros in arguments" ) {
+	Files f;
+	f.text["/r/nest.cfa"] =
+		"#define TMP tmp\n"
+		"#define INNER( a ) ( a + TMP )\n"
+		"#define OUTER( a ) INNER( a ) * tmp\n"
+		"#define foo foo + tmp\n"
+		"#define A B + a\n"
+		"#define B A + b\n"							// 5
+		"#define CALLER G\n"
+		"#define G( a ) a + tmp\n"
+		"#define ID( a ) a\n"
+		"#define SWAP( a, b ) { int tmp = a; a = b; b = tmp; }\n"
+		"#define WRAP( a ) a * tmp\n"					// 10
+		"int x1 = OUTER( tmp );\n"
+		"int x2 = foo;\n"
+		"int x3 = A;\n"
+		"int x4 = CALLER( tmp );\n"
+		"void f( int x, int tmp ) { SWAP( x, ID( tmp ) ); }\n"	// 15
+		"int x5 = WRAP( G( y ) );\n";
+	std::string prep =
+		"# 1 \"/r/nest.cfa\"\n"
+		"#define TMP tmp\n"
+		"#define INNER(a) ( a + TMP )\n"
+		"#define OUTER(a) INNER( a ) * tmp\n"
+		"#define foo foo + tmp\n"
+		"#define A B + a\n"
+		"#define B A + b\n"
+		"#define CALLER G\n"
+		"#define G(a) a + tmp\n"
+		"#define ID(a) a\n"
+		"#define SWAP(a,b) { int tmp = a; a = b; b = tmp; }\n"
+		"#define WRAP(a) a * tmp\n"
+		"int x1 = ( tmp + tmp ) * tmp;\n"
+		"int x2 = foo + tmp;\n"
+		"int x3 = A + b + a;\n"
+		"int x4 = tmp + tmp;\n"
+		"void f( int x, int tmp ) { { int tmp = x; x = tmp; tmp = tmp; }; }\n"
+		"int x5 = y + tmp * tmp;\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/nest.cfa";
+	// "int x1 = ( tmp + tmp ) * tmp": the argument, TMP's body, OUTER's body.
+	CHECK( m.map( F, 12, 11 ) == L( 11, 16 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 12, 11 } ) );
+	CHECK( m.map( F, 12, 17 ) == L( 11, 9 ) );
+	CHECK( m.inMacroBody( F, { 12, 17 } ) );
+	CHECK( m.map( F, 12, 25 ) == L( 11, 9 ) );
+	CHECK( m.inMacroBody( F, { 12, 25 } ) );
+	// A macro is not expanded again inside its own expansion. The name it
+	// leaves is the one the source spells there.
+	CHECK( m.map( F, 13, 9 ) == L( 12, 9 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 13, 9 } ) );
+	CHECK( m.inMacroBody( F, { 13, 15 } ) );
+	CHECK_FALSE( m.inMacroBody( F, { 14, 9 } ) );
+	CHECK( m.inMacroBody( F, { 14, 13 } ) );
+	CHECK( m.inMacroBody( F, { 14, 17 } ) );
+	// CALLER's body ends with G, which takes the ( tmp ) after CALLER.
+	CHECK( m.map( F, 15, 9 ) == L( 14, 17 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 15, 9 } ) );
+	CHECK( m.map( F, 15, 15 ) == L( 14, 9 ) );
+	CHECK( m.inMacroBody( F, { 15, 15 } ) );
+	// An argument with a macro in it is expanded before it is substituted.
+	CHECK( m.map( F, 16, 33 ) == L( 15, 27 ) );
+	CHECK( m.inMacroBody( F, { 16, 33 } ) );
+	CHECK( m.map( F, 16, 46 ) == L( 15, 40 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 16, 46 } ) );
+	CHECK( m.map( F, 16, 51 ) == L( 15, 40 ) );
+	CHECK( m.map( F, 16, 57 ) == L( 15, 27 ) );
+	// "int x5 = y + tmp * tmp": G's tmp maps to G( y ), WRAP's to all of it.
+	CHECK( m.map( F, 17, 9 ) == L( 16, 18 ) );
+	CHECK( m.mapRange( F, 17, 13, 17, 16 ) == Range{ L( 16, 15 ), L( 16, 21 ) } );
+	CHECK( m.inMacroBody( F, { 17, 13 } ) );
+	CHECK( m.mapRange( F, 17, 19, 17, 22 ) == Range{ L( 16, 9 ), L( 16, 23 ) } );
+}
+
+// cpp starts with a "# 0" marker for the main file and its predefined macros
+// before it reads any of the file, so the main file's #defines are printed
+// where cpp read them: one after a use isn't in effect there. One in a dead
+// #if branch isn't printed at all, nor is the #undef next to it.
+TEST_CASE( "sourcemap: a #define after the use, and ones in a dead #if branch" ) {
+	Files f;
+	f.text["/r/guard.h"] = "#ifndef GUARD_H\n#define GUARD_H\n#define G( a ) a - tmp\n#endif\n";
+	f.text["/r/late.cfa"] =
+		"#define SWAP( a, b ) { int tmp = a; a = b; b = tmp; check( tmp ); }\n"	// 0
+		"void check( int );\n"
+		"void f( int x, int tmp ) { SWAP( x, tmp ); }\n"
+		"#define check( v ) ((void)0)\n"
+		"#define N 10\n"
+		"#ifdef BIG\n"																// 5
+		"#undef N\n"
+		"#define N 100\n"
+		"#define EXTRA + tmp\n"
+		"#endif\n"
+		"#define S( a, b ) { int tmp = a; a = b; b = tmp + N; }\n"				// 10
+		"#define T( a ) a + tmp EXTRA\n"
+		"void h( int x, int tmp ) { S( x, tmp ); }\n"
+		"int t = T( tmp );\n"
+		"#include \"guard.h\"\n"
+		"int g = G( tmp );\n";														// 15
+	std::string prep =
+		"# 0 \"/r/late.cfa\"\n"
+		"# 0 \"<built-in>\"\n"
+		"#define __STDC__ 1\n"
+		"# 0 \"<command-line>\"\n"
+		"# 1 \"/r/late.cfa\"\n"
+		"#define SWAP(a,b) { int tmp = a; a = b; b = tmp; check( tmp ); }\n"
+		"void check( int );\n"
+		"void f( int x, int tmp ) { { int tmp = x; x = tmp; tmp = tmp; check( tmp ); }; }\n"
+		"#define check(v) ((void)0)\n"
+		"#define N 10\n"
+		"\n\n\n\n\n"
+		"#define S(a,b) { int tmp = a; a = b; b = tmp + N; }\n"
+		"#define T(a) a + tmp EXTRA\n"
+		"void h( int x, int tmp ) { { int tmp = x; x = tmp; tmp = tmp + 10; }; }\n"
+		"int t = tmp + tmp EXTRA;\n"
+		"# 1 \"/r/guard.h\" 1\n"
+		"\n"
+		"#define GUARD_H \n"
+		"#define G(a) a - tmp\n"
+		"# 16 \"/r/late.cfa\" 2\n"
+		"int g = tmp - tmp;\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/late.cfa";
+	// "{ int tmp = x; x = tmp; tmp = tmp; check( tmp ); }": check isn't a
+	// macro yet.
+	CHECK( m.map( F, 3, 33 ) == L( 2, 27 ) );
+	CHECK( m.inMacroBody( F, { 3, 33 } ) );
+	CHECK( m.map( F, 3, 46 ) == L( 2, 36 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 3, 46 } ) );
+	CHECK( m.map( F, 3, 69 ) == L( 2, 27 ) );
+	CHECK( m.inMacroBody( F, { 3, 69 } ) );
+	// "tmp + 10": the N before the #ifdef BIG.
+	CHECK( m.map( F, 13, 33 ) == L( 12, 27 ) );
+	CHECK( m.inMacroBody( F, { 13, 33 } ) );
+	CHECK( m.map( F, 13, 46 ) == L( 12, 33 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 13, 46 } ) );
+	CHECK( m.inMacroBody( F, { 13, 63 } ) );
+	// "tmp + tmp EXTRA": EXTRA was never defined.
+	CHECK( m.map( F, 14, 8 ) == L( 13, 11 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 14, 8 } ) );
+	CHECK( m.map( F, 14, 14 ) == L( 13, 8 ) );
+	CHECK( m.inMacroBody( F, { 14, 14 } ) );
+	// G from the guarded header.
+	CHECK( m.map( F, 16, 8 ) == L( 15, 11 ) );
+	CHECK( m.map( F, 16, 14 ) == L( 15, 8 ) );
+	CHECK( m.inMacroBody( F, { 16, 14 } ) );
+}
+
+// The alignment can give a macro use the wrong tokens: two uses side by side,
+// a body that ends in a function-like macro name, which takes the ( ... )
+// after the use, or a use whose arguments it matched one by one. The redo
+// then says where the use ends.
+TEST_CASE( "sourcemap: macro uses the alignment cuts in the wrong place" ) {
+	Files f;
+	f.text["/r/cut.cfa"] =
+		"#define SW( a, b ) { int tmp = a; a = b; b = tmp; }\n"				// 0
+		"#define PICK( n ) SW\n"
+		"#define TWO( a ) a + tmp\n"
+		"#define LOG( f, ... ) out( f, ## __VA_ARGS__ ) + tmp\n"
+		"#define LOG1( ... ) out( 1, ## __VA_ARGS__ ) + tmp\n"
+		"void k( int x, int tmp ) { PICK( 2 )( x, tmp ); }\n"					// 5
+		"int u = TWO( tmp ) TWO( y );\n"
+		"int g( int tmp ) { return LOG( tmp, ) + LOG1() + LOG1( 2 ); }\n";
+	std::string prep =
+		"# 1 \"/r/cut.cfa\"\n"
+		"#define SW(a,b) { int tmp = a; a = b; b = tmp; }\n"
+		"#define PICK(n) SW\n"
+		"#define TWO(a) a + tmp\n"
+		"#define LOG(f,...) out( f, ## __VA_ARGS__ ) + tmp\n"
+		"#define LOG1(...) out( 1, ## __VA_ARGS__ ) + tmp\n"
+		"void k( int x, int tmp ) { { int tmp = x; x = tmp; tmp = tmp; }; }\n"
+		"int u = tmp + tmp y + tmp;\n"
+		"int g( int tmp ) { return out( tmp, ) + tmp + out( 1 ) + tmp + out( 1, 2 ) + tmp; }\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/cut.cfa";
+	// PICK( 2 ) gives SW, which takes ( x, tmp ).
+	CHECK( m.map( F, 6, 33 ) == L( 5, 27 ) );
+	CHECK( m.inMacroBody( F, { 6, 33 } ) );
+	CHECK( m.map( F, 6, 39 ) == L( 5, 38 ) );
+	CHECK( m.map( F, 6, 46 ) == L( 5, 41 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 6, 46 } ) );
+	CHECK( m.map( F, 6, 57 ) == L( 5, 27 ) );
+	CHECK( m.inMacroBody( F, { 6, 57 } ) );
+	// "tmp + tmp y + tmp": each TWO gave three tokens.
+	CHECK( m.map( F, 7, 8 ) == L( 6, 13 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 7, 8 } ) );
+	CHECK( m.map( F, 7, 14 ) == L( 6, 8 ) );
+	CHECK( m.inMacroBody( F, { 7, 14 } ) );
+	CHECK( m.map( F, 7, 18 ) == L( 6, 24 ) );
+	CHECK( m.map( F, 7, 22 ) == L( 6, 19 ) );
+	CHECK( m.inMacroBody( F, { 7, 22 } ) );
+	// GNU keeps the comma before an empty variable argument, and drops it when
+	// there is none, which an empty one is when it is the only parameter.
+	CHECK( m.map( F, 8, 31 ) == L( 7, 31 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 8, 31 } ) );
+	CHECK( m.map( F, 8, 40 ) == L( 7, 26 ) );
+	CHECK( m.inMacroBody( F, { 8, 40 } ) );
+	CHECK( m.map( F, 8, 57 ) == L( 7, 40 ) );
+	CHECK( m.inMacroBody( F, { 8, 57 } ) );
+	CHECK( m.map( F, 8, 77 ) == L( 7, 49 ) );
+	CHECK( m.inMacroBody( F, { 8, 77 } ) );
+}
+
+// With two definitions of TWO, CHECK and OFF in the source, cpp printed only
+// the live one. A shorter or empty body can't match the start of a longer
+// one, and an empty OFF can't take the tokens of the check( y ) after it.
+TEST_CASE( "sourcemap: macros with a definition in each #if branch" ) {
+	Files f;
+	f.text["/r/alt.cfa"] =
+		"#define LONG\n"									// 0
+		"#ifdef LONG\n"
+		"#define TWO( a ) a + tmp + tmp\n"
+		"#else\n"
+		"#define TWO( a ) a + tmp\n"
+		"#endif\n"											// 5
+		"#ifndef NDEBUG\n"
+		"#define CHECK( x ) check( x );\n"
+		"#else\n"
+		"#define CHECK( x )\n"
+		"#endif\n"											// 10
+		"#define OFF_ON\n"
+		"#ifndef OFF_ON\n"
+		"#define OFF( x ) check( x );\n"
+		"#else\n"
+		"#define OFF( x )\n"								// 15
+		"#endif\n"
+		"int u = TWO( tmp ) TWO( y );\n"
+		"void f( int y ) { CHECK( y ) CHECK( y ) }\n"
+		"void g( int y ) { OFF( y ) check( y ); }\n";
+	std::string prep =
+		"# 1 \"/r/alt.cfa\"\n"
+		"#define LONG \n"
+		"\n"
+		"#define TWO(a) a + tmp + tmp\n"
+		"\n\n\n\n"
+		"#define CHECK(x) check( x );\n"
+		"\n\n\n"
+		"#define OFF_ON \n"
+		"\n\n\n"
+		"#define OFF(x) \n"
+		"\n"
+		"int u = tmp + tmp + tmp y + tmp + tmp;\n"
+		"void f( int y ) { check( y ); check( y ); }\n"
+		"void g( int y ) { check( y ); }\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/alt.cfa";
+	// The first TWO gave "tmp + tmp + tmp", not "tmp + tmp".
+	CHECK( m.map( F, 18, 8 ) == L( 17, 13 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 18, 8 } ) );
+	CHECK( m.map( F, 18, 14 ) == L( 17, 8 ) );
+	CHECK( m.inMacroBody( F, { 18, 14 } ) );
+	CHECK( m.map( F, 18, 20 ) == L( 17, 8 ) );
+	CHECK( m.inMacroBody( F, { 18, 20 } ) );
+	CHECK( m.map( F, 18, 24 ) == L( 17, 24 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 18, 24 } ) );
+	CHECK( m.map( F, 18, 28 ) == L( 17, 19 ) );
+	CHECK( m.inMacroBody( F, { 18, 28 } ) );
+	CHECK( m.map( F, 18, 34 ) == L( 17, 19 ) );
+	// Each CHECK gave "check( y );".
+	CHECK( m.map( F, 19, 18 ) == L( 18, 18 ) );
+	CHECK( m.inMacroBody( F, { 19, 18 } ) );
+	CHECK( m.map( F, 19, 25 ) == L( 18, 25 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 19, 25 } ) );
+	CHECK( m.map( F, 19, 30 ) == L( 18, 29 ) );
+	CHECK( m.inMacroBody( F, { 19, 30 } ) );
+	CHECK( m.map( F, 19, 37 ) == L( 18, 36 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 19, 37 } ) );
+	// OFF gave nothing; "check( y );" is the source's.
+	CHECK( m.map( F, 20, 18 ) == L( 19, 27 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 20, 18 } ) );
+	CHECK( m.map( F, 20, 25 ) == L( 19, 34 ) );
+}
+
+// A macro that expands to its own name, as glibc's stdin, stdout and stderr
+// do, leaves the name the source spells in an argument. So does one whose
+// body calls the function of the same name, as glibc's tolower( c ) does
+// with optimization on.
+TEST_CASE( "sourcemap: a macro that expands to its own name" ) {
+	Files f;
+	f.text["/r/self.cfa"] =
+		"#define stdout stdout\n"
+		"#define OUT stdout\n"
+		"#define CHECK( e ) if ( ( e ) != 0 ) abort()\n"
+		"void f() { CHECK( fflush( stdout ) ); }\n"
+		"void g() { CHECK( fflush( OUT ) ); }\n"
+		"#define body( c, f ) ( { int r; if ( c < 0 ) r = c; else r = f ( c ); r; } )\n"	// 5
+		"#define lower( c ) body( c, lower )\n"
+		"int d = lower( x );\n";
+	std::string prep =
+		"# 1 \"/r/self.cfa\"\n"
+		"#define stdout stdout\n"
+		"#define OUT stdout\n"
+		"#define CHECK(e) if ( ( e ) != 0 ) abort()\n"
+		"void f() { if ( ( fflush( stdout ) ) != 0 ) abort(); }\n"
+		"void g() { if ( ( fflush( stdout ) ) != 0 ) abort(); }\n"
+		"#define body(c,f) ( { int r; if ( c < 0 ) r = c; else r = f ( c ); r; } )\n"
+		"#define lower(c) body( c, lower )\n"
+		"int d = ( { int r; if ( x < 0 ) r = x; else r = lower ( x ); r; } );\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/self.cfa";
+	CHECK( m.map( F, 4, 18 ) == L( 3, 18 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 4, 18 } ) );
+	CHECK( m.map( F, 4, 26 ) == L( 3, 26 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 4, 26 } ) );
+	CHECK( m.map( F, 4, 44 ) == L( 3, 11 ) );
+	CHECK( m.inMacroBody( F, { 4, 44 } ) );
+	// Here stdout is OUT's body.
+	CHECK( m.map( F, 5, 26 ) == L( 4, 26 ) );
+	CHECK( m.inMacroBody( F, { 5, 26 } ) );
+	// The lower that body calls is the source's, and only its name.
+	CHECK( m.mapRange( F, 8, 48, 8, 53 ) == Range{ L( 7, 8 ), L( 7, 13 ) } );
+	CHECK_FALSE( m.inMacroBody( F, { 8, 48 } ) );
+	CHECK( m.map( F, 8, 56 ) == L( 7, 15 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 8, 56 } ) );
+	CHECK( m.inMacroBody( F, { 8, 16 } ) );
+}
+
+// An empty use gives nothing even when the source's tokens after it are what
+// a longer body would give, also at the end of a line. And A B gives x from
+// A and y from B.
+TEST_CASE( "sourcemap: a use next to the source's own tokens" ) {
+	Files f;
+	f.text["/r/own.cfa"] =
+		"#define OFF_ON\n"									// 0
+		"#ifndef OFF_ON\n"
+		"#define OFF( x ) check( x );\n"
+		"#else\n"
+		"#define OFF( x )\n"
+		"#endif\n"											// 5
+		"#ifndef OFF_ON\n"
+		"#define A x B\n"
+		"#else\n"
+		"#define A x\n"
+		"#endif\n"											// 10
+		"#define B y\n"
+		"void check( int );\n"
+		"void g( int y ) {\n"
+		"\tOFF( y ) check( y );\n"
+		"}\n"												// 15
+		"A B\n"
+		"A B ;\n";
+	std::string prep =
+		"# 1 \"/r/own.cfa\"\n"
+		"#define OFF_ON \n"
+		"\n\n\n"
+		"#define OFF(x) \n"
+		"\n\n\n\n"
+		"#define A x\n"
+		"\n"
+		"#define B y\n"
+		"void check( int );\n"
+		"void g( int y ) {\n"
+		" check( y );\n"
+		"}\n"
+		"x y\n"
+		"x y ;\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/own.cfa";
+	CHECK( m.map( F, 15, 1 ) == L( 14, 10 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 15, 1 } ) );
+	CHECK( m.map( F, 15, 8 ) == L( 14, 17 ) );
+	// A gave x and B gave y.
+	CHECK( m.map( F, 17, 0 ) == L( 16, 0 ) );
+	CHECK( m.inMacroBody( F, { 17, 0 } ) );
+	CHECK( m.map( F, 17, 2 ) == L( 16, 2 ) );
+	CHECK( m.inMacroBody( F, { 17, 2 } ) );
+	CHECK( m.map( F, 18, 2 ) == L( 17, 2 ) );
+	CHECK( m.inMacroBody( F, { 18, 2 } ) );
+	CHECK( m.map( F, 18, 4 ) == L( 17, 4 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 18, 4 } ) );
+}
+
+TEST_CASE( "sourcemap: __VA_OPT__" ) {
+	Files f;
+	f.text["/r/va.cfa"] =
+		"#define V( f, ... ) out( f __VA_OPT__(,) __VA_ARGS__ ) + tmp\n"
+		"#define V2( a, ... ) a ## __VA_OPT__( x ## __VA_ARGS__ y ) ## a\n"
+		"#define VA( ... ) __VA_OPT__( tmp ) + tmp\n"
+		"#define E\n"
+		"int h( int tmp ) { return V( tmp ) + V( tmp, 2 ) + VA( tmp ); }\n"		// 4
+		"int q = V2( q ) + V2( q, 1 );\n";
+	std::string prep =
+		"# 1 \"/r/va.cfa\"\n"
+		"#define V(f,...) out( f __VA_OPT__(,) __VA_ARGS__ ) + tmp\n"
+		"#define V2(a,...) a ## __VA_OPT__( x ## __VA_ARGS__ y ) ## a\n"
+		"#define VA(...) __VA_OPT__( tmp ) + tmp\n"
+		"#define E \n"
+		"int h( int tmp ) { return out( tmp ) + tmp + out( tmp , 2 ) + tmp + tmp + tmp; }\n"
+		"int q = qq + qx1 yq;\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/va.cfa";
+	CHECK( m.map( F, 5, 31 ) == L( 4, 29 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 5, 31 } ) );
+	CHECK( m.map( F, 5, 39 ) == L( 4, 26 ) );
+	CHECK( m.inMacroBody( F, { 5, 39 } ) );
+	CHECK( m.map( F, 5, 50 ) == L( 4, 40 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 5, 50 } ) );
+	CHECK( m.map( F, 5, 62 ) == L( 4, 37 ) );
+	CHECK( m.inMacroBody( F, { 5, 62 } ) );
+	// Both of VA's tmps are its body's: __VA_ARGS__ isn't in it.
+	CHECK( m.map( F, 5, 68 ) == L( 4, 51 ) );
+	CHECK( m.inMacroBody( F, { 5, 68 } ) );
+	CHECK( m.map( F, 5, 74 ) == L( 4, 51 ) );
+	CHECK( m.inMacroBody( F, { 5, 74 } ) );
+	// ## next to __VA_OPT__, with and without variable arguments.
+	CHECK( m.map( F, 6, 8 ) == L( 5, 8 ) );
+	CHECK( m.inMacroBody( F, { 6, 8 } ) );
+	CHECK( m.map( F, 6, 13 ) == L( 5, 18 ) );
+	CHECK( m.inMacroBody( F, { 6, 13 } ) );
+	CHECK( m.inMacroBody( F, { 6, 17 } ) );
+}
+
+// cpp's predefined macros are printed before the file, so a body that uses
+// __INT_MAX__ is redone.
+TEST_CASE( "sourcemap: a body that uses a predefined macro" ) {
+	Files f;
+	f.text["/r/pre.cfa"] =
+		"#define BIG( a ) a + tmp + __INT_MAX__\n"
+		"int w = BIG( tmp );\n";
+	std::string prep =
+		"# 0 \"/r/pre.cfa\"\n"
+		"# 0 \"<built-in>\"\n"
+		"#define __INT_MAX__ 0x7fffffff\n"
+		"# 0 \"<command-line>\"\n"
+		"# 1 \"/r/pre.cfa\"\n"
+		"#define BIG(a) a + tmp + __INT_MAX__\n"
+		"int w = tmp + tmp + 0x7fffffff;\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/pre.cfa";
+	CHECK( m.map( F, 2, 8 ) == L( 1, 13 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 2, 8 } ) );
+	CHECK( m.map( F, 2, 14 ) == L( 1, 8 ) );
+	CHECK( m.inMacroBody( F, { 2, 14 } ) );
+	CHECK( m.inMacroBody( F, { 2, 20 } ) );
+}
+
+// What can't be redone maps as before: an identifier of the expansion that
+// the invocation also has is taken to be that one.
+TEST_CASE( "sourcemap: macros that can't be redone" ) {
+	Files f;
+	f.text["/r/no.cfa"] =
+		"#define V( f, ... ) out( f __VA_OPT__(,) __VA_ARGS__ ) + tmp\n"
+		"#define E\n"
+		"int v = V( tmp, E );\n"
+		"#define N tmp\n"
+		"#define S( a ) a + N\n"
+		"#pragma push_macro( \"N\" )\n"						// 5
+		"#undef N\n"
+		"#pragma pop_macro( \"N\" )\n"
+		"int x = S( tmp );\n";
+	std::string prep =
+		"# 1 \"/r/no.cfa\"\n"
+		"#define V(f,...) out( f __VA_OPT__(,) __VA_ARGS__ ) + tmp\n"
+		"#define E \n"
+		"int v = out( tmp ) + tmp;\n"
+		"#define N tmp\n"
+		"#define S(a) a + N\n"
+		"       \n"
+		"#undef N\n"
+		"       \n"
+		"int x = tmp + tmp;\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/no.cfa";
+	// gcc 16 leaves out __VA_OPT__ when the variable arguments expand to
+	// nothing, and not every version does, so this isn't redone.
+	CHECK( m.map( F, 3, 13 ) == L( 2, 11 ) );
+	CHECK( m.map( F, 3, 21 ) == L( 2, 11 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 3, 21 } ) );
+	// pop_macro brings N back without a #define for -dD to print, so N looks
+	// undefined, the redo gives "tmp + N", and both tmps map to the argument.
+	CHECK( m.map( F, 9, 8 ) == L( 8, 11 ) );
+	CHECK( m.map( F, 9, 14 ) == L( 8, 11 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 9, 14 } ) );
+}
+
+// The translator reads the -dD output with the #define and #undef lines
+// emptied, so every other line keeps its number.
+TEST_CASE( "sourcemap: withoutDefinitions" ) {
+	CHECK( SourceMap::withoutDefinitions( "# 1 \"/r/a.cfa\"\n#define X 1\nint x;\n#undef X\n#pragma once\n#define\n" ) ==
+		   "# 1 \"/r/a.cfa\"\n\nint x;\n\n#pragma once\n#define\n" );
+	CHECK( SourceMap::withoutDefinitions( " #define X 1\n#undef X" ) == " #define X 1\n" );
+	CHECK( SourceMap::withoutDefinitions( "" ).empty() );
 }
 
 TEST_CASE( "sourcemap: macro expansions" ) {
@@ -314,7 +949,9 @@ TEST_CASE( "sourcemap: macro expansions" ) {
 		"int s = SWAP( p, q );\n";
 	std::string prep =
 		"# 1 \"/r/m.cfa\"\n"
-		"\n\n\n"
+		"#define ADD(a,b) ((a) + (b))\n"
+		"#define EMPTY \n"
+		"#define SWAP(a,b) b a\n"
 		"int r = ((x) + (y))\n"
 		"        + z;\n"
 		"      int w = f( 1 );\n"
@@ -450,7 +1087,7 @@ TEST_CASE( "sourcemap: lines too long for one alignment table" ) {
 	o2 += "\n";
 	Files g;
 	g.text["/r/mac.cfa"] = o2;
-	SourceMap m2( "# 2 \"/r/mac.cfa\"\n" + p2 + "\n", g.reader() );
+	SourceMap m2( "# 1 \"/r/mac.cfa\"\n#define X(n) ((n)*2)\n" + p2 + "\n", g.reader() );
 	CHECK( m2.mapRange( "/r/mac.cfa", 2, p2Col, 2, p2Col + 6 ) == Range{ L( 1, o2Col ), L( 1, o2Col + 6 ) } );
 	// A token from a macro maps to its invocation.
 	int x = int( p2.find( "((399)" ) );

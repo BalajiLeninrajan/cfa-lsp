@@ -70,7 +70,7 @@ TEST_CASE( "commands passed to each stage" ) {
 
 	V cpp = ch.cppCommand( req, f, "/tmp/t/in.cfa" );
 	CHECK( cpp.front() == "/opt/cfa/bin/cfa" );
-	CHECK( contains( cpp, { "-E" } ) );
+	CHECK( contains( cpp, { "-E", "-dD" } ) );
 	CHECK( contains( cpp, { "-DN=3" } ) );
 	// The file's directory is a quote directory, ahead of the user's flags.
 	auto quote = std::find( cpp.begin(), cpp.end(), "-Wp,-iquote/home/u/proj" );

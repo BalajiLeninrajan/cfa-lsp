@@ -38,7 +38,7 @@ to pick them up.
 Tests that need `cfa` or the translator skip themselves when those are
 missing. The suites are:
 
-- `tests/analysis`: SourceMap against real `cfa -E` output, the tokenizer,
+- `tests/analysis`: SourceMap against real `cfa -E -dD` output, the tokenizer,
   and the queries on hand-written dumps;
 - `tests/server`: transport, position mapping, flags, compiler output parsing
   and LSP sessions against a fake toolchain (`tests/server/fake`);

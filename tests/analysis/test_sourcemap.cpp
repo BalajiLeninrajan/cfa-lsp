@@ -1,4 +1,4 @@
-// SourceMap against real `cfa -E` output. Every test skips itself when cfa
+// SourceMap against real `cfa -E -dD` output. Every test skips itself when cfa
 // is not on PATH.
 #include <doctest/doctest.h>
 
@@ -59,15 +59,16 @@ struct TempDir {
 };
 
 // Preprocesses `text` as the server does: a copy in another directory whose
-// first line is a marker for the real path, with -I for the real directory.
+// first line is a marker for the real path, with -I for the real directory,
+// and -dD for the macro definitions.
 std::optional<std::string> preprocess( const fs::path & real, const std::string & text, const fs::path & work ) {
 	fs::path buf = work / "buffer" / "buffer.cfa";
 	spit( buf, "# 1 \"" + real.string() + "\"\n" + text );
 	fs::path out = work / "buffer" / "out.i", err = work / "buffer" / "err.txt";
-	std::string cmd = "cfa -E -I'" + real.parent_path().string() + "' '" + buf.string() + "' > '" + out.string() +
+	std::string cmd = "cfa -E -dD -I'" + real.parent_path().string() + "' '" + buf.string() + "' > '" + out.string() +
 					  "' 2> '" + err.string() + "'";
 	if ( std::system( cmd.c_str() ) != 0 ) {
-		FAIL_CHECK( "cfa -E failed: " << slurp( err ) );
+		FAIL_CHECK( "cfa -E -dD failed: " << slurp( err ) );
 		return std::nullopt;
 	}
 	return slurp( out );
@@ -331,6 +332,175 @@ TEST_CASE( "sourcemap/cfa: macros" ) {
 	CHECK( m.map( F, 19, prepCol( P, 19, ";" ) ) == origAt( T, 19, ";" ) );
 }
 
+// An identifier in an expansion maps to the argument it was copied from, and
+// one from a macro's body to the invocation (inMacroBody), with macros from a
+// header's header, #undef, #, ##, nested macros and macros in arguments.
+TEST_CASE( "sourcemap/cfa: macro bodies" ) {
+	if ( !haveCfa() ) { MESSAGE( "cfa not on PATH; skipping" ); return; }
+	TempDir work;
+	REQUIRE( !work.path.empty() );
+	fs::path real = work.path / "src" / "bodies.cfa";
+	const std::string text =
+		"#include \"outer.h\"\n"										// 1
+		"#define N tmp\n"
+		"#define SHOW( v ) show( #v, v, tmp )\n"
+		"#define FIELD( n ) n ## _len + n + len\n"
+		"#define ID( a ) a\n"											// 5
+		"#define WRAP( a ) a * tmp\n"
+		"#define G( a ) ( a + tmp )\n"
+		"void show( const char * s, int a, int b );\n"
+		"int f( int x, int tmp, int len, int len_len, int y ) {\n"
+		"\tSWAP( x, ID( tmp ) );\n"										// 10
+		"\tint r = F( tmp );\n"
+		"#undef F\n"
+		"#define F( a ) tmp + a\n"
+		"\tr += F( tmp );\n"
+		"\tSHOW( N );\n"													// 15
+		"\tSHOW( tmp );\n"
+		"\tr += FIELD( len );\n"
+		"\treturn r + WRAP( G( y ) );\n"
+		"}\n";
+	spit( real.parent_path() / "inner.h", "#define SWAP( a, b ) { int tmp = a; a = b; b = tmp; }\n" );
+	spit( real.parent_path() / "outer.h", "#include \"inner.h\"\n#define F( a ) a + tmp\n" );
+	spit( real, text );
+	auto prep = preprocess( real, text, work.path );
+	REQUIRE( prep );
+	const std::string F = real.string();
+	const std::string & T = text;
+	SourceMap m( *prep, diskReader() );
+	auto P = prepLines( *prep, F );
+	// The nth tmp (or other word) of a preprocessed line, as the map sees it.
+	auto at = [&]( int line, const std::string & word, int nth ) { return m.map( F, line, prepCol( P, line, word, nth ) ); };
+	auto body = [&]( int line, const std::string & word, int nth ) {
+		return m.inMacroBody( F, { line, prepCol( P, line, word, nth ) } );
+	};
+
+	// { int tmp = x; x = tmp; tmp = tmp; }: SWAP is in a header of a header,
+	// and its b is ID( tmp ), expanded first.
+	CHECK( at( 10, "tmp", 0 ) == origAt( T, 10, "SWAP" ) );
+	CHECK( body( 10, "tmp", 0 ) );
+	CHECK( at( 10, "tmp", 1 ) == origAt( T, 10, "tmp" ) );
+	CHECK_FALSE( body( 10, "tmp", 1 ) );
+	CHECK( at( 10, "tmp", 2 ) == origAt( T, 10, "tmp" ) );
+	CHECK( at( 10, "tmp", 3 ) == origAt( T, 10, "SWAP" ) );
+	// outer.h's F, then the one after #undef.
+	CHECK( at( 11, "tmp", 0 ) == origAt( T, 11, "tmp" ) );
+	CHECK( at( 11, "tmp", 1 ) == origAt( T, 11, "F" ) );
+	CHECK( body( 11, "tmp", 1 ) );
+	CHECK( at( 14, "tmp", 0 ) == origAt( T, 14, "F" ) );
+	CHECK( at( 14, "tmp", 1 ) == origAt( T, 14, "tmp" ) );
+	CHECK_FALSE( body( 14, "tmp", 1 ) );
+	// show( "N", tmp, tmp ): the first tmp is N's body, written at N.
+	CHECK( at( 15, "tmp,", 0 ) == origAt( T, 15, "N" ) );
+	CHECK( body( 15, "tmp,", 0 ) );
+	CHECK( at( 15, "tmp )", 0 ) == origAt( T, 15, "SHOW" ) );
+	// show( "tmp", tmp, tmp )
+	CHECK( at( 16, "tmp,", 0 ) == origAt( T, 16, "tmp" ) );
+	CHECK_FALSE( body( 16, "tmp,", 0 ) );
+	CHECK( at( 16, "tmp )", 0 ) == origAt( T, 16, "SHOW" ) );
+	CHECK( body( 16, "tmp )", 0 ) );
+	// len_len + len + len
+	CHECK( at( 17, "len_len", 0 ) == origAt( T, 17, "FIELD" ) );
+	CHECK( body( 17, "len_len", 0 ) );
+	CHECK( at( 17, "len", 0 ) == origAt( T, 17, "len" ) );
+	CHECK( at( 17, "len", 1 ) == origAt( T, 17, "FIELD" ) );
+	// ( y + tmp ) * tmp: G's tmp maps to G( y ).
+	CHECK( at( 18, "y", 0 ) == origAt( T, 18, "y" ) );
+	CHECK( at( 18, "tmp", 0 ) == origAt( T, 18, "G" ) );
+	CHECK( body( 18, "tmp", 0 ) );
+	CHECK( at( 18, "tmp", 1 ) == origAt( T, 18, "WRAP" ) );
+}
+
+// A #define after the use or in a dead #if branch, macro uses side by side or
+// that take the ( ... ) after them, GNU's comma rule and __VA_OPT__.
+TEST_CASE( "sourcemap/cfa: late definitions, dead branches and uses the alignment cuts" ) {
+	if ( !haveCfa() ) { MESSAGE( "cfa not on PATH; skipping" ); return; }
+	TempDir work;
+	REQUIRE( !work.path.empty() );
+	fs::path real = work.path / "src" / "late.cfa";
+	const std::string text =
+		"#define SWAP( a, b ) { int tmp = a; a = b; b = tmp; check( tmp ); }\n"	// 1
+		"void check( int );\n"
+		"void f( int x, int tmp ) { SWAP( x, tmp ); }\n"
+		"#define check( v ) ((void)0)\n"
+		"#define N 10\n"															// 5
+		"#ifdef BIG\n"
+		"#undef N\n"
+		"#define N 100\n"
+		"#define EXTRA + tmp\n"
+		"#endif\n"																	// 10
+		"#define S( a, b ) { int tmp = a; a = b; b = tmp + N; }\n"
+		"#define T( a ) a + tmp EXTRA\n"
+		"void h( int x, int tmp ) { S( x, tmp ); }\n"
+		"int t = T( tmp );\n"
+		"#define SW( a, b ) { int tmp = a; a = b; b = tmp; }\n"						// 15
+		"#define PICK( n ) SW\n"
+		"#define TWO( a ) a + tmp\n"
+		"#define LOG( f, ... ) out( f, ## __VA_ARGS__ ) + tmp\n"
+		"#define LOG1( ... ) out( 1, ## __VA_ARGS__ ) + tmp\n"
+		"#define V( f, ... ) out( f __VA_OPT__(,) __VA_ARGS__ ) + tmp\n"			// 20
+		"void k( int x, int tmp ) { PICK( 2 )( x, tmp ); }\n"
+		"int u = TWO( tmp ) TWO( y );\n"
+		"int g( int tmp ) { return LOG( tmp, ) + LOG1() + LOG1( 2 ); }\n"
+		"int v( int tmp ) { return V( tmp ) + V( tmp, 2 ); }\n";
+	spit( real, text );
+	auto prep = preprocess( real, text, work.path );
+	REQUIRE( prep );
+	const std::string F = real.string();
+	const std::string & T = text;
+	SourceMap m( *prep, diskReader() );
+	auto P = prepLines( *prep, F );
+	auto at = [&]( int line, const std::string & word, int nth ) { return m.map( F, line, prepCol( P, line, word, nth ) ); };
+	auto body = [&]( int line, const std::string & word, int nth ) {
+		return m.inMacroBody( F, { line, prepCol( P, line, word, nth ) } );
+	};
+
+	// { int tmp = x; x = tmp; tmp = tmp; check( tmp ); }: check is defined
+	// only after the use.
+	CHECK( at( 3, "tmp", 1 ) == origAt( T, 3, "SWAP" ) );
+	CHECK( body( 3, "tmp", 1 ) );
+	CHECK( at( 3, "tmp", 2 ) == origAt( T, 3, "tmp", 1 ) );
+	CHECK_FALSE( body( 3, "tmp", 2 ) );
+	CHECK( at( 3, "tmp", 5 ) == origAt( T, 3, "SWAP" ) );
+	CHECK( body( 3, "tmp", 5 ) );
+	// tmp + 10: the N before the #ifdef BIG.
+	CHECK( at( 13, "tmp", 1 ) == origAt( T, 13, "S" ) );
+	CHECK( body( 13, "tmp", 1 ) );
+	CHECK( at( 13, "tmp", 2 ) == origAt( T, 13, "tmp", 1 ) );
+	CHECK( body( 13, "10", 0 ) );
+	// tmp + tmp EXTRA: EXTRA was never defined.
+	CHECK( at( 14, "tmp", 0 ) == origAt( T, 14, "tmp" ) );
+	CHECK( at( 14, "tmp", 1 ) == origAt( T, 14, "T" ) );
+	CHECK( body( 14, "tmp", 1 ) );
+	// PICK( 2 ) gives SW, which takes ( x, tmp ).
+	CHECK( at( 21, "tmp", 1 ) == origAt( T, 21, "PICK" ) );
+	CHECK( body( 21, "tmp", 1 ) );
+	CHECK( at( 21, "tmp", 2 ) == origAt( T, 21, "tmp", 1 ) );
+	CHECK_FALSE( body( 21, "tmp", 2 ) );
+	CHECK( at( 21, "x", 1 ) == origAt( T, 21, "x", 1 ) );
+	// tmp + tmp y + tmp
+	CHECK( at( 22, "tmp", 0 ) == origAt( T, 22, "tmp" ) );
+	CHECK( at( 22, "tmp", 1 ) == origAt( T, 22, "TWO", 0 ) );
+	CHECK( body( 22, "tmp", 1 ) );
+	CHECK( at( 22, "y", 0 ) == origAt( T, 22, "y" ) );
+	CHECK( at( 22, "tmp", 2 ) == origAt( T, 22, "TWO", 1 ) );
+	// out( tmp, ) + tmp + out( 1 ) + tmp + out( 1, 2 ) + tmp
+	CHECK( at( 23, "tmp", 1 ) == origAt( T, 23, "tmp", 1 ) );
+	CHECK_FALSE( body( 23, "tmp", 1 ) );
+	CHECK( at( 23, "tmp", 2 ) == origAt( T, 23, "LOG" ) );
+	CHECK( body( 23, "tmp", 2 ) );
+	CHECK( at( 23, "tmp", 3 ) == origAt( T, 23, "LOG1", 0 ) );
+	CHECK( at( 23, "tmp", 4 ) == origAt( T, 23, "LOG1", 1 ) );
+	// out( tmp ) + tmp + out( tmp, 2 ) + tmp
+	CHECK( at( 24, "tmp", 1 ) == origAt( T, 24, "tmp", 1 ) );
+	CHECK_FALSE( body( 24, "tmp", 1 ) );
+	CHECK( at( 24, "tmp", 2 ) == origAt( T, 24, "V", 0 ) );
+	CHECK( body( 24, "tmp", 2 ) );
+	CHECK( at( 24, "tmp", 3 ) == origAt( T, 24, "tmp", 2 ) );
+	CHECK( at( 24, "tmp", 4 ) == origAt( T, 24, "V", 1 ) );
+	CHECK( body( 24, "tmp", 4 ) );
+}
+
 TEST_CASE( "sourcemap/cfa: CFA syntax" ) {
 	if ( !haveCfa() ) { MESSAGE( "cfa not on PATH; skipping" ); return; }
 	Case c( "cfa.cfa",
@@ -390,28 +560,9 @@ TEST_CASE( "sourcemap/cfa: local include and libcfa headers" ) {
 	MESSAGE( "preprocessed lines: " << std::count( prep->begin(), prep->end(), '\n' ) << ", " << n
 			 << " fstream.hfa tokens checked, " << ms << " ms" );
 	CHECK( ms < 2000 );
-	// Only the three queried files were read, and headers they include, where
-	// SourceMap looks for the #define of a macro to redo its expansion.
-	std::set<std::string> queried{ real.string(), local, fstream };
-	for ( const std::string & r : *reads ) {
-		if ( queried.count( r ) ) continue;
-		bool included = false;
-		for ( const std::string & q : queried ) {
-			std::istringstream in( slurp( q ) );
-			for ( std::string l; !included && std::getline( in, l ); ) {
-				size_t b = l.find_first_of( "\"<" );
-				if ( l.find( "#include" ) == std::string::npos || b == std::string::npos ) continue;
-				size_t e = l.find_first_of( "\">", b + 1 );
-				if ( e == std::string::npos ) continue;
-				std::string name = l.substr( b + 1, e - b - 1 );
-				included = r.size() > name.size() && r.compare( r.size() - name.size() - 1, std::string::npos, "/" + name ) == 0;
-			}
-		}
-		CHECK_MESSAGE( included, "read " << r );
-	}
-	CHECK( reads->count( real.string() ) );
-	CHECK( reads->count( local ) );
-	CHECK( reads->count( fstream ) );
+	// Only the three queried files were read: the definitions to redo macro
+	// expansions with come from cpp's output.
+	CHECK( *reads == std::set<std::string>{ real.string(), local, fstream } );
 
 	auto P = prepLines( *prep, local );
 	Loc scale = origAt( slurp( local ), 11, "SCALE" );

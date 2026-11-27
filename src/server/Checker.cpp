@@ -289,7 +289,8 @@ std::vector<Diag> diagsFromOutput( const std::string & output, const std::string
 
 std::vector<std::string> Checker::cppCommand( const CheckRequest & req, const FlagSet & flags, const std::string & in,
 											  const OverlayDirs & overlays ) const {
-	std::vector<std::string> cmd = { tc.cfa, "-E", "-fdiagnostics-plain-output", "-fdiagnostics-column-unit=byte" };
+	// -dD prints each #define and #undef cpp obeyed, for SourceMap.
+	std::vector<std::string> cmd = { tc.cfa, "-E", "-dD", "-fdiagnostics-plain-output", "-fdiagnostics-column-unit=byte" };
 	auto overlayOf = [&]( const std::string & dir ) -> const std::string * {
 		std::string key = dirKey( dir );
 		for ( const auto & [d, o] : overlays ) {
@@ -604,20 +605,21 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 	}
 	lap( "cfa -E" );
 	std::string cppErr = unOverlay( readFile( o.stderrPath ).value_or( "" ) );
-	if ( ! overlays.empty() ) {
-		// The translator reads in.i itself.
-		if ( ! writeFile( o.stdoutPath, unOverlay( readFile( o.stdoutPath ).value_or( "" ) ) ) && r.ok() ) {
-			fr.status = FrontResult::PreprocessFailed;
-			fr.diags.push_back( fileLevel( req.path, "cfa-lsp: cannot write " + o.stdoutPath ) );
-			return fr;
-		}
+	std::string preprocessed = readFile( o.stdoutPath ).value_or( "" );
+	if ( ! overlays.empty() ) preprocessed = unOverlay( std::move( preprocessed ) );
+	// The translator reads in.i itself, without the lines -dD added. SourceMap
+	// gets them.
+	if ( r.ok() && ! writeFile( o.stdoutPath, SourceMap::withoutDefinitions( preprocessed ) ) ) {
+		fr.status = FrontResult::PreprocessFailed;
+		fr.diags.push_back( fileLevel( req.path, "cfa-lsp: cannot write " + o.stdoutPath ) );
+		return fr;
 	}
 	std::vector<Diag> cppDiags = diagsFromOutput( cppErr, req.path, in, cwd, tc, "cpp" );
 	if ( ! r.ok() ) {
 		fr.status = FrontResult::PreprocessFailed;
 		// cpp writes what it has so far, so the include sites up to the
 		// error are there.
-		fr.diags = withIncludeSummaries( cppDiags, req.path, includeSites( readFile( o.stdoutPath ).value_or( "" ), in, req.path ), tc );
+		fr.diags = withIncludeSummaries( cppDiags, req.path, includeSites( preprocessed, in, req.path ), tc );
 		bool anyError = false;
 		for ( const auto & d : cppDiags ) anyError = anyError || d.severity == 1;
 		if ( ! anyError ) {
@@ -662,7 +664,6 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 	}
 
 	// 3. Load.
-	auto preprocessed = readFile( o.stdoutPath ).value_or( "" );
 	struct Cache {
 		std::mutex m;
 		std::map<std::string, std::optional<std::string>> files;

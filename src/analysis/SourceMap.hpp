@@ -4,6 +4,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "Types.hpp"
@@ -34,8 +35,15 @@ class SourceMap {
 	// file, disk contents for headers. nullopt if unreadable.
 	using Reader = std::function<std::optional<std::string>( const std::string & path )>;
 
-	// `preprocessed` is the exact text the translator read.
+	// `preprocessed` is `cfa -E -dD` output. The translator read its
+	// withoutDefinitions(), which has the same lines. Its #define and #undef
+	// lines say which macros were defined where. Plain `cfa -E` output works
+	// too, but then no macro expansion is redone (see inMacroBody).
 	SourceMap( std::string preprocessed, Reader read );
+
+	// `cfa -E -dD` output with each #define and #undef line that cpp printed
+	// left empty, for the translator. Every line keeps its number.
+	static std::string withoutDefinitions( std::string_view preprocessed );
 	~SourceMap();
 	SourceMap( SourceMap && ) noexcept;
 	SourceMap & operator=( SourceMap && ) noexcept;
@@ -57,7 +65,7 @@ class SourceMap {
 	// Whether the token at `p` came from the body of a macro rather than from
 	// the source or a macro argument, so the source has no token for it, only
 	// the invocation. Known only when SourceMap could redo the expansion from
-	// a #define in the file or a header it includes directly; false otherwise.
+	// the definitions cpp printed and got what cpp got; false otherwise.
 	bool inMacroBody( const std::string & file, Point p ) const;
 
 	// Every file named in a line marker (empty for identity()).
