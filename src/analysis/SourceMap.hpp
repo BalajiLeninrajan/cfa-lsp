@@ -35,15 +35,17 @@ class SourceMap {
 	// file, disk contents for headers. nullopt if unreadable.
 	using Reader = std::function<std::optional<std::string>( const std::string & path )>;
 
-	// `preprocessed` is `cfa -E -dD` output. The translator read its
-	// withoutDefinitions(), which has the same lines. Its #define and #undef
-	// lines say which macros were defined where. Plain `cfa -E` output works
-	// too, but then no macro expansion is redone (see inMacroBody).
+	// `preprocessed` is `cfa -E -dD` output. Its #define and #undef lines say
+	// which macros were defined where. Positions are in its translatorInput(),
+	// which the translator read. Plain `cfa -E` output works too, but then no
+	// macro expansion is redone (see inMacroBody).
 	SourceMap( std::string preprocessed, Reader read );
 
-	// `cfa -E -dD` output with each #define and #undef line that cpp printed
-	// left empty, for the translator. Every line keeps its number.
-	static std::string withoutDefinitions( std::string_view preprocessed );
+	// The text for the translator, made from `cfa -E -dD` output. Each #define
+	// and #undef line that cpp printed is left empty, so every line keeps its
+	// number. A line that cpp split to print a #define or #undef from inside a
+	// macro's arguments is joined again, as plain `cfa -E` prints it.
+	static std::string translatorInput( std::string_view preprocessed );
 	~SourceMap();
 	SourceMap( SourceMap && ) noexcept;
 	SourceMap & operator=( SourceMap && ) noexcept;

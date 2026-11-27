@@ -15,7 +15,9 @@ cfa-cpp --lsp OUT.json [--lsp-focus PATH]... [--lsp-c-out OUT.c] [--lsp-stop-aft
 - `INPUT.i` is the output of `cfa -E` (preprocessed, with `# N "file"` line
   markers). The server runs `cfa -E -dD` and empties the `#define` and
   `#undef` lines that `-dD` adds, so the line numbers match the text it
-  keeps. The server writes the buffer to a temp file whose first line is
+  keeps. Where `-dD` split a line to print a directive from inside a macro's
+  arguments, the server joins it again, as plain `cfa -E` prints it, and
+  turns the lines in between into line markers. The server writes the buffer to a temp file whose first line is
   `# 1 "/abs/path/of/real/file.cfa"`, so every file name in the dump is the
   real path, never the temp path.
 - `--lsp OUT.json` turns LSP mode on. Errors and warnings go into the JSON,

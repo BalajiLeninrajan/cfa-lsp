@@ -297,7 +297,7 @@ TEST_CASE( "sourcemap: macro body identifier that is also an argument" ) {
 	CHECK( m.inMacroBody( F, { 4, 31 } ) );
 
 	// Without the definitions cpp printed, the argument is the only guess.
-	SourceMap n( SourceMap::withoutDefinitions( prep ), f.reader() );
+	SourceMap n( SourceMap::translatorInput( prep ), f.reader() );
 	CHECK( n.map( F, 3, 7 ) == tmp );
 	CHECK_FALSE( n.inMacroBody( F, { 3, 7 } ) );
 }
@@ -930,11 +930,170 @@ TEST_CASE( "sourcemap: macros that can't be redone" ) {
 
 // The translator reads the -dD output with the #define and #undef lines
 // emptied, so every other line keeps its number.
-TEST_CASE( "sourcemap: withoutDefinitions" ) {
-	CHECK( SourceMap::withoutDefinitions( "# 1 \"/r/a.cfa\"\n#define X 1\nint x;\n#undef X\n#pragma once\n#define\n" ) ==
+TEST_CASE( "sourcemap: translatorInput" ) {
+	CHECK( SourceMap::translatorInput( "# 1 \"/r/a.cfa\"\n#define X 1\nint x;\n#undef X\n#pragma once\n#define\n" ) ==
 		   "# 1 \"/r/a.cfa\"\n\nint x;\n\n#pragma once\n#define\n" );
-	CHECK( SourceMap::withoutDefinitions( " #define X 1\n#undef X" ) == " #define X 1\n" );
-	CHECK( SourceMap::withoutDefinitions( "" ).empty() );
+	CHECK( SourceMap::translatorInput( " #define X 1\n#undef X" ) == " #define X 1\n" );
+	CHECK( SourceMap::translatorInput( "" ).empty() );
+	// A #define after a line, then a marker for a later line, splits nothing.
+	CHECK( SourceMap::translatorInput( "# 1 \"/r/a.cfa\"\nint a;\n#define Q 1\n# 9 \"/r/a.cfa\"\nint b;\n" ) ==
+		   "# 1 \"/r/a.cfa\"\nint a;\n\n# 9 \"/r/a.cfa\"\nint b;\n" );
+	// Two directives in one macro's arguments split the line twice, and the
+	// three pieces are joined into one.
+	const std::string mark = "# 1 \"/r/t.cfa\"\n";
+	CHECK( SourceMap::translatorInput( mark + " x = w + y+w +\n#define S 1\n#define T 1\n" + mark + "                     y\n\n#undef S\n" +
+									   mark + "    +w\n    ;\n" ) ==
+		   mark + mark + mark + mark + mark + mark + mark + mark + mark + " x = w + y+w + y +w\n    ;\n" );
+}
+
+// cpp prints a #define or #undef inside a macro's arguments as soon as it
+// reads it: the tokens before the macro, the directive, a marker repeating
+// their line, and the rest of the line. The translator gets the line joined
+// again (see SourceMap::translatorInput), and so does SourceMap.
+TEST_CASE( "sourcemap: a #define inside a macro's arguments" ) {
+	Files f;
+	f.text["/r/s.cfa"] =
+		"#define F(a,b) a+b\n"
+		"int y, w;\n"
+		"int g() {\n"
+		"\tint x = w + F( y,\n"
+		"#define Q 2\n"												// 5
+		"\tw );\n"
+		"\treturn x;\n"
+		"}\n";
+	std::string prep =
+		"# 1 \"/r/s.cfa\"\n"
+		"#define F(a,b) a+b\n"
+		"int y, w;\n"
+		"int g() {\n"
+		" int x = w +\n"
+		"#define Q 2\n"
+		"# 4 \"/r/s.cfa\"\n"
+		"             y+w\n"
+		"\n"
+		"    ;\n"
+		" return x;\n"
+		"}\n";
+	CHECK( SourceMap::translatorInput( prep ) ==
+		   "# 1 \"/r/s.cfa\"\n"
+		   "\n"
+		   "int y, w;\n"
+		   "int g() {\n"
+		   "# 4 \"/r/s.cfa\"\n"
+		   "# 4 \"/r/s.cfa\"\n"
+		   "# 4 \"/r/s.cfa\"\n"
+		   " int x = w + y+w\n"
+		   "\n"
+		   "    ;\n"
+		   " return x;\n"
+		   "}\n" );
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/s.cfa";
+	// " int x = w + y+w" at pline 8
+	//   0123456789012345
+	CHECK( m.map( F, { 4, 9, 8 } ) == L( 3, 9 ) );				// w
+	CHECK( m.map( F, { 4, 11, 8 } ) == L( 3, 11 ) );			// +
+	CHECK( m.map( F, { 4, 13, 8 } ) == L( 3, 16 ) );			// y, the argument
+	CHECK( m.map( F, 4, 13 ) == L( 3, 16 ) );
+	CHECK_FALSE( m.inMacroBody( F, { 4, 13, 8 } ) );
+	CHECK( m.map( F, { 4, 14, 8 } ) == L( 3, 13 ) );			// the body's +
+	CHECK( m.inMacroBody( F, { 4, 14, 8 } ) );
+	CHECK( m.map( F, { 4, 15, 8 } ) == L( 5, 1 ) );				// w, the argument on line 6
+	CHECK( m.map( F, { 6, 4, 10 } ) == L( 5, 4 ) );				// ;
+	CHECK( m.map( F, { 7, 1, 11 } ) == L( 6, 1 ) );				// return
+}
+
+// The tokens before the macro were printed with the definitions above the
+// directive, and the macro's expansion with the directive's.
+TEST_CASE( "sourcemap: definitions printed in the middle of a line" ) {
+	Files f;
+	f.text["/r/n.cfa"] =
+		"#define N 1\n"
+		"#define F( a ) a\n"
+		"int x = N + F( N\n"
+		"#undef N\n"
+		"#define N 2\n"												// 5
+		" );\n";
+	std::string prep =
+		"# 1 \"/r/n.cfa\"\n"
+		"#define N 1\n"
+		"#define F(a) a\n"
+		"int x = 1 +\n"
+		"#undef N\n"
+		"#define N 2\n"
+		"# 3 \"/r/n.cfa\"\n"
+		"            2\n"
+		"\n"
+		"\n"
+		"  ;\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/n.cfa";
+	// "int x = 1 + 2" at pline 8
+	//  0123456789012
+	CHECK( m.map( F, { 3, 8, 8 } ) == L( 2, 8 ) );				// 1: N
+	CHECK( m.inMacroBody( F, { 3, 8, 8 } ) );					// redone with N as 1
+	CHECK( m.map( F, { 3, 10, 8 } ) == L( 2, 10 ) );			// +
+	CHECK( m.map( F, { 3, 12, 8 } ) == L( 2, 12 ) );			// 2: F( N )
+	CHECK( m.inMacroBody( F, { 3, 12, 8 } ) );					// redone with N as 2
+	CHECK( m.map( F, { 6, 2, 11 } ) == L( 5, 2 ) );				// ;
+}
+
+// When the marker after the directive switches flag 3, plain cpp splits the
+// line there too. Only the lines between the pieces change, so the second
+// piece continues the line.
+TEST_CASE( "sourcemap: a #define inside a system-header macro's arguments" ) {
+	Files f;
+	f.text["/r/c.cfa"] =
+		"#include <hd.h>\n"
+		"int w, y;\n"
+		"int z = w + isd( y\n"
+		"#define R 2\n"
+		" );\n";
+	std::string prep =
+		"# 1 \"/r/c.cfa\"\n"
+		"# 1 \"/r/hd.h\" 1 3\n"
+		"#define isd(c) ( tab[c] & 8 )\n"
+		"# 2 \"/r/c.cfa\" 2\n"
+		"int w, y;\n"
+		"int z = w +\n"
+		"#define R 2\n"
+		"# 3 \"/r/c.cfa\" 3\n"
+		"            ( tab[\n"
+		"# 3 \"/r/c.cfa\"\n"
+		"           y\n"
+		"# 3 \"/r/c.cfa\" 3\n"
+		"           ] & 8 )\n"
+		"\n"
+		"  \n"
+		"# 5 \"/r/c.cfa\"\n"
+		" ;\n";
+	// What plain cpp prints, but for the emptied #define and the marker for
+	// the line after "int z = w + ".
+	CHECK( SourceMap::translatorInput( prep ) ==
+		   "# 1 \"/r/c.cfa\"\n"
+		   "# 1 \"/r/hd.h\" 1 3\n"
+		   "\n"
+		   "# 2 \"/r/c.cfa\" 2\n"
+		   "int w, y;\n"
+		   "int z = w + \n"
+		   "# 4 \"/r/c.cfa\"\n"
+		   "# 3 \"/r/c.cfa\" 3\n"
+		   "           ( tab[\n"
+		   "# 3 \"/r/c.cfa\"\n"
+		   "           y\n"
+		   "# 3 \"/r/c.cfa\" 3\n"
+		   "           ] & 8 )\n"
+		   "\n"
+		   "  \n"
+		   "# 5 \"/r/c.cfa\"\n"
+		   " ;\n" );
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/c.cfa";
+	CHECK( m.map( F, { 3, 10, 6 } ) == L( 2, 10 ) );			// +
+	CHECK( m.map( F, { 3, 11, 11 } ) == L( 2, 17 ) );			// y, the argument
+	CHECK( m.map( F, { 3, 11, 9 } ) == L( 2, 12 ) );			// ( from the body: isd
+	CHECK( m.inMacroBody( F, { 3, 13, 9 } ) );					// tab
+	CHECK( m.map( F, { 5, 1, 17 } ) == L( 4, 2 ) );				// ;
 }
 
 TEST_CASE( "sourcemap: macro expansions" ) {

@@ -607,9 +607,9 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 	std::string cppErr = unOverlay( readFile( o.stderrPath ).value_or( "" ) );
 	std::string preprocessed = readFile( o.stdoutPath ).value_or( "" );
 	if ( ! overlays.empty() ) preprocessed = unOverlay( std::move( preprocessed ) );
-	// The translator reads in.i itself, without the lines -dD added. SourceMap
-	// gets them.
-	if ( r.ok() && ! writeFile( o.stdoutPath, SourceMap::withoutDefinitions( preprocessed ) ) ) {
+	// The translator reads in.i itself, without the lines -dD added (see
+	// SourceMap::translatorInput). SourceMap gets them and reads the same text.
+	if ( r.ok() && ! writeFile( o.stdoutPath, SourceMap::translatorInput( preprocessed ) ) ) {
 		fr.status = FrontResult::PreprocessFailed;
 		fr.diags.push_back( fileLevel( req.path, "cfa-lsp: cannot write " + o.stdoutPath ) );
 		return fr;

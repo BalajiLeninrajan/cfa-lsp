@@ -501,6 +501,40 @@ TEST_CASE( "sourcemap/cfa: late definitions, dead branches and uses the alignmen
 	CHECK( body( 24, "tmp", 4 ) );
 }
 
+// cpp splits a line to print a #define or #undef from inside a macro's
+// arguments. The translator's text has the line joined again, as plain cpp
+// prints it, and SourceMap reads that text.
+TEST_CASE( "sourcemap/cfa: a #define inside a macro's arguments" ) {
+	if ( !haveCfa() ) { MESSAGE( "cfa not on PATH; skipping" ); return; }
+	Case c( "inarg.cfa",
+			"#define F( a, b ) a+b\n"
+			"int y, w;\n"
+			"int g() {\n"
+			"\tint x = w + F( y,\n"
+			"#define Q 2\n"						// 5
+			"\tw );\n"
+			"\tint z = w + F( y,\n"
+			"#undef Q\n"
+			"\tw );\n"
+			"\treturn x + z;\n"					// 10
+			"}\n" );
+	REQUIRE( c.ok );
+	const std::string F = c.real.string();
+	const std::string & T = c.text;
+	SourceMap m( c.prep, diskReader() );
+	auto P = prepLines( SourceMap::translatorInput( c.prep ), F );
+	for ( int line : { 4, 7 } ) {
+		CAPTURE( line );
+		REQUIRE( P.count( line ) );
+		CAPTURE( P[line] );
+		CHECK( lex( P[line] ).size() == 8 );		// " int x = w + y+w", in one piece
+		CHECK( m.map( F, line, prepCol( P, line, "w", 0 ) ) == origAt( T, line, "w" ) );
+		CHECK( m.map( F, line, prepCol( P, line, "+", 0 ) ) == origAt( T, line, "+" ) );
+		CHECK( m.map( F, line, prepCol( P, line, "y", 0 ) ) == origAt( T, line, "y" ) );
+		CHECK( m.map( F, line, prepCol( P, line, "w", 1 ) ) == origAt( T, line + 2, "w" ) );
+	}
+}
+
 TEST_CASE( "sourcemap/cfa: CFA syntax" ) {
 	if ( !haveCfa() ) { MESSAGE( "cfa not on PATH; skipping" ); return; }
 	Case c( "cfa.cfa",

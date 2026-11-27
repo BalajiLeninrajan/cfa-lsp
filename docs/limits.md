@@ -29,6 +29,10 @@
   where gcc versions differ, a body with `_Pragma`, and a macro that
   `#pragma pop_macro` brings back. cpp's `-dD` output has no `#define` for
   that, so the macro looks undefined after it.
+- A `#line` right after a `#define` or `#undef` that gives the number of the
+  code line before the directive looks like a directive inside a macro's
+  arguments (see [how-it-works.md](how-it-works.md#columns)). The two lines
+  are joined, so the tokens after the `#line` map to the line before it.
 - Uses inside macro bodies have no references. Inside a `cofor` body, uses of
   the loop variable have none either: they name the copy the translator makes
   in the function it generates for the body.

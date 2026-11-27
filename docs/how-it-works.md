@@ -11,7 +11,8 @@ the buffer:
    like a libcfa header doesn't hide that one from `#include <x.hfa>`.
 2. It runs the forked translator: `cfa-cpp --lsp out.json --lsp-focus
    /real/path.cfa [--lsp-c-out out.c] ... in.i`, where `in.i` is cpp's
-   output with the `#define` and `#undef` lines that `-dD` adds left empty. The translator runs its
+   output with the `#define` and `#undef` lines that `-dD` adds left empty
+   (see [Columns](#columns)). The translator runs its
    passes as usual, records errors instead of stopping at the first one, and
    after the resolver has run writes the declarations, resolved references,
    expression types and scopes to `out.json`. [dump-format.md](dump-format.md) describes
@@ -123,6 +124,19 @@ obeyed at the place it read it, starting with the predefined macros and the
 header, and a `#define` in a dead `#if` branch never comes into it. The
 translator reads the same text with those lines left empty, so every line
 keeps its number.
+
+A `#define` or `#undef` inside a macro's arguments (a GCC extension) is
+printed as soon as cpp reads it, so `-dD` splits the line: the tokens before
+the macro, the directive, a marker that repeats their line number, and the
+rest of the line. Plain `cfa -E` keeps the line whole, and the translator
+would read the repeated number as a second copy of the line. So the server
+joins the pieces again in `in.i` and turns the lines between them into
+markers, which take no line number. It reads the same text itself, so it
+agrees with the translator on lines, columns and `pline`. The tokens before
+the macro were printed with the definitions above the directive, and the
+expansion with the directive's. When the marker after the directive switches
+to or from a system header, plain `cfa -E` splits the line there too, so
+only the lines between the pieces change.
 
 The redo also decides where a use ends, so two uses side by side, or a body
 that ends in a function-like macro name and takes the `( ... )` after the
