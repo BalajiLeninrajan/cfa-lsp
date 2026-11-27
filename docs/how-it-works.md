@@ -134,9 +134,13 @@ joins the pieces again in `in.i` and turns the lines between them into
 markers, which take no line number. It reads the same text itself, so it
 agrees with the translator on lines, columns and `pline`. The tokens before
 the macro were printed with the definitions above the directive, and the
-expansion with the directive's. When the marker after the directive switches
-to or from a system header, plain `cfa -E` splits the line there too, so
-only the lines between the pieces change.
+expansion with the directive's. The macro's own name is the exception: cpp
+looked it up before it read the arguments, so a use that redefines its own
+macro in them gets the old body. The server leaves out a definition that cpp
+printed before such a use when the directive's line comes after the name's.
+When the marker after the directive switches to or from a system header,
+plain `cfa -E` splits the line there too, so only the lines between the
+pieces change.
 
 The redo also decides where a use ends, so two uses side by side, or a body
 that ends in a function-like macro name and takes the `( ... )` after the

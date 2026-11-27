@@ -1038,6 +1038,100 @@ TEST_CASE( "sourcemap: definitions printed in the middle of a line" ) {
 	CHECK( m.map( F, { 6, 2, 11 } ) == L( 5, 2 ) );				// ;
 }
 
+// cpp looks a macro's name up before it reads the arguments, so a use that
+// redefines its own macro inside them takes the old body. Both definitions
+// give "x = tmp", the first use with tmp from the old body and the second
+// with tmp from the argument. cpp prints the definitions before the first
+// use, which starts its line, and in the middle of the second, whose line is
+// joined.
+TEST_CASE( "sourcemap: a use that redefines its own macro in its arguments" ) {
+	Files f;
+	f.text["/r/j.cfa"] =
+		"#define S(a, b) a = tmp\n"
+		"int tmp, x;\n"
+		"void f() {\n"
+		"\tS( x,\n"
+		"#undef S\n"												// 5
+		"#define S(a, b) a = b\n"
+		"\ttmp );\n"
+		"\tx = x + S( x,\n"
+		"#undef S\n"
+		"#define S(a, b) a = tmp\n"									// 10
+		"\ttmp );\n"
+		"}\n";
+	std::string prep =
+		"# 1 \"/r/j.cfa\"\n"
+		"#define S(a,b) a = tmp\n"
+		"int tmp, x;\n"
+		"void f() {\n"
+		"\n"
+		"#undef S\n"
+		"#define S(a,b) a = b\n"
+		"# 4 \"/r/j.cfa\"\n"
+		" x = tmp\n"
+		"\n"
+		"\n"
+		"      ;\n"
+		" x = x +\n"
+		"#undef S\n"
+		"#define S(a,b) a = tmp\n"
+		"# 8 \"/r/j.cfa\"\n"
+		"         x = tmp\n"
+		"\n"
+		"\n"
+		"      ;\n"
+		"}\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/j.cfa";
+	// " x = tmp" at pline 9
+	//  012345
+	CHECK( m.map( F, { 4, 1, 9 } ) == L( 3, 4 ) );				// x, the argument
+	CHECK_FALSE( m.inMacroBody( F, { 4, 1, 9 } ) );
+	CHECK( m.map( F, { 4, 5, 9 } ) == L( 3, 1 ) );				// tmp from the old body: the use
+	CHECK( m.inMacroBody( F, { 4, 5, 9 } ) );
+	// " x = x + x = tmp" at pline 17
+	//  01234567890123
+	CHECK( m.map( F, { 8, 5, 17 } ) == L( 7, 5 ) );				// x before the use
+	CHECK( m.map( F, { 8, 9, 17 } ) == L( 7, 12 ) );			// x, the argument
+	CHECK( m.map( F, { 8, 13, 17 } ) == L( 10, 1 ) );			// tmp from the argument b
+	CHECK_FALSE( m.inMacroBody( F, { 8, 13, 17 } ) );
+}
+
+// A #line back to an earlier line gives the same marker after a #define as a
+// directive inside a use's arguments, but those definitions came before the
+// use. The markers put them on lines 11 to 13, below the use's line 1, and
+// the #line 10 above them says they are really on lines 4 to 6.
+TEST_CASE( "sourcemap: definitions above a #line that goes back" ) {
+	Files f;
+	f.text["/r/l.cfa"] =
+		"int y;\n"
+		"#line 10\n"
+		"int z;\n"
+		"#define F(a) a + 1\n"
+		"#undef F\n"
+		"#define F(a) 2 + a\n"
+		"#line 1\n"
+		"int x = F( x );\n";
+	std::string prep =
+		"# 1 \"/r/l.cfa\"\n"
+		"int y;\n"
+		"# 10 \"/r/l.cfa\"\n"
+		"int z;\n"
+		"#define F(a) a + 1\n"
+		"#undef F\n"
+		"#define F(a) 2 + a\n"
+		"# 1 \"/r/l.cfa\"\n"
+		"int x = 2 + x;\n";
+	SourceMap m( prep, f.reader() );
+	const std::string F = "/r/l.cfa";
+	// "int x = 2 + x;" at pline 9
+	//  012345678901
+	CHECK( m.map( F, { 1, 8, 9 } ) == L( 7, 8 ) );				// 2: the use
+	CHECK( m.inMacroBody( F, { 1, 8, 9 } ) );					// redone with the last F
+	CHECK( m.map( F, { 1, 12, 9 } ) == L( 7, 11 ) );			// x, the argument
+	CHECK_FALSE( m.inMacroBody( F, { 1, 12, 9 } ) );
+}
+
 // When the marker after the directive switches flag 3, plain cpp splits the
 // line there too. Only the lines between the pieces change, so the second
 // piece continues the line.

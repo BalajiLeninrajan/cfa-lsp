@@ -45,7 +45,9 @@
 // The #defines in effect come from cpp itself. The check runs `cfa -E -dD`,
 // which prints each #define and #undef cpp obeyed where it read it, the
 // predefined ones and those from -D first. So the definition in effect at a
-// preprocessed line is the last one printed above it (see Impl::index). The
+// preprocessed line is the last one printed above it (see Impl::index),
+// except for the name of a macro whose arguments hold the directive: cpp
+// looked that name up before it read them. The
 // translator reads the same text with those lines emptied, and with a line
 // that cpp split to print one joined again (see translatorText). SourceMap
 // reads that text too, so the two agree on lines, columns and pline.
@@ -171,8 +173,11 @@ Loc startOf( const Token & t ) { return { t.line, t.col }; }
 Loc endOf( const Token & t ) { return { t.endLine, t.endCol }; }
 
 // The definition macro `name` had when cpp printed the token at column `col`
-// of preprocessed line `pline`, or null when it had none.
-using DefineLookup = std::function<const Define *( const std::string & name, int pline, int col )>;
+// of preprocessed line `pline`, or null when it had none. cpp looked the name
+// up after reading the original file's 0-based line `read` (INT_MAX: after
+// everything it printed there), which matters for a directive inside the
+// arguments of the use cpp printed there.
+using DefineLookup = std::function<const Define *( const std::string & name, int pline, int col, int read )>;
 
 // Tokenizes a macro body or a pasted token. A "#" first on the line would
 // start a directive, so the text is lexed after a token that is then dropped.
@@ -275,12 +280,16 @@ class Expander {
 	const DefineLookup & defines;
 	std::unordered_map<std::string, int> ids;
 	size_t work = 0;
+	// The last original line the outermost scan has read. cpp looks up the
+	// names it meets there with the directives up to that line, and the names
+	// in arguments once it has read all of them.
+	int readLine = -1;
 	// For prefix(): the use starts at O[first], and the scan stops at the
 	// first token after it that comes untouched from the source, at O[stopAt].
 	bool prefixMode = false;
 	size_t first = 0, stopAt = SIZE_MAX;
 
-	const Define * lookup( const std::string & name ) { return defines( name, line, col ); }
+	const Define * lookup( const std::string & name, bool top ) { return defines( name, line, col, top ? readLine : INT_MAX ); }
 	int idOf( const std::string & name );
 	bool source( size_t ob, size_t oe, std::vector<XTok> & out );
 	bool emit( XTok t, std::vector<XTok> & out, bool top );
@@ -307,6 +316,7 @@ bool Expander::source( size_t ob, size_t oe, std::vector<XTok> & out ) {
 		in.push_back( std::move( t ) );
 	}
 	work = 0;
+	readLine = -1;
 	stopAt = SIZE_MAX;
 	return expand( std::move( in ), out, true, 0 );
 }
@@ -361,12 +371,13 @@ bool Expander::expand( std::vector<XTok> ts, std::vector<XTok> & out, bool top, 
 			stopAt = t.from.b;						// the use is over
 			return true;
 		}
+		if ( top && untouched( t ) ) readLine = std::max( readLine, O[t.from.b].line );
 		if ( t.kind != TokKind::Identifier || t.any ) {
 			if ( !emit( std::move( t ), out, top ) ) return false;
 			continue;
 		}
 		const int id = idOf( t.text );
-		const Define * d = std::binary_search( t.hide.begin(), t.hide.end(), id ) ? nullptr : lookup( t.text );
+		const Define * d = std::binary_search( t.hide.begin(), t.hide.end(), id ) ? nullptr : lookup( t.text, top );
 		if ( !d && madeUpByCpp( t.text ) && !std::binary_search( t.hide.begin(), t.hide.end(), id ) ) {
 			t.any = true;
 			t.from.body = true;
@@ -390,6 +401,7 @@ bool Expander::expand( std::vector<XTok> ts, std::vector<XTok> & out, bool top, 
 			while ( !ts.empty() ) {
 				XTok a = std::move( ts.back() );
 				ts.pop_back();
+				if ( top && untouched( a ) ) readLine = std::max( readLine, O[a.from.b].line );
 				if ( isPunct( a, "(" ) ) {
 					++nest;
 				} else if ( isPunct( a, ")" ) ) {
@@ -1151,10 +1163,15 @@ bool parseMarker( std::string_view l, int & line, std::optional<std::string> & f
 
 // A #define or #undef that cpp printed. It takes effect from line `pline` of
 // translatorText(), or from column `col` of that line when cpp printed it in
-// the middle of the line.
+// the middle of the line. `line` is the 0-based line the markers give it.
+// When cpp printed it from inside the arguments of a macro use, `use` is the
+// line of translatorText() where the use's tokens start and `file` the file
+// it is in; otherwise `use` is 0.
 struct Printed {
 	int pline, col;
 	std::string_view text;
+	int line = 0, use = 0;
+	std::string file;
 };
 
 // The text the translator reads, made from `cfa -E -dD` output: each #define
@@ -1187,6 +1204,12 @@ struct Printed {
 //
 // A #line that repeats the number of the line before a #define looks the
 // same and is joined as well.
+//
+// After a directive inside a macro's arguments, cpp prints a marker that goes
+// back to the line of the use, without leaving the file. The definitions
+// printed since the last code line then get the line where the use starts as
+// `use`. A #line back to an earlier line looks the same, so `use` alone
+// doesn't say a definition came after the use's name (see Impl::definition).
 std::string translatorText( std::string_view dd, std::vector<Printed> & defs ) {
 	std::string out;
 	out.reserve( dd.size() );
@@ -1201,6 +1224,16 @@ std::string translatorText( std::string_view dd, std::vector<Printed> & defs ) {
 	int line = 0, lineFlags = 0, gap = 0;
 	bool prevDef = false;
 	bool unindent = false;						// the line is a second piece cpp indented one column more
+	// The definitions since the last code line start at `pending`; `back`
+	// says a marker went back to an earlier line of the same file since.
+	size_t pending = 0;
+	bool back = false;
+	auto setUse = [&]( size_t from, int use ) {
+		for ( size_t e = from; e < defs.size(); ++e ) {
+			defs[e].use = use;
+			defs[e].file = file.value_or( "" );
+		}
+	};
 	int pline = 1;
 	for ( size_t pos = 0; pos < dd.size(); ++pline ) {
 		size_t nl = dd.find( '\n', pos );
@@ -1215,7 +1248,7 @@ std::string translatorText( std::string_view dd, std::vector<Printed> & defs ) {
 			if ( !lastLine ) out += '\n';
 		};
 		if ( definitionLine( l ) ) {
-			defs.push_back( { pline, 0, l } );
+			defs.push_back( { pline, 0, l, next, 0, {} } );
 			put( {} );
 			prevDef = true;
 			++gap;
@@ -1229,6 +1262,9 @@ std::string translatorText( std::string_view dd, std::vector<Printed> & defs ) {
 			if ( blank ) {
 				++gap;
 			} else {
+				if ( back ) setUse( pending, pline );
+				pending = defs.size();
+				back = false;
 				have = true;
 				at = out.size();
 				line = next;
@@ -1273,7 +1309,11 @@ std::string translatorText( std::string_view dd, std::vector<Printed> & defs ) {
 			for ( size_t e = moved; e < defs.size(); ++e ) {
 				defs[e].pline = pline;
 				if ( e >= after ) defs[e].col = col;
+				if ( defs[e].use ) defs[e].use = pline;
 			}
+			setUse( pending, pline );
+			pending = defs.size();
+			back = false;
 			at = out.size();
 			out += joined;
 			if ( cEnd < dd.size() ) out += '\n';
@@ -1299,6 +1339,12 @@ std::string translatorText( std::string_view dd, std::vector<Printed> & defs ) {
 			}
 		}
 		put( l );
+		if ( ( f && f != file ) || ( fl & 3 ) ) {
+			pending = defs.size();
+			back = false;
+		} else if ( n - 1 < next ) {
+			back = true;
+		}
 		if ( f ) file = std::move( f );
 		next = n - 1;
 		flags = fl;
@@ -1402,12 +1448,15 @@ struct SourceMap::Impl {
 	struct Event {
 		int pline, col;
 		std::optional<Define> def;
+		int line, use;					// as in Printed
+		std::string file;
 	};
 	std::unordered_map<std::string, std::vector<Event>> defines;
 
 	void index();
 	const FileTable * table( const std::string & file );
-	const Define * definition( const std::string & name, int pline, int col ) const;
+	const Define * definition( const std::string & name, int pline, int col, int read, const std::string & file,
+							   const FileTable & ft ) const;
 
 	// Finds the table and the line's tokens; subs is null when the line has
 	// none (or the file is unknown), and the caller falls back. With a known
@@ -1451,7 +1500,7 @@ void SourceMap::Impl::index() {
 			std::string name;
 			std::optional<Define> d;
 			parseDefinition( p.text, name, d );
-			if ( !name.empty() ) defines[name].push_back( { p.pline, p.col, std::move( d ) } );
+			if ( !name.empty() ) defines[name].push_back( { p.pline, p.col, std::move( d ), p.line, p.use, p.file } );
 		}
 		prep = std::move( text );
 	}
@@ -1514,16 +1563,22 @@ const FileTable * SourceMap::Impl::table( const std::string & file ) {
 		ft = it->second.get();
 	}
 	std::call_once( ft->once, [&] {
-		buildFile( *ft, file, prep, read,
-				   [this]( const std::string & name, int pline, int col ) { return definition( name, pline, col ); } );
+		buildFile( *ft, file, prep, read, [&]( const std::string & name, int pline, int col, int r ) {
+			return definition( name, pline, col, r, file, *ft );
+		} );
 	} );
 	return ft;
 }
 
 // The last definition of `name` printed before column `col` of preprocessed
 // line `pline`: above the line, or earlier on it when cpp printed it inside a
-// line that translatorText() joined.
-const Define * SourceMap::Impl::definition( const std::string & name, int pline, int col ) const {
+// line that translatorText() joined. cpp printed a definition from inside the
+// arguments of the use at `pline` before the use, but read it after the
+// use's name, so one below original line `read` of `file` (`ft`) is left
+// out. Its line from the markers is moved back to the real line first, so
+// one above a #line that went back stays in.
+const Define * SourceMap::Impl::definition( const std::string & name, int pline, int col, int read,
+											const std::string & file, const FileTable & ft ) const {
 	auto it = defines.find( name );
 	if ( it == defines.end() ) return nullptr;
 	const std::vector<Event> & events = it->second;
@@ -1531,6 +1586,10 @@ const Define * SourceMap::Impl::definition( const std::string & name, int pline,
 							   []( const std::pair<int, int> & at, const Event & ev ) { return at < std::pair{ ev.pline, ev.col }; } );
 	if ( e == events.begin() ) return nullptr;
 	--e;
+	while ( read < INT_MAX && e->use == pline && e->file == file && ft.actualLine( e->line ) > read ) {
+		if ( e == events.begin() ) return nullptr;
+		--e;
+	}
 	return e->def ? &*e->def : nullptr;
 }
 
