@@ -40,6 +40,21 @@
   `$` are hidden unless the prefix has a `$`.
 - Type and signature text comes from the translator's pretty printer, so it
   can differ from what you wrote (`Fib &f`, assertions left out).
+- A check reads the buffer and unsaved headers without their `#line`
+  directives. After one, `__LINE__` and `__FILE__` give the real line and
+  file in the check, not the values the directive sets. Compiling the file
+  still gives the directive's values.
+- A header read from disk keeps its `#line` directives, and so does an
+  unsaved header that cpp finds on disk. When cpp reads it from the overlay
+  too, the overlay copy keeps them as well. A main file that cpp also reads
+  from disk, through `#include __FILE__` or a header that includes it back,
+  keeps them in the buffer too. The buffer also keeps a `#line` whose number comes from a macro, and a `# N "file"`
+  linemarker with flags. The server maps the translator's positions after
+  one of these back to the real lines, but treats one in an `#if 0` block as
+  if cpp had obeyed it, ignores one whose number comes from a macro, and
+  gcc's messages after one give the directive's numbers.
+- The server doesn't read a directive spelled with the `%:` digraph, so a
+  `%:line` stays in the buffer and moves the lines after it.
 - If the translator fails an internal assertion or crashes, the check reports
   `internal translator error` on line 1, and unless the crash came after
   resolution the previous results stay in use.

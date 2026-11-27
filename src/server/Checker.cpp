@@ -538,7 +538,17 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 	const std::string dir = fr.tmp->path();
 	const std::string in = dir + "/in.cfa";
 	const std::string cwd = fs::path( req.path ).parent_path().string();
-	if ( ! writeFile( in, "# 1 \"" + quoteForMarker( req.path ) + "\"\n" + req.text ) ) {
+	// cpp reads the buffer and the unsaved headers without their #line
+	// directives, so its line markers, gcc's messages and the translator's
+	// positions all give the real lines.
+	std::string text = blankLineDirectives( req.text );
+	std::map<std::string, std::string> buffers, unblanked;
+	for ( const auto & [path, b] : req.overlays ) {
+		buffers[normalize( path )] = blankLineDirectives( b );
+		unblanked[normalize( path )] = b;
+	}
+	const std::string marker = "# 1 \"" + quoteForMarker( req.path ) + "\"\n";
+	if ( ! writeFile( in, marker + text ) ) {
 		fr.status = FrontResult::PreprocessFailed;
 		fr.diags.push_back( fileLevel( req.path, "cfa-lsp: cannot write " + in ) );
 		return fr;
@@ -557,6 +567,7 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 	// holds one, a copy of it under an overlay directory searched first. The
 	// overlay paths in cpp's output are put back to the real ones.
 	OverlayDirs overlays;
+	std::map<std::string, std::vector<std::string>> copies;	// each unsaved header's overlay files
 	if ( ! req.overlays.empty() ) {
 		std::vector<std::string> search = { dirKey( cwd ) };
 		for ( size_t i = 0; i < fr.flags.cpp.size(); i += 1 ) {
@@ -570,16 +581,16 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 			if ( seen ) continue;
 			std::string odir = dir + "/overlay" + std::to_string( overlays.size() );
 			bool used = false;
-			for ( const auto & [path, text] : req.overlays ) {
-				std::string p = normalize( path );
+			for ( const auto & [p, b] : buffers ) {
 				if ( p.size() <= d.size() + 1 || p.compare( 0, d.size(), d ) != 0 || p[d.size()] != '/' ) continue;
 				fs::path target = fs::path( odir ) / p.substr( d.size() + 1 );
 				std::error_code ec;
 				fs::create_directories( target.parent_path(), ec );
-				if ( ec || ! writeFile( target.string(), text ) ) {
+				if ( ec || ! writeFile( target.string(), b ) ) {
 					log::warn( "cannot write overlay ", target.string() );
 					continue;
 				}
+				copies[p].push_back( target.string() );
 				used = true;
 			}
 			if ( used ) overlays.push_back( { d, odir } );
@@ -603,15 +614,63 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 		return fr;
 	}
 	lap( "cfa -E" );
-	std::string cppErr = unOverlay( readFile( o.stderrPath ).value_or( "" ) );
-	if ( ! overlays.empty() ) {
+	// The unsaved headers cpp read from an overlay. cpp can find one on disk
+	// instead, for example when the header next to it includes it, and then
+	// it obeys the #line directives in that copy. The same goes for the main
+	// file, when it includes itself or a header includes it back.
+	std::set<std::string> fromOverlay;
+	if ( ! overlays.empty() || text != req.text ) {
+		std::string raw = readFile( o.stdoutPath ).value_or( "" );
+		auto resolve = [&cwd]( std::string p ) {
+			if ( ! p.empty() && p[0] != '/' ) p = ( fs::path( cwd ) / p ).string();
+			return normalize( p );
+		};
+		std::set<std::string> fromDisk;
+		for ( const auto & site : findIncludeSites( raw ) ) {
+			bool overlaid = false;
+			for ( const auto & ov : overlays ) overlaid = overlaid || site.first.rfind( ov.second + "/", 0 ) == 0;
+			( overlaid ? fromOverlay : fromDisk ).insert( resolve( overlaid ? unOverlay( site.first ) : site.first ) );
+		}
+		// A header with no include guard can be read from both. SourceMap has
+		// one text for it, so it gets its #line directives back in the
+		// overlay too, and cpp runs again with them, as it did before the
+		// server blanked any. A main file read from disk too gets them back
+		// in in.cfa the same way.
+		bool again = false;
+		if ( text != req.text && fromDisk.count( normalize( req.path ) ) ) {
+			text = req.text;
+			if ( ! writeFile( in, marker + text ) ) {
+				fr.status = FrontResult::PreprocessFailed;
+				fr.diags.push_back( fileLevel( req.path, "cfa-lsp: cannot write " + in ) );
+				return fr;
+			}
+			again = true;
+		}
+		for ( const std::string & p : fromDisk ) {
+			if ( ! fromOverlay.count( p ) || buffers[p] == unblanked[p] ) continue;
+			fromOverlay.erase( p );
+			for ( const std::string & c : copies[p] ) {
+				if ( ! writeFile( c, unblanked[p] ) ) log::warn( "cannot write overlay ", c );
+			}
+			again = true;
+		}
+		if ( again ) {
+			r = runProcess( cppCommand( req, fr.flags, in, overlays ), o, &cancel );
+			if ( r.status == RunResult::Cancelled ) {
+				fr.status = FrontResult::Cancelled;
+				return fr;
+			}
+			lap( "cfa -E again" );
+			raw = readFile( o.stdoutPath ).value_or( "" );
+		}
 		// The translator reads in.i itself.
-		if ( ! writeFile( o.stdoutPath, unOverlay( readFile( o.stdoutPath ).value_or( "" ) ) ) && r.ok() ) {
+		if ( ! overlays.empty() && ! writeFile( o.stdoutPath, unOverlay( std::move( raw ) ) ) && r.ok() ) {
 			fr.status = FrontResult::PreprocessFailed;
 			fr.diags.push_back( fileLevel( req.path, "cfa-lsp: cannot write " + o.stdoutPath ) );
 			return fr;
 		}
 	}
+	std::string cppErr = unOverlay( readFile( o.stderrPath ).value_or( "" ) );
 	std::vector<Diag> cppDiags = diagsFromOutput( cppErr, req.path, in, cwd, tc, "cpp" );
 	if ( ! r.ok() ) {
 		fr.status = FrontResult::PreprocessFailed;
@@ -668,7 +727,13 @@ FrontResult Checker::front( const CheckRequest & req, const CancelToken & cancel
 		std::map<std::string, std::optional<std::string>> files;
 	};
 	auto cache = std::make_shared<Cache>();
-	SourceMap::Reader reader = [cache, main = req.path, text = req.text, buffers = req.overlays, cwd]( const std::string & p ) -> std::optional<std::string> {
+	// The main file as cpp read it, and each unsaved header as cpp read it
+	// from its overlay. For one cpp found on disk, the buffer with its #line
+	// directives, which SourceMap maps as before.
+	for ( auto & [p, b] : buffers ) {
+		if ( ! fromOverlay.count( p ) ) b = std::move( unblanked[p] );
+	}
+	SourceMap::Reader reader = [cache, main = req.path, text, buffers, cwd]( const std::string & p ) -> std::optional<std::string> {
 		std::string path = p;
 		if ( ! path.empty() && path[0] != '/' ) path = ( fs::path( cwd ) / path ).string();
 		path = normalize( path );
