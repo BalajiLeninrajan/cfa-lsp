@@ -4,7 +4,9 @@
 #include <cctype>
 #include <climits>
 #include <cstdint>
+#include <deque>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <string_view>
 #include <unordered_map>
@@ -177,7 +179,7 @@ Loc endOf( const Token & t ) { return { t.endLine, t.endCol }; }
 // up after reading the original file's 0-based line `read` (INT_MAX: after
 // everything it printed there), which matters for a directive inside the
 // arguments of the use cpp printed there.
-using DefineLookup = std::function<const Define *( const std::string & name, int pline, int col, int read )>;
+using DefineLookup = std::function<const Define *( std::string_view name, int pline, int col, int read )>;
 
 // Tokenizes a macro body or a pasted token. A "#" first on the line would
 // start a directive, so the text is lexed after a token that is then dropped.
@@ -189,7 +191,8 @@ std::vector<Token> lexBody( std::string_view text ) {
 
 // Builtin macros whose value cpp makes up. In a redone expansion each one
 // matches whatever single token cpp printed for it.
-bool madeUpByCpp( const std::string & name ) {
+bool madeUpByCpp( std::string_view name ) {
+	if ( !name.starts_with( "__" ) ) return false;
 	static const char * const names[] = { "__LINE__", "__FILE__", "__BASE_FILE__", "__FILE_NAME__", "__COUNTER__",
 										  "__INCLUDE_LEVEL__", "__DATE__", "__TIME__", "__TIMESTAMP__" };
 	for ( const char * n : names ) {
@@ -218,27 +221,16 @@ Origin span( const Origin & x, const Origin & y ) {
 // that a macro is not expanded again inside its own expansion).
 using HideSet = std::vector<int>;
 
-HideSet unite( const HideSet & x, const HideSet & y ) {
-	HideSet out;
-	std::set_union( x.begin(), x.end(), y.begin(), y.end(), std::back_inserter( out ) );
-	return out;
-}
-
-HideSet intersect( const HideSet & x, const HideSet & y ) {
-	HideSet out;
-	std::set_intersection( x.begin(), x.end(), y.begin(), y.end(), std::back_inserter( out ) );
-	return out;
-}
-
-// A token while redoing an expansion.
+// A token while redoing an expansion. Its text is in an original token, a
+// macro body, or Expander::made.
 struct XTok {
-	std::string text;
+	std::string_view text;
 	TokKind kind = TokKind::Other;
 	bool space = false;				// whitespace before it, which # turns into one space
 	bool any = false;				// made up by cpp (__LINE__): matches any one token
 	bool mark = false;				// a placemarker: an empty argument next to ##, or an empty __VA_OPT__
 	Origin from;
-	HideSet hide;
+	int hide = 0;					// its hide set, in Expander::sets
 };
 
 // Redoes cpp's expansion of some original tokens, as C11 6.10.3 says (Prosser's
@@ -278,7 +270,14 @@ class Expander {
 	const size_t pb, pe;
 	const int line, col;
 	const DefineLookup & defines;
-	std::unordered_map<std::string, int> ids;
+	std::unordered_map<std::string_view, int> ids;
+	std::deque<std::string> made;				// the text of tokens that # and ## made
+	// Each hide set once, so a token copies an index instead of the set;
+	// sets[0] is the empty one. The other maps remember the sets that a
+	// union or an intersection of two of them, by index, gave.
+	std::vector<HideSet> sets{ HideSet{} };
+	std::map<HideSet, int> setIds{ { HideSet{}, 0 } };
+	std::unordered_map<uint64_t, int> unions, intersections;
 	size_t work = 0;
 	// The last original line the outermost scan has read. cpp looks up the
 	// names it meets there with the directives up to that line, and the names
@@ -289,19 +288,55 @@ class Expander {
 	bool prefixMode = false;
 	size_t first = 0, stopAt = SIZE_MAX;
 
-	const Define * lookup( const std::string & name, bool top ) { return defines( name, line, col, top ? readLine : INT_MAX ); }
-	int idOf( const std::string & name );
+	const Define * lookup( std::string_view name, bool top ) { return defines( name, line, col, top ? readLine : INT_MAX ); }
+	int idOf( std::string_view name );
+	int setOf( HideSet s );
+	int unite( int x, int y );
+	int intersect( int x, int y );
+	bool hidden( int set, int id ) const { return std::binary_search( sets[set].begin(), sets[set].end(), id ); }
+	bool paste( XTok & lhs, const XTok & rhs, const Origin & inv );
+	XTok stringize( const std::vector<XTok> & arg, const Origin & inv );
 	bool source( size_t ob, size_t oe, std::vector<XTok> & out );
 	bool emit( XTok t, std::vector<XTok> & out, bool top );
 	bool expand( std::vector<XTok> ts, std::vector<XTok> & out, bool top, int depth );
-	bool subst( const Define & d, const Args & args, bool omitted, const HideSet & hs, const Origin & inv,
-				std::vector<XTok> & os, int depth );
+	bool subst( const Define & d, const Args & args, bool omitted, int hs, const Origin & inv, std::vector<XTok> & os,
+				int depth );
 	bool replace( const Define & d, const Args & args, bool omitted, const Origin & inv, size_t bb, size_t be,
 				  Expanded & expanded, std::vector<XTok> & os, int depth );
 };
 
-int Expander::idOf( const std::string & name ) {
+int Expander::idOf( std::string_view name ) {
 	return ids.try_emplace( name, (int)ids.size() ).first->second;
+}
+
+int Expander::setOf( HideSet s ) {
+	auto [it, added] = setIds.try_emplace( s, (int)sets.size() );
+	if ( added ) sets.push_back( std::move( s ) );
+	return it->second;
+}
+
+int Expander::unite( int x, int y ) {
+	if ( x == y || y == 0 ) return x;
+	if ( x == 0 ) return y;
+	auto [it, added] = unions.try_emplace( (uint64_t)std::min( x, y ) << 32 | (uint32_t)std::max( x, y ), 0 );
+	if ( added ) {
+		HideSet out;
+		std::set_union( sets[x].begin(), sets[x].end(), sets[y].begin(), sets[y].end(), std::back_inserter( out ) );
+		it->second = setOf( std::move( out ) );
+	}
+	return it->second;
+}
+
+int Expander::intersect( int x, int y ) {
+	if ( x == y ) return x;
+	if ( x == 0 || y == 0 ) return 0;
+	auto [it, added] = intersections.try_emplace( (uint64_t)std::min( x, y ) << 32 | (uint32_t)std::max( x, y ), 0 );
+	if ( added ) {
+		HideSet out;
+		std::set_intersection( sets[x].begin(), sets[x].end(), sets[y].begin(), sets[y].end(), std::back_inserter( out ) );
+		it->second = setOf( std::move( out ) );
+	}
+	return it->second;
 }
 
 // Expands O[ob, oe) into `out`, which cpp's output has to start with.
@@ -362,7 +397,7 @@ bool Expander::expand( std::vector<XTok> ts, std::vector<XTok> & out, bool top, 
 	std::reverse( ts.begin(), ts.end() );			// a stack: the next token is at the back
 	auto isPunct = []( const XTok & t, const char * p ) { return t.kind == TokKind::Punct && t.text == p; };
 	// A token as the source has it, not produced or copied by an expansion.
-	auto untouched = []( const XTok & t ) { return !t.from.body && t.hide.empty() && t.from.b >= 0 && t.from.e == t.from.b + 1; };
+	auto untouched = []( const XTok & t ) { return !t.from.body && t.hide == 0 && t.from.b >= 0 && t.from.e == t.from.b + 1; };
 	while ( !ts.empty() ) {
 		if ( ++work > MaxWork ) return false;
 		XTok t = std::move( ts.back() );
@@ -376,9 +411,9 @@ bool Expander::expand( std::vector<XTok> ts, std::vector<XTok> & out, bool top, 
 			if ( !emit( std::move( t ), out, top ) ) return false;
 			continue;
 		}
-		const int id = idOf( t.text );
-		const Define * d = std::binary_search( t.hide.begin(), t.hide.end(), id ) ? nullptr : lookup( t.text, top );
-		if ( !d && madeUpByCpp( t.text ) && !std::binary_search( t.hide.begin(), t.hide.end(), id ) ) {
+		const bool hid = t.hide != 0 && hidden( t.hide, idOf( t.text ) );
+		const Define * d = hid ? nullptr : lookup( t.text, top );
+		if ( !d && !hid && madeUpByCpp( t.text ) ) {
 			t.any = true;
 			t.from.body = true;
 		}
@@ -388,7 +423,7 @@ bool Expander::expand( std::vector<XTok> ts, std::vector<XTok> & out, bool top, 
 			continue;
 		}
 
-		HideSet hs = t.hide;
+		int hs = t.hide;
 		Origin inv = t.from;
 		Args args;
 		bool omitted = false;						// no variable arguments at all
@@ -432,7 +467,7 @@ bool Expander::expand( std::vector<XTok> ts, std::vector<XTok> & out, bool top, 
 			// arguments are the only parameter.
 			if ( d->variadic && n == 1 && args[0].empty() ) omitted = true;
 		}
-		hs = unite( hs, { id } );
+		hs = unite( hs, setOf( { idOf( t.text ) } ) );
 		inv.body = true;
 		if ( inv.b < 0 ) inv.e = -1;
 		std::vector<XTok> os;
@@ -445,29 +480,30 @@ bool Expander::expand( std::vector<XTok> ts, std::vector<XTok> & out, bool top, 
 
 // The string literal # makes of an argument: its spelling with each run of
 // whitespace between tokens as one space, and " and \ escaped in literals.
-XTok stringize( const std::vector<XTok> & arg, const Origin & inv ) {
+XTok Expander::stringize( const std::vector<XTok> & arg, const Origin & inv ) {
 	XTok s;
 	s.kind = TokKind::String;
 	s.from = inv;
-	s.text = "\"";
+	std::string text = "\"";
 	bool first = true;
 	for ( const XTok & a : arg ) {
 		if ( a.mark ) continue;
 		if ( a.any ) s.any = true;
-		if ( !first && a.space ) s.text += ' ';
+		if ( !first && a.space ) text += ' ';
 		first = false;
 		bool literal = a.kind == TokKind::String || a.kind == TokKind::Char;
 		for ( char c : a.text ) {
-			if ( literal && ( c == '"' || c == '\\' ) ) s.text += '\\';
-			s.text += c;
+			if ( literal && ( c == '"' || c == '\\' ) ) text += '\\';
+			text += c;
 		}
 	}
-	s.text += '"';
+	text += '"';
+	s.text = made.emplace_back( std::move( text ) );
 	return s;
 }
 
 // a ## b. False when the two don't make one token, which cpp rejects.
-bool paste( XTok & lhs, const XTok & rhs, const Origin & inv ) {
+bool Expander::paste( XTok & lhs, const XTok & rhs, const Origin & inv ) {
 	if ( rhs.mark ) return true;
 	if ( lhs.mark ) {
 		bool space = lhs.space;
@@ -475,10 +511,10 @@ bool paste( XTok & lhs, const XTok & rhs, const Origin & inv ) {
 		lhs.space = space;
 		return true;
 	}
-	std::string text = lhs.text + rhs.text;
+	std::string text = std::string( lhs.text ) + std::string( rhs.text );
 	std::vector<Token> ts = lexBody( text );
 	if ( ts.size() != 1 || ts[0].text != text ) return false;
-	lhs.text = std::move( text );
+	lhs.text = made.emplace_back( std::move( text ) );
 	lhs.kind = ts[0].kind;
 	lhs.any = false;
 	lhs.from = inv;
@@ -488,7 +524,7 @@ bool paste( XTok & lhs, const XTok & rhs, const Origin & inv ) {
 
 // The body of `d` with its parameters replaced, as `os`. `omitted`: the use
 // gave no variable arguments.
-bool Expander::subst( const Define & d, const Args & args, bool omitted, const HideSet & hs, const Origin & inv,
+bool Expander::subst( const Define & d, const Args & args, bool omitted, int hs, const Origin & inv,
 					  std::vector<XTok> & os, int depth ) {
 	Expanded expanded( d.params.size() );
 	if ( !replace( d, args, omitted, inv, 0, d.body.size(), expanded, os, depth ) ) return false;
@@ -1442,6 +1478,11 @@ struct SourceMap::Impl {
 	};
 	std::vector<PhysLine> phys;
 
+	// Lets a std::string_view find a std::string key.
+	struct NameHash {
+		using is_transparent = void;
+		size_t operator()( std::string_view s ) const { return std::hash<std::string_view>{}( s ); }
+	};
 	// Every #define and #undef that cpp printed, by macro name, in order, with
 	// where it takes effect (see Printed). No definition for an #undef.
 	// Filled by index().
@@ -1451,11 +1492,11 @@ struct SourceMap::Impl {
 		int line, use;					// as in Printed
 		std::string file;
 	};
-	std::unordered_map<std::string, std::vector<Event>> defines;
+	std::unordered_map<std::string, std::vector<Event>, NameHash, std::equal_to<>> defines;
 
 	void index();
 	const FileTable * table( const std::string & file );
-	const Define * definition( const std::string & name, int pline, int col, int read, const std::string & file,
+	const Define * definition( std::string_view name, int pline, int col, int read, const std::string & file,
 							   const FileTable & ft ) const;
 
 	// Finds the table and the line's tokens; subs is null when the line has
@@ -1563,7 +1604,7 @@ const FileTable * SourceMap::Impl::table( const std::string & file ) {
 		ft = it->second.get();
 	}
 	std::call_once( ft->once, [&] {
-		buildFile( *ft, file, prep, read, [&]( const std::string & name, int pline, int col, int r ) {
+		buildFile( *ft, file, prep, read, [&]( std::string_view name, int pline, int col, int r ) {
 			return definition( name, pline, col, r, file, *ft );
 		} );
 	} );
@@ -1577,7 +1618,7 @@ const FileTable * SourceMap::Impl::table( const std::string & file ) {
 // use's name, so one below original line `read` of `file` (`ft`) is left
 // out. Its line from the markers is moved back to the real line first, so
 // one above a #line that went back stays in.
-const Define * SourceMap::Impl::definition( const std::string & name, int pline, int col, int read,
+const Define * SourceMap::Impl::definition( std::string_view name, int pline, int col, int read,
 											const std::string & file, const FileTable & ft ) const {
 	auto it = defines.find( name );
 	if ( it == defines.end() ) return nullptr;
