@@ -5,7 +5,7 @@ the buffer:
 
 1. It writes the buffer to a temporary file that starts with
    `# 1 "/real/path.cfa"`, so every location in the output names the real
-   file, and runs `cfa -E` on it with the user's flags. The real file's
+   file, and runs `cfa -E -dD` on it with the user's flags. The real file's
    directory is added as a quote directory (`-iquote`, see [configuration](configuration.md#compiler-flags)), so
    `#include "x.hfa"` finds the file next to it and a project header named
    like a libcfa header doesn't hide that one from `#include <x.hfa>`.
@@ -15,7 +15,9 @@ the buffer:
    number comes from a macro and a `# N "file"` linemarker with flags stay
    as written.
 2. It runs the forked translator: `cfa-cpp --lsp out.json --lsp-focus
-   /real/path.cfa [--lsp-c-out out.c] ... in.i`. The translator runs its
+   /real/path.cfa [--lsp-c-out out.c] ... in.i`, where `in.i` is cpp's
+   output with the `#define` and `#undef` lines that `-dD` adds left empty
+   (see [Columns](#columns)). The translator runs its
    passes as usual, records errors instead of stopping at the first one, and
    after the resolver has run writes the declarations, resolved references,
    expression types and scopes to `out.json`. [dump-format.md](dump-format.md) describes
@@ -127,10 +129,42 @@ server reads them to get the real lines back.
 
 To tell an identifier in a macro's body from the same name passed as an
 argument (`tmp` in `SWAP( x, tmp )` when the body declares its own `tmp`),
-the server redoes the expansion from the `#define`. That works for a macro
-defined in the same file or in a header the file includes directly, whose
-arguments and body use no other macros, and whose body has no `#` or `##`.
-For other macros, such an identifier maps to the argument.
+the server redoes the expansion the way cpp does: `#`, `##`, `__VA_OPT__`,
+macros in the body and in the arguments, and GNU's `, ## __VA_ARGS__`. The
+check runs `cfa -E -dD`, which prints every `#define` and `#undef` cpp
+obeyed at the place it read it, starting with the predefined macros and the
+`-D` flags. So the redo uses the definition cpp had at that point, from any
+header, and a `#define` in a dead `#if` branch never comes into it. The
+translator reads the same text with those lines left empty, so every line
+keeps its number.
+
+A `#define` or `#undef` inside a macro's arguments (a GCC extension) is
+printed as soon as cpp reads it, so `-dD` splits the line: the tokens before
+the macro, the directive, a marker that repeats their line number, and the
+rest of the line. Plain `cfa -E` keeps the line whole, and the translator
+would read the repeated number as a second copy of the line. So the server
+joins the pieces again in `in.i` and turns the lines between them into
+markers, which take no line number. It reads the same text itself, so it
+agrees with the translator on lines, columns and `pline`. The tokens before
+the macro were printed with the definitions above the directive, and the
+expansion with the directive's. The macro's own name is the exception: cpp
+looked it up before it read the arguments, so a use that redefines its own
+macro in them gets the old body. The server leaves out a definition that cpp
+printed before such a use when the directive's line comes after the name's.
+When the marker after the directive switches to or from a system header,
+plain `cfa -E` splits the line there too, so only the lines between the
+pieces change.
+
+The redo also decides where a use ends, so two uses side by side, or a body
+that ends in a function-like macro name and takes the `( ... )` after the
+use, map right. A name from the body maps to the whole invocation, and isn't
+a reference or a declaration name, because your file doesn't spell it there.
+A body that has the macro's own name is the exception, like glibc's
+`stdout`, or `tolower( c )`, which calls the function `tolower` when
+optimization is on. Your file spells that name, so it maps to the name at
+the start of the use. If the redo doesn't give exactly the tokens cpp
+printed, an identifier from the expansion maps to the argument with the
+same name, if there is one.
 
 ## Formatting
 

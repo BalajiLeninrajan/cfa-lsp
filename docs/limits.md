@@ -22,6 +22,17 @@
 - An unsaved header is found through the include path. A header on disk that
   includes it with `#include "..."` from the same directory still reads the
   copy on disk.
+- A few macro expansions can't be redone (see
+  [how-it-works.md](how-it-works.md#columns)), so a name from the macro's
+  body that is also written in the arguments maps to the argument:
+  `__VA_OPT__` when the variable arguments are there but expand to nothing,
+  where gcc versions differ, a body with `_Pragma`, and a macro that
+  `#pragma pop_macro` brings back. cpp's `-dD` output has no `#define` for
+  that, so the macro looks undefined after it.
+- A `#line` right after a `#define` or `#undef` that gives the number of the
+  code line before the directive looks like a directive inside a macro's
+  arguments (see [how-it-works.md](how-it-works.md#columns)). The two lines
+  are joined, so the tokens after the `#line` map to the line before it.
 - Uses inside macro bodies have no references. Inside a `cofor` body, uses of
   the loop variable have none either: they name the copy the translator makes
   in the function it generates for the body.
